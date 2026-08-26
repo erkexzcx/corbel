@@ -59,11 +59,11 @@ You can run it yourself instead. `-o` writes a new file and leaves the input unt
 
 ```sh
 corbel --bricks --zaa -v -o modified.gcode original.gcode
-# corbel: 240 layers, 1365 perimeter loops, 533 raised by 0.100 mm
-# corbel: 13 more were left flat where the wall ends and something is printed over it
-# corbel: 5062.0 mm filament, 16.7% of it in raised loops; a flow of 1.025 adds 1.07% to the part
-# corbel: 1168 surface moves on 86 layers followed from -0.080 to +0.100 mm of their plane, written as 3041 moves
-# corbel: 69.9 mm filament in those surfaces, re-metered by -1.83% for the gaps they really cross
+# corbel: 460 layers, 11390 perimeter loops, 4890 raised by 0.100 mm
+# corbel: 491 more were left flat where the wall ends and something is printed over it
+# corbel: 52339.5 mm filament, 17.2% of it in raised loops; a flow of 1.025 adds 0.89% to the part
+# corbel: 3653 surface moves on 127 layers followed from -0.089 to +0.100 mm of their plane, written as 15597 moves
+# corbel: 271.1 mm filament in those surfaces, re-metered by +3.20% for the gaps they really cross
 ```
 
 Zero raised loops means the file gave bricking nothing to work with — usually a single wall, or unrecognised region markers. `no surface shallow enough to smooth` means the part has no shallow top, which a plain box genuinely does not.
@@ -113,7 +113,7 @@ The gaps are drawn far larger than life — on a 0.2 mm layer they are a few mic
 
 - **The first layer on the bed is left exactly as sliced.** Nothing presses a bead there, so surplus spreads sideways instead of filling anything — on a Benchy it filled in the recessed nameplate, which is exactly one layer deep. A raised column climbs to its half layer over two layers rather than stepping up in one.
 - **The outer wall gets the flow and is then moved inward by half the width it gains**, so the gain feeds the joint behind it and the commanded outer face stays where the slicer drew it. What it gains is `flow - 1` of its *spacing*, not of its nominal width.
-- **A `G2`/`G3` arc moves with it**, keeping its centre and changing radius by the offset, with `I`/`J` restated. On two real arc-fitted slices the gap between commanded and landed radius stayed inside what three-decimal coordinates already put there (0.45 µm median, against the input's 0.39 µm); a loop whose arcs cannot be moved without distorting their circle is left as sliced, 3 beads of 21396 on a Benchy.
+- **A `G2`/`G3` arc moves with it**, keeping its centre and changing radius by the offset, with `I`/`J` restated. A loop whose arcs cannot be moved without distorting their circle is left as sliced, which on a real slice is a handful of beads in twenty thousand.
 
 The compensation is exact on the toolpath, but plastic is looser than a coordinate — the walls behind the visible one keep their gain, and a raised bead is out of reach of the nozzle's underside, so a bricked part can come out slightly over nominal in XY. If yours does, `--extra-flow 0` leaves only the raise, every bead metered as sliced and no wall moved; beyond that, your slicer's XY size compensation trims a measured offset.
 
@@ -125,54 +125,17 @@ The compensation is exact on the toolpath, but plastic is looser than a coordina
 
 > **extra flow ≈ `--extra-flow` × (layer height ÷ nozzle diameter)**
 
-So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle. Both numbers are read from your file, on every layer.
+So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle, and about +1% on a 0.08 mm one. Both numbers are read from your file, on every layer, so an adaptive slice is metered against what it actually printed. Nozzle size barely matters on its own; what matters is how thick your layer is next to your nozzle.
 
 **Why those two numbers.** A bead is a rectangle with a half-round bulge on each side, and two side by side leave a corner empty where the bulges meet, which the nozzle's flat underside normally squashes shut. Bricklayering lifts every other wall half a layer, putting that corner out of reach, so the extra flow fills it instead — and its size depends on the **layer height** and the **line width**, both stated in your file.
-| nozzle | line width | layer | layer ÷ nozzle | extra flow |
-|---|---|---|---|---|
-| 0.2 | 0.22 | 0.10 | 50% | +2.56% |
-| 0.4 | 0.45 | 0.08 | 20% | +0.94% |
-| 0.4 | 0.45 | 0.16 | 40% | +1.96% |
-| **0.4** | **0.45** | **0.20** | **50%** | **+2.50%** |
-| 0.4 | 0.45 | 0.28 | 70% | +3.65% |
-| 0.6 | 0.65 | 0.30 | 50% | +2.61% |
-| 0.8 | 0.85 | 0.40 | 50% | +2.66% |
 
-Read down the 50% rows — 2.56, 2.50, 2.61, 2.66. Nozzle size barely matters on its own; what matters is **how thick your layer is next to your nozzle**. It is `≈` because the flow follows the **line width** your file states, which stock profiles set at 1.06 to 1.13 times the nozzle, keeping it within **±7%** of the simple form.
+**Set it anywhere from 0 to 50.** `0` meters every bead as sliced and moves no wall, leaving only the raise. The top of the range is for sweeping a test print rather than printing with, and there is a ceiling nobody picked: a bead can be widened until its edge reaches the centre of the loop beside it, which is the bead model's own arithmetic rather than a chosen limit.
 
-**If you want more or less of it**, set `--extra-flow` anywhere from 0 to 50:
+**What it costs on the whole part is small, because it is paid only on walls.** On a ten-object plate at the default, a flow of 1.025 on the walls added **+0.89%** to the part; on a part that is mostly wall it is a little over 2%. Infill, bridges, gap fill and the surfaces are metered exactly as sliced, so it is never a global flow bump.
 
-| `--extra-flow` | 0.4 mm nozzle, 0.2 mm layer | 0.4 mm nozzle, 0.28 mm layer |
-|---|---|---|
-| `0` | none — metered as sliced | none — metered as sliced |
-| `2.5` | +1.25% | +1.83% |
-| `5` (default) | +2.50% | +3.65% |
-| `10` | +5.00% | +7.31% |
-| `50` | +25.0% | +36.5% |
+**Where the numbers come from.** The width is read from whichever states it first — the `SLIC3R_*` configuration your slicer exports to a post-processing script, a `.bgcode` container's metadata, or the settings block appended to plain `.gcode` — with a percentage resolved against `nozzle_diameter`. Layer heights are measured from the commanded Z one layer at a time. A file stating no width, as Cura's do, falls back to a reference profile for both the flow and the inward move, and `-v` says so.
 
-The top of the range is for sweeping a test print rather than printing with, and there is a ceiling nobody picked: a bead can be widened until its edge reaches the centre of the loop beside it, **×1.89** on the profile above, which nothing comes within 15% of even at `50`.
-
-**What it costs on the whole part**, measured on two real slices at the default:
-
-| part | filament in raised loops | added to the whole part |
-|---|---|---|
-| Benchy, 2 walls | 16.7% | **+1.07%** |
-| Cylinder, solid wall throughout | 45.5% | **+2.30%** |
-
-**What gets it, and what does not** — measured per region on a real Benchy at the default:
-
-| region | flow |
-|---|---|
-| Outer wall | **×1.0219** |
-| Inner wall | **×1.0230** |
-| Overhang wall | **×1.0226** |
-| Solid infill, sparse infill, gap fill, bridges, top and bottom surface, brim | ×1.0000 |
-
-So it is never a global flow bump. Those three sit a little under the 1.025 the profile asks for because the first layer on the bed is metered as sliced.
-
-**Where the numbers come from.** The width is read from whichever states it first — the `SLIC3R_*` configuration your slicer exports to a post-processing script, a `.bgcode` container's metadata, or the settings block appended to plain `.gcode` — with a percentage resolved against `nozzle_diameter`. Layer heights are measured from the commanded Z one layer at a time, so an adaptive slice is metered against what it printed. A file stating no width, as Cura's do, falls back to the reference profile for both the flow and the inward move, and `-v` says so.
-
-The formula is the slicer's own bead model: PrusaSlicer's [`Flow::rounded_rectangle_extrusion_spacing`](https://github.com/prusa3d/PrusaSlicer/blob/master/src/libslic3r/Flow.cpp) spaces beads at `width − height × (1 − π/4)` and meters each at `height × spacing`. Verified against three real slices: neighbouring loops **0.4074 mm** apart against the formula's 0.4071, and each bead metered **0.0773–0.0774 mm²** against 0.0774, where a nominal-width model predicts 0.0855. The default itself is a **chosen constant**, small on purpose because it is paid on every wall and sets how far the visible wall is drawn in; only how it *scales* is derived. Micro-CT work supports the direction without having been used to fit it: [Faizaan *et al.* 2025](https://doi.org/10.1038/s41598-025-87348-2) found void fractions of 0.117% to 4.99% in concentric-filled PLA, **axially connected in every reconstruction**.
+The formula is the slicer's own bead model: PrusaSlicer's [`Flow::rounded_rectangle_extrusion_spacing`](https://github.com/prusa3d/PrusaSlicer/blob/master/src/libslic3r/Flow.cpp) spaces beads at `width − height × (1 − π/4)` and meters each at `height × spacing`, which was checked against real slices rather than assumed. The default itself is a **chosen constant**, small on purpose because it is paid on every wall and sets how far the visible wall is drawn in; only how it *scales* is derived. Micro-CT work supports the direction without having been used to fit it: [Faizaan *et al.* 2025](https://doi.org/10.1038/s41598-025-87348-2) found the voids in concentric-filled PLA to be **axially connected in every reconstruction**.
 
 ---
 
@@ -195,23 +158,19 @@ The formula is the slicer's own bead model: PrusaSlicer's [`Flow::rounded_rectan
 
 **What it touches.** The top surface, the ironing over it, and the walls — which matter more than they sound: a slope steeper than about 13° leaves a tread narrower than the wall stack on it, so your slicer emits no top-surface region at all and the staircase is entirely wall. The visible wall is always followed, and only ever lowered, since a bead standing proud is out of reach of the nozzle's underside and free to bulge on the face of the part. The walls behind it are followed when this runs alone, and left alone when bricklayering runs in the same pass, because lowering a wall onto a bead that transform has raised would close a gap your slicer metered open. Infill, bridges and anything with a layer printed over it come out exactly as sliced.
 
-**What it costs.** Each stretch is metered for its own gap, so one sitting low takes less material and one sitting high takes more; over a tread the two cancel. Measured with `--zaa` alone:
-
-| part | followed | how far off their plane |
-|---|---|---|
-| 60 mm spherical cap | 2678 moves, 17 of 90 layers | −0.074 to +0.100 mm |
-| 180 mm spherical cap | 15824 moves, 52 of 240 layers | −0.082 to +0.100 mm |
-| 60 mm cone, 1.9° | 1712 moves, 5 of 20 layers | −0.091 to +0.100 mm |
-| Benchy, 2 walls | 1608 moves, 86 of 240 layers | −0.081 to +0.100 mm |
-| Cube, and a flat plate with a boss on it | nothing — every face is vertical or flat | — |
+**What it costs.** Each stretch is metered for its own gap, so one sitting low takes less material and one sitting high takes more; over a tread the two cancel. A cube, and a flat plate with a boss on it, are left completely alone — every face is vertical or flat, and there is nothing to follow.
 
 A curve needs a move per bend, so the exported file grows by a few per cent on a part with shallow tops and not at all on one without them; a **straight** climb costs nothing, since your printer interpolates height along a move already.
 
-**A minority of layers is the right answer, not a shortfall.** A staircase only shows where a layer leaves a tread wider than the bead standing on it. On the 60 mm cap, 19 of its 90 layers leave such a tread and 17 are followed; weighted over those, the surface comes out **0.32 of half a layer** from where the slicer put it across 56% of their length. A Benchy is a poor subject — its hull flares outward, only 18 of its 241 layers leave a tread at all, and it gets 0.03 across 8.8%. Print a shallow dome, a low cone or a wide chamfer to see the difference.
+**A minority of layers is the right answer, not a shortfall.** A staircase only shows where a layer leaves a tread wider than the bead standing on it, and on most parts that is a small share of the layers. A Benchy is a poor subject — its hull flares outward, so barely any layer leaves a tread at all. Print a shallow dome, a low cone or a wide chamfer to see the difference.
 
 **How shallow it goes comes from your layer height.** The widest tread it will follow is the one a **1° slope** leaves — 11.5 mm at 0.2 mm layers, 4.6 mm at 0.08 mm ones. As an angle it means the same thing on every profile and moves with an adaptive slice, and the fade runs a further quarter *past* that slope, so the widest tread it follows does not end in a step of its own.
 
 **What it will not do.** A flat top is left alone: nothing is printed above it, so there is no far edge to climb to, and lowering it would starve a surface that was correct as sliced. So is a ledge with a wall on it, whose tread looks like a slope's and is not one — the layer below tells them apart. A bore going straight down leaves no tread to follow, though one that opens upward *is* followed, so long as it is at least a bead across and its lip is no wider than that 1° slope: narrower than a bead and it cannot be told from the gap the slicer leaves between two neighbouring lines, wider than the slope and what surrounds it is not a lip but the inside of the part. And a surface curving sharply inside one tread is approximated by a straight climb, which errs toward the plane rather than away from it.
+
+**What it leaves behind.** Following a surface *inside* a layer means the beads of that layer are no longer all at one height, and two passes of a top surface run about a bead apart — inside the nozzle's own underside. Whichever goes down second is laid against the other, so the nozzle shears a little off it. That is bounded by the amplitude — half a layer, one bead at its extreme beside one left on the plane — and every run of the test suite is held to it. It is not zero, and six ways of making it zero were tried on a real plate and measured; each was either worse or suppressed the following the transform exists to do. The reason none of them work is that two neighbouring passes *cross* in height along their own length, so no order of whole passes has every point ascending. What is bounded instead is how steeply the surface may rise: a climb is held to one layer height per bead width, a stretch of exposure too narrow to ramp across is put back on the plane, and a strip narrower than the nozzle keeps none of its amplitude.
+
+`--zaa` **without** `--bricks` also follows the walls behind the visible one, and where one of a neighbouring pair is covered by the layer above and the other is not, the two end up half a layer apart; running the two transforms together does not, because bricklayering leaves those walls alone.
 
 ---
 

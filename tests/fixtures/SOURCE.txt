@@ -9,3 +9,78 @@ They are kept here so the decoder can be checked against files produced by the
 reference implementation rather than by this project. The matching ASCII files
 from that repository are not included; the expected decoder output is pinned as
 a length and CRC32 in tests/binary_gcode.rs instead.
+
+
+objects_2walls_bambu.gcode.zst
+objects_manywalls_bambu.gcode.zst
+
+One plate of the primitives Bambu Studio adds from its right-click menu — cube,
+sphere, cone, cylinder and the rest — sliced with Bambu Studio 02.08.02.61 for
+a 0.4 mm nozzle at 0.2 mm layers, 0.45 mm inner and 0.42 mm outer walls,
+wall_sequence "inner wall/outer wall", which is the stock order and lays the
+visible wall down last. One asks for 2 walls and the other for a thousand, so
+the same shapes are carried by one hidden wall in the first and by as many as
+their geometry allows in the second. Nothing here is anyone's design: they are
+the solids the slicer generates on demand.
+
+Both are an eight-layer window — layers 144 to 151, kept behind the file's own
+header and config block — and compressed with zstd. A nozzle replay needs a
+real slicer's travels, arcs, wipes, seam gaps and gap fill, and none of that
+survives being written by hand.
+
+The window is where it is because the domes are there. A Benchy stood here
+before and was the wrong subject: its hull is near vertical, so the surface
+transform had almost nothing to work on, and a bound on how deep a crest it
+leaves passed at a quarter of a layer on that fixture and was false by a factor
+of three on the whole file. A fixture that does not reach the feature under
+test is worse than none. This window carries 27 top-surface regions across
+eight layers and eight objects.
+
+They are inputs, not expectations. tests/collision.rs runs the binary over them
+and replays a nozzle across the result.
+
+
+baseline.gcode.zst, and the twenty named after the one setting each changes:
+arachne, arachne-thinwall, fuzzy-skin, gapfill-off, inner-outer-inner,
+layer-max, layer-thin, nasty-combo, no-arcs, no-prime-tower, no-zhop,
+outer-first, scarf-seam, seam-back, seam-random, walls-1, walls-3, walls-6,
+zhop-normal, zhop-spiral.
+
+One plate, sliced twenty-one ways. Every one of them is `complex-figures.3mf`
+— fourteen of the primitives Bambu
+Studio offers from its right-click menu, plus a 3DBenchy and a torture test —
+sliced by Bambu Studio 02.08.02.61 for a **Bambu Lab P1S with a 0.8 mm nozzle
+at 0.4 mm layers**, which is a coarser regime than anything else in this
+directory and exercises the flow ceiling rather than the middle of the range.
+
+`baseline.gcode.zst` is the profile as saved: 2 walls, classic generator,
+`wall_sequence` "inner wall/outer wall", arc fitting on, `z_hop` 0.4 mm Auto
+Lift, aligned seam, printed by layer. **Every other file changes exactly one
+setting**, and the setting is in the name — except `nasty-combo.gcode.zst`,
+which turns on everything awkward at once.
+
+Each was checked to differ from `baseline` before being stored, in the header
+it declares AND in what the binary then does with it. A fixture that does not
+reach the feature it is named for is worse than no fixture, because it reports
+a pass nobody earned: on the first attempt the settings were written into the
+project JSON as numbers where that file stores strings, Bambu Studio silently
+fell back to profile defaults, and six variants were byte-identical to the
+baseline while appearing to have worked.
+
+They are windows, not whole plates: layers 30 to 54, with the file's own head
+kept in front so the start G-code, the settings block and the machine's own
+below-the-bed nozzle wipe are all still there. Whole plates come to 38 MB,
+which the suite cannot afford to run — `--bricks --zaa` over one is 34 seconds
+against a debug build. The window keeps every object present and reaches both
+transforms: 669 loops raised and 1312 surface moves on the baseline.
+
+Regenerating them, and the traps in doing so, is
+`.github/skills/fixtures-generation/SKILL.md`.
+
+Two variants are deliberately absent. `print_sequence = by object` and
+`spiral_mode` both need a plate this one is not — sequential printing refuses
+these objects as too tall and too close, and spiral vase refuses more than one
+object. `ironing_type` will not take on this project at any of its four values.
+
+3DBenchy is by Creative Tools, CC BY-ND 4.0 (unmodified). The remaining
+primitives are Bambu Studio's own built-in shapes.

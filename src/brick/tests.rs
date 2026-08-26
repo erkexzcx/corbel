@@ -127,23 +127,55 @@ fn seamed_skin(gap: f64) -> String {
 
 /// Each tagged loop in the output, paired with whether the nozzle was
 /// raised when it printed.
+///
+/// Read off the commanded height rather than off the stamps. A raised loop is
+/// written last on its layer and nothing follows it, so there is no reset to
+/// see; and a stamp says what this pass meant where a `Z` word says what the
+/// printer does.
 fn loop_states(out: &str) -> Vec<(String, bool)> {
-    let mut raised = false;
+    let mut plane = 0.0_f64;
+    let mut nozzle = 0.0_f64;
     let mut states = Vec::new();
     for line in out.lines() {
+        let parsed = Line::parse(line);
+        if let Some(z) = parsed.z.filter(|_| parsed.is_move()) {
+            nozzle = z;
+            // Only the file's own moves say where the layer sits: the ones
+            // this pass inserts are the raise being measured.
+            if !line.contains(BRICK_STAMP) {
+                plane = z;
+            }
+        }
         let Some((body, tag)) = line.rsplit_once("; ") else {
             continue;
         };
-        if let Some(note) = tag.strip_prefix(BRICK_STAMP) {
-            match note {
-                "raised" => raised = true,
-                "reset" => raised = false,
-                _ => {}
-            }
-        } else if !body.trim().is_empty() {
-            states.push((tag.to_owned(), raised));
+        if !tag.starts_with(BRICK_STAMP) && !body.trim().is_empty() {
+            states.push((tag.to_owned(), nozzle > plane + 1e-9));
         }
     }
+    states
+}
+
+/// The tags of the loops that were raised, ordered by tag rather than by the
+/// order they were written in.
+///
+/// Which loops alternate is the question nearly every grouping test is
+/// actually asking. The order they go down in is a separate one, with
+/// [`flat_loops_are_written_before_the_raised_ones_they_stand_beside`] to
+/// itself.
+fn parities(out: &str) -> Vec<(String, bool)> {
+    let mut states = loop_states(out);
+    states.sort_by(|left, right| left.0.cmp(&right.0));
+    states
+}
+
+/// The same, for what a test says it expects.
+fn expected(states: &[(&str, bool)]) -> Vec<(String, bool)> {
+    let mut states: Vec<(String, bool)> = states
+        .iter()
+        .map(|(tag, raised)| ((*tag).to_owned(), *raised))
+        .collect();
+    states.sort_by(|left, right| left.0.cmp(&right.0));
     states
 }
 
@@ -209,6 +241,7 @@ fn raised_loops(out: &str, planes: &[f64]) -> Vec<(String, bool)> {
         let on_a_plane = planes.iter().any(|plane| (z - plane).abs() < 1e-9);
         states.push((tag.to_owned(), !on_a_plane));
     }
+    states.sort_by(|left, right| left.0.cmp(&right.0));
     states
 }
 
@@ -231,7 +264,37 @@ fn raises_every_other_internal_loop() {
         out.contains("G1 X0.00 Y0.00 F9000 Z0.900 ; corbel brick raised"),
         "{out}"
     );
-    assert!(out.contains("G1 Z0.800 F600 ; corbel brick reset"), "{out}");
+    assert_eq!(
+        parities(&out),
+        expected(&[("loop1", false), ("loop2", true)]),
+        "{out}"
+    );
+}
+
+/// A raised loop is the last bead written on its layer, so the layer change
+/// that follows takes the nozzle to the next plane and there is nothing left
+/// for a reset to do.
+///
+/// Writing one anyway is not free: it drops the nozzle half a layer where it
+/// stands, which is the end of the bead it has just laid, with that bead's
+/// neighbours standing at the same height all around it.
+#[test]
+fn nothing_is_written_to_bring_the_nozzle_down_after_the_last_raise() {
+    let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(2, "loop")));
+    let out = run(&source, &Config::default());
+    assert!(
+        !out.contains("corbel brick reset"),
+        "the layer change already commands the next plane:\n{out}"
+    );
+    let raise = out.find("Z0.900").expect("the raise was written");
+    let change = out[raise..]
+        .find(";LAYER_CHANGE")
+        .expect("a layer follows the raise");
+    let next = out[raise..].find("G1 Z1.00").expect("the next plane");
+    assert!(
+        change < next,
+        "the raise must be the last thing on its layer:\n{out}"
+    );
 }
 
 #[test]
@@ -258,14 +321,13 @@ fn a_height_change_rides_the_travel_that_reaches_the_loop() {
         "every raise has the travel that reaches its loop to ride:\n{out}"
     );
     // Riding a travel must not move the bead: every loop is still laid at
-    // the height it was laid at before.
-    assert!(
-        out.contains("G1 X0.00 Y0.00 F9000 Z0.900 ; corbel brick raised"),
+    // the height it was laid at before. Loops of one height are written in a
+    // run, so only the first of them names one.
+    assert!(out.contains("F9000 Z0.900 ; corbel brick raised"), "{out}");
+    assert_eq!(
+        parities(&out),
+        expected(&[("loop1", true), ("loop2", false), ("loop3", true)]),
         "{out}"
-    );
-    assert!(
-        !out.contains("G1 Z0.900"),
-        "the raise still stopped the toolhead:\n{out}"
     );
 }
 
@@ -630,7 +692,7 @@ fn a_section_in_relative_positioning_is_written_back_exactly_as_it_was_found() {
 }
 
 #[test]
-fn inserted_z_moves_fall_back_when_the_file_never_moves_z_alone() {
+fn a_file_that_never_moves_z_alone_still_rides_every_raise() {
     let source = relative(&format!(
         ";LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.2 F9000\n{}\
          ;LAYER_CHANGE\n;TYPE:Perimeter\nG1 X0 Y0 Z0.4 F9000\n{}\
@@ -643,9 +705,168 @@ fn inserted_z_moves_fall_back_when_the_file_never_moves_z_alone() {
         wall(2, "above")
     ));
     let out = run(&source, &Config::default());
-    // Nothing here moves Z on its own, so the closing reset — which has no
-    // travel left to ride — falls back to the built-in feedrate.
-    assert!(out.contains("G1 Z0.600 F720 ; corbel brick reset"), "{out}");
+    let inserted: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("G1 Z") && line.contains(BRICK_STAMP))
+        .collect();
+    assert!(
+        inserted.is_empty(),
+        "{inserted:?} stopped the toolhead where a travel would have carried it:\n{out}"
+    );
+    assert!(out.contains("Z0.700 ; corbel brick raised"), "{out}");
+}
+
+/// A loop reached by nothing but the wipe of the loop before it has no travel
+/// of its own to carry a height, and a file that never moves Z alone has no
+/// feedrate of the slicer's to borrow for one either.
+#[test]
+fn an_inserted_height_falls_back_when_the_file_states_no_rate_for_one() {
+    // Two loops of one wall, the second reached straight off the first's
+    // wipe. A wipe belongs to the loop it retraces, so it is not the second
+    // loop's lead and the second loop has none.
+    let wall = "G1 X0.00 Y0.00 E0.5 ; out1\n\
+                G1 X10.00 Y0.00 E0.5\n\
+                G1 X10.00 Y10.00 E0.5\n\
+                G1 X0.00 Y10.00 E0.5\n\
+                G1 X0.00 Y0.40 E0.5\n\
+                G1 X0.00 Y2.00 E-0.2\n\
+                G1 X0.45 Y0.45 E0.5 ; in1\n\
+                G1 X9.55 Y0.45 E0.5\n\
+                G1 X9.55 Y9.55 E0.5\n\
+                G1 X0.45 Y9.55 E0.5\n\
+                G1 X0.45 Y0.85 E0.5\n";
+    let mut source = String::new();
+    for z in [0.2, 0.4, 0.6, 0.8, 1.0] {
+        source.push_str(&format!(";LAYER_CHANGE\nG1 X0 Y0 Z{z:.2} F9000\n"));
+        source.push_str(";TYPE:Perimeter\n");
+        source.push_str(&untagged(wall));
+    }
+    let out = run(&relative(&source), &plain());
+    assert!(
+        out.contains(&format!("F{FALLBACK_Z_FEEDRATE} ; {BRICK_STAMP}raised")),
+        "an inserted height must name a rate this pass can stand behind:\n{out}"
+    );
+}
+
+/// The layer's own height is written before any of the layer's loops, even
+/// though the loop that carried it may now be written last.
+///
+/// A slicer states the plane in the first loop's lead — some on a line of its
+/// own after the marker, Klipper and Orca on the travel that reaches the first
+/// bead. That loop is reordered like any other, and a height that travelled
+/// with it left every loop written before it printing at the plane of the
+/// layer below.
+#[test]
+fn the_layer_s_own_height_is_written_before_the_loops_it_was_reordered_past() {
+    // Three loops and no visible wall, so the first loop the slicer wrote is
+    // a raised one and is written last.
+    let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(3, "loop")));
+    let out = run(&source, &plain());
+    let plane = out.find("G1 Z0.80").expect("the layer's own height");
+    let first = out.find("; loop").expect("a tagged bead");
+    assert!(
+        plane < first,
+        "a loop was written before the plane it stands on:\n{out}"
+    );
+    assert_eq!(
+        raised_loops(&out, &[0.2, 0.4, 0.6, 0.8, 1.0]),
+        expected(&[("loop1", true), ("loop2", false), ("loop3", true)]),
+        "{out}"
+    );
+}
+
+/// A wipe retraces the bead just laid, so it goes wherever that loop goes.
+///
+/// It used to be pulled into the next loop's lead, which was harmless while
+/// loops were written in the order they arrived and nonsense once they are
+/// not: the wipe was written at another loop's height, over a path the nozzle
+/// was nowhere near.
+#[test]
+fn a_wipe_is_written_with_the_loop_it_retraces() {
+    // The inner loop is flat and written first; the outer is raised and
+    // written last. The wipe belongs to the inner one.
+    let body = ";TYPE:Perimeter\n\
+                G1 X0.45 Y0.45 F9000\n\
+                G1 X9.55 Y0.45 E0.5 ; in1\n\
+                G1 X9.55 Y9.55 E0.5\n\
+                G1 X0.45 Y9.55 E0.5\n\
+                G1 X0.45 Y0.85 E0.5\n\
+                G1 X0.45 Y3.00 E-0.2 ; wipe\n\
+                G1 X0.00 Y0.00 F9000\n\
+                G1 X10.00 Y0.00 E0.5 ; out1\n\
+                G1 X10.00 Y10.00 E0.5\n\
+                G1 X0.00 Y10.00 E0.5\n\
+                G1 X0.00 Y0.40 E0.5\n";
+    let out = run(&middle_layer(body), &plain());
+    let inner = out.find("; in1").expect("the inner loop");
+    let wipe = out.find("; wipe").expect("the wipe");
+    let outer = out.find("; out1").expect("the outer loop");
+    assert!(
+        inner < wipe && wipe < outer,
+        "the wipe left the loop it retraces:\n{out}"
+    );
+}
+
+/// A column part way up the ramp stands at half the offset, so a settled loop
+/// laid before a climbing one beside it plows it exactly as a raised loop laid
+/// before a flat one does. Lowest first, whatever the slicer's order.
+#[test]
+fn a_climbing_raise_is_written_before_a_settled_one_beside_it() {
+    let settled = |tag: &str| wall_of(2, tag, 0.0, 10.0, 0.5);
+    let started = |tag: &str| wall_of(2, tag, 20.0, 10.0, 0.5);
+    let mut source = String::new();
+    // The first wall stands from the bed, so by the tagged layer its column
+    // has settled. The second begins two layers below it and is still
+    // climbing.
+    for z in [0.2, 0.4, 0.6] {
+        source.push_str(&layer(z));
+        source.push_str(&format!(";TYPE:Perimeter\n{}", untagged(&settled("a"))));
+    }
+    source.push_str(&layer(0.8));
+    source.push_str(&format!(
+        ";TYPE:Perimeter\n{}{}",
+        untagged(&settled("a")),
+        untagged(&started("b"))
+    ));
+    source.push_str(&layer(1.0));
+    source.push_str(&format!(
+        ";TYPE:Perimeter\n{}{}",
+        settled("a"),
+        started("b")
+    ));
+    source.push_str(&layer(1.2));
+    source.push_str(&format!(
+        ";TYPE:Perimeter\n{}{}",
+        untagged(&settled("a")),
+        untagged(&started("b"))
+    ));
+    let out = run(&relative(&source), &plain());
+
+    let height = |tag: &str| {
+        let mut z = 0.0_f64;
+        for line in out.lines() {
+            let parsed = Line::parse(line);
+            if let Some(value) = parsed.z.filter(|_| parsed.is_move()) {
+                z = value;
+            }
+            if line.ends_with(tag) {
+                return z;
+            }
+        }
+        panic!("{tag} was not written:\n{out}");
+    };
+    let settled_at = height("; a2");
+    let climbing_at = height("; b2");
+    assert!(
+        climbing_at < settled_at,
+        "the wall that just began must stand lower: {climbing_at} vs {settled_at}\n{out}"
+    );
+    let climbing = out.find("; b2").expect("the climbing loop");
+    let settled_first = out.find("; a2").expect("the settled loop");
+    assert!(
+        climbing < settled_first,
+        "the lower of two raises must be laid first:\n{out}"
+    );
 }
 
 #[test]
@@ -718,7 +939,7 @@ fn a_bead_laid_on_a_raise_is_metered_for_it_even_where_its_own_parity_says_other
     }
 
     let out = run(&relative(&source), &plain());
-    let states = loop_states(&out);
+    let states = parities(&out);
     assert_eq!(
         states,
         [
@@ -770,13 +991,13 @@ fn a_wall_that_ends_partway_up_is_capped_while_its_neighbour_carries_on() {
     let source = relative(&source);
     let out = run(&source, &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![
-            ("on1".to_owned(), false),
-            ("on2".to_owned(), true),
-            ("end1".to_owned(), false),
-            ("end2".to_owned(), false),
-        ],
+        parities(&out),
+        expected(&[
+            ("on1", false),
+            ("on2", true),
+            ("end1", false),
+            ("end2", false),
+        ]),
         "only the wall that stops is capped: {out}"
     );
     assert!(
@@ -812,12 +1033,12 @@ fn a_wall_that_ends_partway_up_is_capped_though_the_file_states_no_layers() {
     let out = run(&without_layer_markers(&source), &plain());
     assert_eq!(
         raised_loops(&out, &planes),
-        vec![
-            ("on1".to_owned(), false),
-            ("on2".to_owned(), true),
-            ("end1".to_owned(), false),
-            ("end2".to_owned(), false),
-        ],
+        expected(&[
+            ("on1", false),
+            ("on2", true),
+            ("end1", false),
+            ("end2", false),
+        ]),
         "only the wall that stops is capped: {out}"
     );
     assert!(
@@ -868,7 +1089,7 @@ fn a_z_hop_opens_no_layer_where_the_file_states_none() {
     let hopped = run(&with_a_hop_before_every_travel(&source), &plain());
     assert_eq!(
         raised_loops(&flat, &planes),
-        vec![("loop1".to_owned(), false), ("loop2".to_owned(), true)],
+        expected(&[("loop1", false), ("loop2", true)]),
         "{flat}"
     );
     assert_eq!(
@@ -927,7 +1148,7 @@ fn a_layer_that_ends_inside_a_perimeter_region_is_written_before_the_next_begins
     );
     assert_eq!(
         raised_loops(&out, &[0.2, 0.4, 0.6, 0.8, 1.0]),
-        vec![("loop1".to_owned(), false), ("loop2".to_owned(), true)],
+        expected(&[("loop1", false), ("loop2", true)]),
         "{out}"
     );
 }
@@ -963,11 +1184,7 @@ fn a_layer_a_file_states_no_marker_for_still_has_a_travel_to_raise_on() {
     // the loop that had nothing left to ride.
     assert_eq!(
         raised_loops(&out, &[0.2, 0.4, 0.6, 0.8, 1.0]),
-        vec![
-            ("loop1".to_owned(), true),
-            ("loop2".to_owned(), false),
-            ("loop3".to_owned(), true),
-        ],
+        expected(&[("loop1", true), ("loop2", false), ("loop3", true),]),
         "{out}"
     );
 }
@@ -988,8 +1205,8 @@ fn the_top_layer_caps_the_wall_flat() {
     ));
     let out = run(&source, &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![("loop1".to_owned(), false), ("loop2".to_owned(), false)],
+        parities(&out),
+        expected(&[("loop1", false), ("loop2", false)]),
         "the top layer must stay on the plane: {out}"
     );
     assert!(
@@ -1017,8 +1234,8 @@ fn the_layer_that_tops_a_wall_caps_it_though_the_file_goes_on() {
     ));
     let out = run(&source, &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![("loop1".to_owned(), false), ("loop2".to_owned(), false)],
+        parities(&out),
+        expected(&[("loop1", false), ("loop2", false)]),
         "the wall's top layer must stay on the plane: {out}"
     );
     assert!(
@@ -1074,14 +1291,14 @@ fn a_loop_that_does_not_touch_the_last_one_starts_a_new_contour() {
     ));
     let out = run(&source, &Config::default());
     assert_eq!(
-        loop_states(&out),
-        vec![
-            ("wall1".to_owned(), true),
-            ("wall2".to_owned(), false),
-            ("wall3".to_owned(), true),
-            ("hole1".to_owned(), false),
-            ("hole2".to_owned(), true),
-        ],
+        parities(&out),
+        expected(&[
+            ("wall1", true),
+            ("wall2", false),
+            ("wall3", true),
+            ("hole1", false),
+            ("hole2", true),
+        ]),
         "{out}"
     );
 }
@@ -1139,8 +1356,8 @@ fn a_retraction_between_a_wall_s_own_loops_does_not_split_it() {
     };
     let out = run(&source, &config);
     assert_eq!(
-        loop_states(&out),
-        vec![("inner".to_owned(), false), ("outer".to_owned(), true)],
+        parities(&out),
+        expected(&[("inner", false), ("outer", true)]),
         "the retraction must not split the wall: {out}"
     );
 }
@@ -1202,10 +1419,7 @@ fn a_contour_holding_one_loop_is_raised_against_the_wall_that_shows() {
     // external perimeter, so the visible wall is what it staggers against.
     let source = middle_layer(&format!(";TYPE:Perimeter\n{}", wall(1, "lone")));
     let outcome = apply(&source, &Config::default());
-    assert_eq!(
-        loop_states(&outcome.gcode),
-        vec![("lone1".to_owned(), true)]
-    );
+    assert_eq!(parities(&outcome.gcode), expected(&[("lone1", true)]));
     // The other four are the fixture's own wall on the layers around it.
     assert_eq!(outcome.stats.loops, 5);
     // The bed layer stays flat and the top one is capped, so the three in
@@ -1231,8 +1445,8 @@ fn a_solid_wall_three_beads_thick_bricks_its_single_inner_bead() {
     );
     let outcome = apply(&source, &Config::default());
     assert_eq!(
-        loop_states(&outcome.gcode),
-        vec![("rib1".to_owned(), true), ("skin1".to_owned(), false)],
+        parities(&outcome.gcode),
+        expected(&[("rib1", true), ("skin1", false)]),
         "{}",
         outcome.gcode
     );
@@ -1268,19 +1482,45 @@ fn a_lone_hole_is_bricked_beside_a_wall_in_the_same_region() {
     assert_eq!(outcome.stats.raised, 6);
 }
 
+/// Nothing outside the wall is ever laid while the nozzle stands at a raise.
+///
+/// It used to be a reset written before the region ended. It is now the order
+/// itself: a raised loop waits for the end of its layer, so by the time the
+/// infill runs there is no raise to come down from — and the infill is laid
+/// before the beads it would otherwise have been plowed by.
 #[test]
-fn restores_z_before_leaving_the_perimeter_region() {
+fn nothing_outside_the_wall_is_laid_while_the_nozzle_stands_at_a_raise() {
     let source = middle_layer(&format!(
         ";TYPE:Perimeter\n{};TYPE:Solid infill\nG1 X40 Y0 E0.5\n",
         wall(2, "loop")
     ));
     let out = run(&source, &Config::default());
-    // The fixture repeats the wall on every layer, so anchor on the
-    // tagged one rather than on the file's first solid infill.
-    let tail = &out[out.find("; loop2").expect("tagged loop kept")..];
-    let reset = tail.find("corbel brick reset").expect("reset emitted");
-    let infill = tail.find(";TYPE:Solid infill").expect("marker kept");
-    assert!(reset < infill, "Z must drop before infill starts:\n{out}");
+    let mut plane = 0.0_f64;
+    let mut nozzle = 0.0_f64;
+    let mut region = String::new();
+    for line in out.lines() {
+        let parsed = Line::parse(line);
+        if let Some(z) = parsed.z.filter(|_| parsed.is_move()) {
+            nozzle = z;
+            if !line.contains(BRICK_STAMP) {
+                plane = z;
+            }
+        }
+        if let Some(marker) = line.strip_prefix(";TYPE:") {
+            region = marker.trim().to_owned();
+        }
+        if parsed.draws_in_plane() && parsed.e.is_some_and(|e| e > 0.0) && region == "Solid infill"
+        {
+            assert!(
+                nozzle <= plane + 1e-9,
+                "infill was laid at {nozzle} above a plane of {plane}:\n{out}"
+            );
+        }
+    }
+    assert!(
+        out.contains("; loop2") && out.contains(";TYPE:Solid infill"),
+        "the fixture must reach the infill:\n{out}"
+    );
 }
 
 /// A region is buffered whole and settled at the marker that ends it, so a
@@ -2252,26 +2492,22 @@ fn the_visible_wall_anchors_an_alternation_that_runs_the_whole_stack() {
         body.push_str(";TYPE:External perimeter\n");
         body.push_str(&wall_of(1, "skin", 0.0, 10.0, 1.0));
         let out = run(&middle_layer(&body), &plain());
-        loop_states(&out)
+        parities(&out)
     };
 
     assert_eq!(
         stack(3),
-        vec![
-            ("in21".to_owned(), false),
-            ("in11".to_owned(), true),
-            ("skin1".to_owned(), false),
-        ],
+        expected(&[("in21", false), ("in11", true), ("skin1", false),]),
         "three walls: only the one between the ends"
     );
     assert_eq!(
         stack(4),
-        vec![
-            ("in31".to_owned(), true),
-            ("in21".to_owned(), false),
-            ("in11".to_owned(), true),
-            ("skin1".to_owned(), false),
-        ],
+        expected(&[
+            ("in31", true),
+            ("in21", false),
+            ("in11", true),
+            ("skin1", false),
+        ]),
         "four walls: the far end is raised too"
     );
 }
@@ -2296,16 +2532,16 @@ fn a_wall_printed_inner_outer_inner_still_alternates_by_geometry() {
         ring(0, "skin"),
         ring(3, "in3"),
     );
-    let states = loop_states(&run(&middle_layer(&body), &plain()));
+    let states = parities(&run(&middle_layer(&body), &plain()));
 
     assert_eq!(
         states,
-        vec![
-            ("in21".to_owned(), false),
-            ("in11".to_owned(), true),
-            ("skin1".to_owned(), false),
-            ("in31".to_owned(), true),
-        ],
+        expected(&[
+            ("in21", false),
+            ("in11", true),
+            ("skin1", false),
+            ("in31", true),
+        ]),
         "reading outwards that is skin flat, in1 raised, in2 flat, in3 raised"
     );
 }
@@ -2327,18 +2563,18 @@ fn a_thick_wall_stays_one_contour_however_its_loops_were_sequenced() {
     body.push_str(";TYPE:Perimeter\n");
     // 2.25 mm from the visible wall, well past `MAX_LOOP_GAP`.
     body.push_str(&ring(5, "in5"));
-    let states = loop_states(&run(&middle_layer(&body), &plain()));
+    let states = parities(&run(&middle_layer(&body), &plain()));
 
     assert_eq!(
         states,
-        vec![
-            ("in41".to_owned(), false),
-            ("in31".to_owned(), true),
-            ("in21".to_owned(), false),
-            ("in11".to_owned(), true),
-            ("skin1".to_owned(), false),
-            ("in51".to_owned(), true),
-        ],
+        expected(&[
+            ("in41", false),
+            ("in31", true),
+            ("in21", false),
+            ("in11", true),
+            ("skin1", false),
+            ("in51", true),
+        ]),
         "the innermost loop belongs to the wall, not to a contour of its own"
     );
 }
@@ -2359,18 +2595,18 @@ fn each_visible_wall_opens_a_contour_of_its_own() {
         body.push_str(";TYPE:External perimeter\n");
         body.push_str(&wall_of(1, &format!("out{island}"), origin, 10.0, 1.0));
     }
-    let states = loop_states(&run(&middle_layer(&body), &plain()));
+    let states = parities(&run(&middle_layer(&body), &plain()));
 
     assert_eq!(
         states,
-        vec![
-            ("in11".to_owned(), true),
-            ("out11".to_owned(), false),
-            ("in21".to_owned(), true),
-            ("out21".to_owned(), false),
-            ("in31".to_owned(), true),
-            ("out31".to_owned(), false),
-        ],
+        expected(&[
+            ("in11", true),
+            ("out11", false),
+            ("in21", true),
+            ("out21", false),
+            ("in31", true),
+            ("out31", false),
+        ]),
         "every island must be numbered from its own visible wall"
     );
 }
@@ -2600,14 +2836,14 @@ fn a_second_region_in_a_layer_is_grouped_on_its_own() {
     // Numbering runs outwards from the loop against the visible wall,
     // which each slicer prints last, so the raise alternates from there.
     assert_eq!(
-        loop_states(&out),
-        [
-            ("near1".to_owned(), false),
-            ("near2".to_owned(), true),
-            ("far1".to_owned(), true),
-            ("far2".to_owned(), false),
-            ("far3".to_owned(), true),
-        ],
+        parities(&out),
+        expected(&[
+            ("near1", false),
+            ("near2", true),
+            ("far1", true),
+            ("far2", false),
+            ("far3", true),
+        ]),
         "{out}"
     );
 }
@@ -2779,8 +3015,8 @@ fn numbering_follows_the_wall_order_the_slicer_used() {
     };
     let out = run(&source, &config);
     assert_eq!(
-        loop_states(&out),
-        vec![("loop1".to_owned(), true), ("loop2".to_owned(), false)],
+        parities(&out),
+        expected(&[("loop1", true), ("loop2", false)]),
         "{out}"
     );
 }
@@ -2936,8 +3172,8 @@ fn a_wall_drawn_with_arcs_is_one_contour_however_its_arcs_were_cut() {
          G3 X20.00 Y30.45 I0 J10.45 E1.0\n";
     let out = run(&middle_layer(body), &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![("inner".to_owned(), false), ("outer".to_owned(), true)],
+        parities(&out),
+        expected(&[("inner", false), ("outer", true)]),
         "the two rings are one wall and must alternate: {out}"
     );
 }
@@ -2977,14 +3213,14 @@ fn gap_fill_inside_a_wall_does_not_split_it() {
     );
     let out = run(&middle_layer(&body), &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![
-            ("loop1".to_owned(), true),
-            ("loop2".to_owned(), false),
-            ("gap1".to_owned(), false),
-            ("loop3".to_owned(), true),
-            ("loop4".to_owned(), false),
-        ],
+        parities(&out),
+        expected(&[
+            ("loop1", true),
+            ("loop2", false),
+            ("gap1", false),
+            ("loop3", true),
+            ("loop4", false),
+        ]),
         "the wall is numbered from its visible loop straight through the gap \
          fill, which takes no place of its own in the alternation: {out}"
     );
@@ -3048,13 +3284,13 @@ fn a_hole_beside_an_island_keeps_its_own_contour() {
     );
     let out = run(&middle_layer(&body), &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![
-            ("island2".to_owned(), true),
-            ("island1".to_owned(), false),
-            ("hole2".to_owned(), true),
-            ("hole1".to_owned(), false),
-        ],
+        parities(&out),
+        expected(&[
+            ("island2", true),
+            ("island1", false),
+            ("hole2", true),
+            ("hole1", false),
+        ]),
         "the hole must stagger against its own visible wall: {out}"
     );
 }
@@ -3218,8 +3454,8 @@ fn a_full_circle_that_names_no_coordinate_is_still_a_bead() {
          G2 I-10.45 J0 E2.0 ; outer\n";
     let out = run(&middle_layer(body), &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![("inner".to_owned(), false), ("outer".to_owned(), true)],
+        parities(&out),
+        expected(&[("inner", false), ("outer", true)]),
         "a whole ring in one move is still a loop of the wall: {out}"
     );
 }
@@ -3272,15 +3508,15 @@ fn a_layer_holding_a_move_that_cannot_be_followed_is_left_unbricked() {
     let unreachable = format!("{body}G1 X20000.00 Y0.00 E1.0\n");
     let out = run(&middle_layer(&unreachable), &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![("loop1".to_owned(), false), ("loop2".to_owned(), false)],
+        parities(&out),
+        expected(&[("loop1", false), ("loop2", false)]),
         "nothing about this wall was measured, so nothing of it is raised: {out}"
     );
     // And the same wall without the impossible move is bricked as usual, so
     // it is the move that refused it and not the fixture.
     assert_eq!(
         loop_states(&run(&middle_layer(&body), &plain())),
-        vec![("loop1".to_owned(), false), ("loop2".to_owned(), true)],
+        expected(&[("loop1", false), ("loop2", true)]),
         "the fixture itself must brick"
     );
 }
@@ -3309,8 +3545,8 @@ fn a_thin_wall_over_a_column_does_not_cap_it() {
     source.push_str(&format!(";TYPE:Thin wall\n{}", untagged(&on)));
     let out = run(&relative(&source), &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![("on1".to_owned(), false), ("on2".to_owned(), true)],
+        parities(&out),
+        expected(&[("on1", false), ("on2", true)]),
         "the thin wall over it meters the raise itself: {out}"
     );
 }
@@ -3351,12 +3587,8 @@ fn gap_fill_over_a_column_covers_it_and_is_metered_for_what_it_left() {
     let out = run(&relative(&source), &plain());
 
     assert_eq!(
-        loop_states(&out),
-        vec![
-            ("on1".to_owned(), false),
-            ("on2".to_owned(), true),
-            ("gap1".to_owned(), false),
-        ],
+        parities(&out),
+        expected(&[("on1", false), ("on2", true), ("gap1", false),]),
         "the gap fill stands on the raised column, so the column is not \
          capped — and the gap fill itself is never raised: {out}"
     );
@@ -3405,14 +3637,14 @@ fn a_thin_wall_inside_a_wall_does_not_split_it() {
     );
     let out = run(&middle_layer(&body), &plain());
     assert_eq!(
-        loop_states(&out),
-        vec![
-            ("loop1".to_owned(), true),
-            ("loop2".to_owned(), false),
-            ("thin1".to_owned(), false),
-            ("loop3".to_owned(), true),
-            ("loop4".to_owned(), false),
-        ],
+        parities(&out),
+        expected(&[
+            ("loop1", true),
+            ("loop2", false),
+            ("thin1", false),
+            ("loop3", true),
+            ("loop4", false),
+        ]),
         "the wall is numbered from its visible loop straight through the \
          thin wall, which takes no place of its own in the alternation: {out}"
     );

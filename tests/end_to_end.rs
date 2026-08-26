@@ -1,5 +1,14 @@
 //! Runs the built binary against a realistic slicer file and checks the
 //! resulting G-code is still coherent.
+//!
+//! Every run also goes through [`nozzle`], which replays the result and refuses
+//! a file the toolhead cannot execute. It is wired into [`run_bare`] and
+//! [`run_with_env`] rather than into the tests, because those are the only two
+//! places this file starts the binary: a test added later cannot skip it
+//! without going out of its way, and one that changes what a transform writes
+//! is checked against a printer whether or not its author thought to.
+
+mod nozzle;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -103,7 +112,9 @@ fn run(args: &[&str]) -> std::process::Output {
 
 /// Runs the binary with exactly the arguments given and nothing added.
 fn run_bare(args: &[&str]) -> std::process::Output {
-    Command::new(BIN).args(args).output().expect("run binary")
+    let output = Command::new(BIN).args(args).output().expect("run binary");
+    assert_survivable(args, &output);
+    output
 }
 
 fn with_transforms<'a>(args: &[&'a str]) -> Vec<&'a str> {
@@ -118,11 +129,131 @@ fn with_transforms<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// Runs the binary the way a slicer would, with the print configuration
 /// exported into the environment.
 fn run_with_env(args: &[&str], settings: &[(&str, &str)]) -> std::process::Output {
-    Command::new(BIN)
-        .args(with_transforms(args))
+    let args = with_transforms(args);
+    let output = Command::new(BIN)
+        .args(&args)
         .envs(settings.iter().copied())
         .output()
-        .expect("run binary")
+        .expect("run binary");
+    let borrowed: Vec<&str> = args.to_vec();
+    assert_survivable(&borrowed, &output);
+    output
+}
+
+/// Replays a nozzle over whatever that run wrote.
+///
+/// A run that failed wrote nothing, and a binary container is checked by
+/// tests/binary_gcode.rs against Prusa's own reference files instead. A run
+/// carrying `--force` is not policed either: that switch is the user
+/// overriding a guard this tool put there, and processing a file a second time
+/// compounds what the first one did — 122 µm against the 88 a single run
+/// leaves.
+///
+/// What is left is every plain G-code file this suite produces, and the bar
+/// depends on which transform wrote it. Bricking has to leave none: it chooses
+/// the order its own beads go down in. The surface transform cannot — see
+/// [`SURFACE_CREST`].
+fn assert_survivable(args: &[&str], output: &std::process::Output) {
+    if !output.status.success() || args.contains(&"--force") {
+        return;
+    }
+    let Some(path) = wrote(args) else {
+        return;
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    // The ledger needs the input as well, and only a run given `--output`
+    // still has one: the default target is the file itself.
+    if let Some(source) = args
+        .iter()
+        .position(|arg| *arg == "--output")
+        .and_then(|at| args.get(at + 2))
+        .and_then(|input| fs::read_to_string(input).ok())
+    {
+        let faults = nozzle::faults(
+            &nozzle::ledger(&source),
+            &nozzle::ledger(&text),
+            // What a run says about its flow accounts for bricking alone. The
+            // surface transform re-meters what it reshapes on top of that, so
+            // the claim no longer describes the whole change.
+            (!args.contains(&"--zaa"))
+                .then(|| String::from_utf8_lossy(&output.stderr).into_owned())
+                .as_deref(),
+        );
+        assert!(
+            faults.is_empty(),
+            "{args:?}: {} of what must survive did not\n  {}",
+            faults.len(),
+            faults.join("\n  ")
+        );
+    }
+    let report = nozzle::inspect(&text);
+    assert!(
+        report.under_the_bed.is_empty(),
+        "{args:?}: {} moves go under the plate",
+        report.under_the_bed.len()
+    );
+    assert!(
+        report.dragged.is_empty(),
+        "{args:?}: {} beads are dragged, longest {:.1} mm\n{}",
+        report.dragged.len(),
+        report
+            .dragged
+            .iter()
+            .map(|drag| drag.span)
+            .fold(0.0_f64, f64::max),
+        report.dragged.first().map_or(String::new(), |drag| format!(
+            "  line {}: {}",
+            drag.line,
+            drag.text.trim()
+        ))
+    );
+    let allowed = match args.contains(&"--zaa") {
+        true => report.nozzle.layer * SURFACE_CREST,
+        false => 0.0,
+    };
+    assert!(
+        report.worst() <= allowed,
+        "{args:?}: a crest {:.0} um deep, over the {:.0} um allowed here\n{}",
+        report.worst() * 1000.0,
+        allowed * 1000.0,
+        report
+            .plunges
+            .iter()
+            .max_by(|left, right| left.depth().total_cmp(&right.depth()))
+            .map_or(String::new(), |plunge| format!(
+                "  line {}: {}",
+                plunge.line,
+                plunge.text.trim()
+            ))
+    );
+}
+
+/// How deep a crest the surface transform may leave, as a share of the layer.
+///
+/// Half a layer is its own amplitude: it moves a bead by up to that either way
+/// from the plane, so a bead at one extreme beside one left on the plane is
+/// the worst a single run can build. It is not zero and cannot be — six ways
+/// of trying to make it zero are recorded in README.md, each measured and each
+/// refuted. What this bar does hold is the discipline that brought it here:
+/// before the climb was bounded to a bead width, a whole file reached 156 µm,
+/// which is more than the amplitude and so more than the geometry can excuse.
+const SURFACE_CREST: f64 = 0.5;
+
+/// Where a run put its result: what `--output` names, or the input itself,
+/// since a run without one rewrites the file in place.
+fn wrote(args: &[&str]) -> Option<PathBuf> {
+    if let Some(at) = args
+        .iter()
+        .position(|arg| *arg == "--output" || *arg == "-o")
+    {
+        return args.get(at + 1).map(PathBuf::from);
+    }
+    args.iter()
+        .rev()
+        .map(PathBuf::from)
+        .find(|arg| arg.is_file())
 }
 
 /// Every non-comment line must still look like G-code, and no coordinate may be
@@ -161,7 +292,9 @@ fn brick_rewrites_the_file_in_place() {
     assert_ne!(result, source, "file should have been modified");
     assert_wellformed(&result);
     assert!(result.contains("corbel brick raised"));
-    assert!(result.contains("corbel brick reset"));
+    // No reset: a raised loop is the last bead of its layer, and the layer
+    // change that follows commands the next plane itself.
+    assert!(!result.contains("corbel brick reset"), "{result}");
 }
 
 #[test]
@@ -470,28 +603,52 @@ fn a_wall_closed_by_a_solid_surface_partway_up_is_left_flat() {
     let out = std::fs::read_to_string(&path).unwrap();
     assert_wellformed(&out);
 
-    // Every raise is undone before the nozzle leaves the loop it belongs to,
-    // so the shoulder's own stretch of each layer can be read on its own. The
-    // travel to X40.450 is the one that reaches it.
+    // Which wall a bead belongs to is where it is, not where it sits in the
+    // text: loops are written lowest first and a raised one waits for the end
+    // of its layer, so neither wall's beads are a contiguous stretch.
     let layers: Vec<&str> = out.split(";LAYER_CHANGE").collect();
-    let shoulder_of = |layer: usize| {
-        layers[layer]
-            .split_once("X40.450 Y40.450 F9000")
-            .expect("the travel that reaches the shoulder")
-            .1
+    let raised_in = |layer: usize, shoulder: bool| {
+        let mut z = 0.0_f64;
+        let mut plane = 0.0_f64;
+        let mut found = false;
+        for line in layers[layer].lines() {
+            let words: Vec<&str> = line
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect();
+            let word = |letter: char| {
+                words
+                    .iter()
+                    .find(|w| w.starts_with(letter))
+                    .and_then(|w| w[1..].parse::<f64>().ok())
+            };
+            if let Some(height) = word('Z') {
+                z = height;
+                if !line.contains("corbel") {
+                    plane = height;
+                }
+            }
+            let Some(x) = word('X') else { continue };
+            if word('E').is_some_and(|e| e > 0.0) && (x >= 40.0) == shoulder {
+                found |= z > plane + 1e-9;
+            }
+        }
+        found
     };
     assert!(
-        !shoulder_of(3).contains("corbel brick raised"),
+        !raised_in(3, true),
         "the wall that stops must finish on the plane: {}",
-        shoulder_of(3)
+        layers[3]
     );
     assert!(
-        shoulder_of(2).contains("corbel brick raised"),
+        raised_in(2, true),
         "while the layer below it still bricks: {}",
-        shoulder_of(2)
+        layers[2]
     );
     assert!(
-        layers[3].contains("corbel brick raised"),
+        raised_in(3, false),
         "and so does the wall that carries on, on the same layer: {}",
         layers[3]
     );

@@ -521,6 +521,23 @@ impl Builder {
                                 false => 1.0,
                             };
                             let fading = ((carried - strip) / (reach * FADE)).clamp(0.0, 1.0);
+                            // And a strip narrower than the nozzle's own
+                            // underside is not a slope either. The nozzle
+                            // rears up to it and comes back down inside its
+                            // own footprint, which leaves a crest one bead
+                            // wide with the pass beside it on the plane — and
+                            // a flat nozzle can follow a surface that rises
+                            // away from it but cannot pass a crest. Full
+                            // amplitude from one bead width up, since that is
+                            // where the nozzle first fits inside the crest,
+                            // and tapered rather than cut below it so two
+                            // strips either side of the width do not step
+                            // apart. Measured on a 25-layer Benchy, whose hull
+                            // is steep enough that this is nearly all the top
+                            // surface it has: the deepest a bead was laid
+                            // under a crest of its own neighbour went from
+                            // 100 µm — half a layer — to 24.
+                            let riding = (strip / (bead * 2.0)).clamp(0.0, 1.0);
                             let across = ((out + shift) / strip).clamp(0.0, 1.0);
                             // Filled in for every cell of the window, covered
                             // ones included: reading the field between cells
@@ -534,7 +551,7 @@ impl Builder {
                             // the strip beside it, while one just inside the
                             // strip measures the strip itself and continues it
                             // exactly.
-                            rough[offset] = ((across - 0.5) * sloped * fading) as f32;
+                            rough[offset] = ((across - 0.5) * sloped * fading * riding) as f32;
                         }
                         // Read back while the band is still in cache, so the
                         // blur can walk the rows that hold something.

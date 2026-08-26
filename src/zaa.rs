@@ -982,19 +982,32 @@ impl<W: Write, R: BufRead> Pass<W, R> {
     /// and never touches a covered one, so a bead under the layer above still
     /// sits exactly on its plane and the wall that shows keeps its ceiling.
     ///
-    /// A **climb** is held to a different figure, because nothing is in its
-    /// way. What bounds a descent is the nozzle's own flat underside plowing
-    /// back through material it laid a bead width ago; climbing, it lifts away
-    /// from that material and the gap it opens is one the extrusion is already
-    /// metered for. The bound that is left is the surface itself: the rise is
-    /// box-blurred over a grid cell, so the steepest the measured surface can
-    /// ask for is one layer height per cell, and holding a climb to that never
-    /// flattens anything the field can express. Held to the descent's figure
-    /// instead it flattened a great deal: a bead leaving a covered stretch was
-    /// kept low for a further bead width, and the far edge of a strip is
-    /// exactly where the ramp has to reach half a layer for one layer's ramp
-    /// to meet the next one's — so a tread narrower than a bead was levelled
-    /// outright and the staircase it was there to remove came back.
+    /// A **climb** is held to a looser figure, but it is held. What bounds a
+    /// descent is the nozzle's own flat underside plowing back through
+    /// material it laid a bead width ago; climbing, it lifts away from that
+    /// material and the gap it opens is one the extrusion is already metered
+    /// for. That is true along the path and false across it: the pass laid
+    /// *beside* this one has to come back down alongside whatever this one
+    /// reared up to, and a bead spacing is well inside the nozzle's own
+    /// footprint. So a climb is held to one layer height per bead width —
+    /// twice the descent's figure, since it is the freer of the two, and the
+    /// steepest a bead can rise and still have a neighbour laid against it.
+    ///
+    /// It used to be one layer height per **grid cell**, which is not a bound
+    /// on anything a nozzle does. A bead leaving a covered stretch is forced
+    /// back onto its plane and then climbs out of it, so the profile was a
+    /// gentle fall and a sheer rise: measured on a 25-layer Benchy, **62
+    /// reversals of direction in 284 top-surface samples, 28% of the path
+    /// steeper than one layer per bead width and the worst 3.70 mm per mm** —
+    /// eight times what a descent is allowed. The crests of one pass then
+    /// stood over the troughs of the next.
+    ///
+    /// It is not the descent's figure, and that distinction is load-bearing:
+    /// the far edge of a strip is exactly where the ramp has to reach half a
+    /// layer for one layer's ramp to meet the next one's, and at the descent's
+    /// figure a tread narrower than a bead was levelled outright and the
+    /// staircase it was there to remove came back. At this one a tread half a
+    /// bead wide still reaches the full offset.
     ///
     /// `entry` is where the bead before this one leaves the nozzle, which is
     /// this one's first sample seen from the other side of the join. Its
@@ -1004,7 +1017,8 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         if !(fall.is_finite() && fall > 0.0) {
             return;
         }
-        let climb = height / self.grid.cell();
+        self.level_slivers();
+        let climb = height / self.bead;
         if let (Some(entry), Some(first)) = (entry, self.samples.first_mut())
             && !self.covered[0]
             && first.3 > entry
@@ -1026,6 +1040,44 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             if !self.covered[index] && rise > ceiling {
                 self.samples[index].3 = ceiling;
             }
+        }
+    }
+
+    /// Puts back on the plane any stretch of surface too narrow to ramp
+    /// across, where the layer above closes over it again at both ends.
+    ///
+    /// A covered sample is forced onto its plane, so a sliver of exposure
+    /// between two covered stretches is written as a rear up to half a layer
+    /// and straight back down — a crest, not a slope. A flat nozzle can follow
+    /// a surface that rises away from it and cannot pass a crest narrower than
+    /// its own underside: it flattens the crest, and the pass laid beside it
+    /// comes down alongside whatever is left. Measured on a 25-layer Benchy,
+    /// whose hull is near vertical and so leaves exactly these slivers: 62
+    /// reversals of direction in 284 top-surface samples, and 135 places where
+    /// a bead was laid under a crest of its own neighbour.
+    ///
+    /// Only a stretch closed at *both* ends. One that runs to either end of
+    /// the bead carries on into the bead beside it, and that is a slope being
+    /// followed across a join rather than a sliver.
+    fn level_slivers(&mut self) {
+        let mut start = 0;
+        while start < self.samples.len() {
+            if self.covered[start] {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < self.samples.len() && !self.covered[end] {
+                end += 1;
+            }
+            let closed = start > 0 && end < self.samples.len();
+            let across = self.samples[end - 1].2 - self.samples[start].2;
+            if closed && across < self.bead {
+                for sample in &mut self.samples[start..end] {
+                    sample.3 = 0.0;
+                }
+            }
+            start = end;
         }
     }
 

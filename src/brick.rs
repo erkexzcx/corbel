@@ -414,6 +414,7 @@ pub fn stream<R: BufRead, W: Write>(
     }
     pass.rejoin()?;
     pass.flush()?;
+    pass.write_held()?;
     pass.out.flush()?;
 
     Ok(Stats {
@@ -515,6 +516,9 @@ struct Buffered {
     /// demand for filament and so reaches the output stream only when the
     /// line is written.
     resets_origin: bool,
+    /// Set where this line is itself a `; LINE_WIDTH:` declaration, so
+    /// replaying it puts the output's own idea of the width back.
+    width: Option<usize>,
 }
 
 /// Where a buffered move has to end up instead, and what its bead's length
@@ -526,6 +530,41 @@ struct Moved {
     /// with the rest of the loop. `None` for a straight move.
     centre: Option<(f64, f64)>,
     ratio: f64,
+}
+
+/// A region's raised loops, held back until the end of the layer they belong
+/// to.
+///
+/// A bead at the plane laid beside one already standing half a layer proud is
+/// plowed by the nozzle's own underside, and ordering the region's own loops
+/// only settles the walls. What is laid against the innermost loop afterwards
+/// is the island's infill, in regions of its own — and on a two-wall part that
+/// loop is both the one against the visible wall and the one against the
+/// infill, so no order *within* the region avoids it.
+///
+/// The wait is to the end of the layer rather than to the next region, because
+/// an island's walls and its infill interleave: a stock Bambu slice puts
+/// sparse infill between two wall regions, so loops released at the next wall
+/// still have infill laid over them. Nothing follows the last thing written on
+/// a layer, and the next layer's beads stand a whole layer above these.
+///
+/// Only the deferred loops' own lines are kept, so this holds the raised beads
+/// of one layer and not the layer.
+struct Held {
+    arena: Vec<u8>,
+    buffer: Vec<Buffered>,
+    cells: Vec<u32>,
+    loops: Vec<Loop>,
+    /// The marker line that declared the region these came out of.
+    ///
+    /// They are written past the markers of everything laid after them, so
+    /// without it a reader takes a wall for whatever region it lands in — and
+    /// one of those readers is [`zaa`](crate::zaa), which would reshape it as
+    /// a top surface.
+    marker: Vec<u8>,
+    /// The plane they belong to, since they are written after the regions that
+    /// followed them and a plane is read off the layer rather than the stream.
+    plane: f64,
 }
 
 /// Samples one arc may be cut into. A corrupt `I`/`J` can name a radius no
@@ -609,6 +648,14 @@ impl Iterator for Along {
 /// contour, and neither may be raised: a thin wall's two faces are both the
 /// visible one, so half a layer of step on it is half a layer of step on the
 /// outside of the part.
+/// True for a slicer's statement of how wide the beads after it are. It is a
+/// comment, so nothing on the printer reads it — but every previewer does, and
+/// so does anything that prices a file.
+fn is_a_width(line: Line<'_>) -> bool {
+    line.marker()
+        .is_some_and(|marker| marker.trim_start().starts_with("LINE_WIDTH"))
+}
+
 fn is_filler(feature: Feature) -> bool {
     matches!(feature, Feature::GapFill | Feature::ThinWall)
 }
@@ -627,9 +674,19 @@ struct Loop {
     /// wipe, the travel out of the region — which lays nothing and so must
     /// never be scaled by the flow the bead was given.
     beads: usize,
+    /// One past the last line that belongs to this loop rather than to the
+    /// next one: its beads, plus the wipe and retraction written along the
+    /// path it just laid. Those follow the loop wherever it is written, since
+    /// a wipe retraces a bead and is nonsense anywhere else.
+    trail: usize,
     /// Which contour of the region this loop belongs to, so a contour that
     /// holds only one loop can be told apart from a wall that alternates.
     contour: usize,
+    /// The `; LINE_WIDTH:` in force where this loop's first bead was written,
+    /// as an index into [`Pass::widths`]. A slicer states the width once for a
+    /// whole region, so a loop written out of that region's order inherits
+    /// whatever the region before it declared unless this is put back.
+    width: usize,
     /// True where this loop is the visible wall, which anchors the numbering
     /// of the contour it belongs to and is the one loop that gets moved
     /// sideways.
@@ -666,6 +723,11 @@ struct Loop {
     /// every loop with both the one before it and the one after.
     outline: Option<[f64; 4]>,
     points: usize,
+    /// Range of `Pass.raised_cells` holding the cells this loop stands proud
+    /// in, empty unless it is raised. Kept from the walk `mark_columns`
+    /// already makes, so a travel can be tested against what is really in its
+    /// way without walking a loop's path a second time.
+    cells: (usize, usize),
 }
 
 struct Pass<'a, W: Write> {
@@ -692,6 +754,34 @@ struct Pass<'a, W: Write> {
     /// and handed to `standing` when the layer closes.
     rising: Cells,
     climbing: Cells,
+    /// Cells this layer has already left standing proud, grown as each raised
+    /// loop is *written* rather than when it is decided.
+    ///
+    /// `rising` is the whole layer's answer and is known before a line of it
+    /// is emitted, which is the wrong question for a travel: what can be in
+    /// the nozzle's way is what has actually been laid by the time the travel
+    /// runs.
+    laid: Cells,
+    /// How high the tallest of them stands, so a travel is only lifted where
+    /// it would otherwise pass below one.
+    laid_top: f64,
+    /// The cells of the region's raised loops, one run per loop. Cleared with
+    /// the region, so nothing larger than one region is ever held.
+    raised_cells: Vec<u32>,
+    /// Where the nozzle really stands, which is not where the buffer says once
+    /// the loops have been reordered.
+    at_now: (f64, f64),
+    /// This layer's raised loops, waiting for everything laid against them to
+    /// be written first. See [`Held`].
+    held: Vec<Held>,
+    /// The marker line that declared the region being buffered, so the loops
+    /// held out of it can say what they are when they are written.
+    marker: Vec<u8>,
+    /// Every distinct `; LINE_WIDTH:` line the file has stated, the one in
+    /// force now, and the one the output last carried.
+    widths: Vec<Vec<u8>>,
+    width: usize,
+    wrote_width: usize,
     /// Cells of the loop being settled, kept between calls so the walk that
     /// weighs a loop against the layers either side of it can hand its path
     /// to `rising` rather than be repeated for it.
@@ -790,6 +880,15 @@ impl<'a, W: Write> Pass<'a, W> {
             climbed: Cells::on(footprint::Grid::default()),
             rising: Cells::on(footprint::Grid::default()),
             climbing: Cells::on(footprint::Grid::default()),
+            laid: Cells::on(footprint::Grid::default()),
+            laid_top: f64::NEG_INFINITY,
+            raised_cells: Vec::new(),
+            at_now: (0.0, 0.0),
+            held: Vec::new(),
+            marker: Vec::new(),
+            widths: vec![Vec::new()],
+            width: 0,
+            wrote_width: 0,
             path: Vec::new(),
             warned: false,
             layer_markers: survey.layer_markers,
@@ -846,9 +945,23 @@ impl<'a, W: Write> Pass<'a, W> {
 
     fn feed(&mut self, raw: &str, bytes: &[u8]) -> io::Result<()> {
         let line = Line::parse_bytes(raw, bytes);
+        if is_a_width(line) {
+            let raw = line.origin();
+            self.width = match self.widths.iter().position(|had| had == raw) {
+                Some(at) => at,
+                None => {
+                    self.widths.push(raw.to_vec());
+                    self.widths.len() - 1
+                }
+            };
+        }
         if let Some(marker) = line.marker() {
             if is_layer_marker(marker) {
                 self.flush()?;
+                // A raise belongs to the plane it was measured against, so
+                // loops still waiting for an infill that never came have run
+                // out of layer to wait in.
+                self.write_held()?;
                 // Slicers re-declare the region after a layer change, and some
                 // open the next wall with a stray segment before they do.
                 // Carrying the old region across would buffer that segment as
@@ -881,6 +994,10 @@ impl<'a, W: Write> Pass<'a, W> {
                     self.flush()?;
                 }
                 self.feature = feature;
+                if feature.is_perimeter() {
+                    self.marker.clear();
+                    self.marker.extend_from_slice(line.origin());
+                }
                 if continues && !self.buffer.is_empty() {
                     self.buffer(line, self.at);
                     return Ok(());
@@ -979,6 +1096,9 @@ impl<'a, W: Write> Pass<'a, W> {
             // after that layer's last bead stays: it is the travel this
             // layer's first raise rides.
             self.flush_before_a_layer()?;
+            // A raise belongs to the plane it was measured against, and a file
+            // that states no layers still has them.
+            self.write_held()?;
             self.layer += usize::from(std::mem::replace(&mut self.started, true));
             self.close_layer();
             self.markerless.open(self.layer_z);
@@ -989,6 +1109,13 @@ impl<'a, W: Write> Pass<'a, W> {
         let from = self.at;
         if let Some((x, y, _)) = moved {
             self.at = (x, y);
+            // With nothing buffered the output has caught up with the input,
+            // so this is where the nozzle really stands — which is what a held
+            // loop's travel has to be measured from once the region between
+            // them has gone by.
+            if self.buffer.is_empty() {
+                self.at_now = (x, y);
+            }
         }
 
         // Gap fill only joins the buffer where there is a wall in it to keep
@@ -1213,7 +1340,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // Anything else ends the tail, and it has to be written out before the
         // line that ended it.
         self.flush()?;
-        if line.z.is_some() && line.is_move() {
+        if line.z.is_some() && line.draws() {
             self.nozzle_z = Some(self.modal.position().2);
         }
         if let Some(rate) = line.f {
@@ -1242,7 +1369,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // reaches it, to be printed before the nozzle rises.
         let extrudes = line.draws_in_plane() && delta.is_some_and(|d| d > 0.0);
         let steers = line.is_xy_move();
-        let positions = steers || (line.is_move() && line.z.is_some());
+        let positions = steers || (line.draws() && line.z.is_some());
         let carries = positions && line.e.is_none();
         let places = line.x.is_some() || line.y.is_some();
 
@@ -1257,9 +1384,18 @@ impl<'a, W: Write> Pass<'a, W> {
             delta,
             // Where the move leaves the nozzle, not the number on the line:
             // every height this pass compares against is an absolute one.
+            //
+            // An ARC counts. A slicer asked for a spiral lift climbs on a
+            // `G2`/`G3` naming `Z` and no `X` or `Y`, and `Line::is_move` is
+            // `G0`/`G1` alone — so read that way the hop is invisible, the
+            // nozzle is believed to be on the plane it left, and `carrier`
+            // then declines to write the descent because it thinks the
+            // descent has already happened. Measured on a stock Bambu plate:
+            // the reordered visible wall was laid a whole layer above its
+            // plane, straight after the lift.
             z: line
                 .z
-                .filter(|_| line.is_move())
+                .filter(|_| line.draws())
                 .map(|_| self.modal.position().2),
             f: line.f,
             xy,
@@ -1273,6 +1409,7 @@ impl<'a, W: Write> Pass<'a, W> {
             carries,
             absolute: self.extruder.is_absolute(),
             resets_origin: line.code == Code::SetPosition,
+            width: is_a_width(line).then_some(self.width),
         });
 
         if extrudes {
@@ -1297,10 +1434,23 @@ impl<'a, W: Write> Pass<'a, W> {
 
     fn open_loop(&mut self, body: usize) {
         // Pull the travel that reaches this loop in with it, so reordering
-        // loops keeps them reachable.
+        // loops keeps them reachable — but not back over the wipe and
+        // retraction the loop before it left behind, which retrace that loop's
+        // own path and have to be written where it is.
+        //
+        // A bare height change in the lead is NOT excluded here, tempting as
+        // it is: a slicer coming off a Z-hop writes hop, travel, `G1 Z<plane>`,
+        // prime, loop, and holding that descent back would keep it out of a
+        // deferred region. Stopping the walk-back at it also changes where
+        // every lead begins, which is what contours are grouped by — measured
+        // on a stock plate, raises fell from 411 to 29. The descent is put
+        // back in `Pass::feed` instead, where nothing else depends on it.
         let floor = self.loops.last().map_or(0, |previous| previous.body + 1);
         let mut lead = body;
-        while lead > floor && !self.buffer[lead - 1].extrudes {
+        while lead > floor
+            && !self.buffer[lead - 1].extrudes
+            && !self.buffer[lead - 1].delta.is_some_and(|delta| delta < 0.0)
+        {
             lead -= 1;
         }
         self.loops.push(Loop {
@@ -1308,7 +1458,9 @@ impl<'a, W: Write> Pass<'a, W> {
             body,
             end: 0,
             beads: 0,
+            trail: 0,
             contour: 0,
+            width: self.width,
             external: self.feature == Feature::ExternalPerimeter,
             hidden: self.feature == Feature::InternalPerimeter,
             filler: is_filler(self.feature),
@@ -1319,6 +1471,7 @@ impl<'a, W: Write> Pass<'a, W> {
             on_a_climb: false,
             outline: None,
             points: 0,
+            cells: (0, 0),
         });
         self.travelled = false;
     }
@@ -1332,6 +1485,8 @@ impl<'a, W: Write> Pass<'a, W> {
         std::mem::swap(&mut self.climbed, &mut self.climbing);
         self.rising.clear();
         self.climbing.clear();
+        self.laid.clear();
+        self.laid_top = f64::NEG_INFINITY;
         self.floor = None;
     }
 
@@ -1402,98 +1557,382 @@ impl<'a, W: Write> Pass<'a, W> {
         self.mark_columns();
         let moved = self.move_walls();
 
-        let head = self.loops.first().map_or(self.buffer.len(), |l| l.lead);
+        let head = self.region_head();
         for index in 0..head {
             self.replay(index, 1.0, &moved)?;
         }
+        if head > 0 {
+            self.at_now = self.buffer[head - 1].at;
+        }
+        let plane = self.plane();
 
-        let mut standing = None;
-        for index in 0..self.loops.len() {
+        // Any loop held back to the end of the layer takes its own lead with
+        // it, and a slicer coming off a Z-hop puts the descent back to the
+        // plane in exactly that lead: hop, travel, `G1 Z<plane>`, prime,
+        // marker, first bead. Hold the region and the descent goes with it,
+        // so everything written between here and the end of the layer is laid
+        // a hop above the plane it was metered for. Measured on a Bambu plate
+        // at a 0.6 mm hop: 662 beads, sparse infill among them.
+        //
+        // It has to happen HERE, between the head and the first loop. Later,
+        // and it cancels the lift a slicer writes after a region's last bead;
+        // in front of every bead instead, it cannot tell a stranded nozzle
+        // from one standing on this pass's own raise, and dropping the latter
+        // put 1327 dragged beads into a real file.
+        //
+        // Only a nozzle left ABOVE the plane counts. Below it is the ordinary
+        // layer change, whose height rides the travel that reaches the first
+        // loop and is put back by that loop's own carrier; saying it again
+        // here only stops the toolhead where a travel was already going to
+        // carry it.
+        let holds = (0..self.loops.len()).any(|at| self.rise_of(self.loops[at]) > 0.0);
+        if holds && self.nozzle_z.is_some_and(|at| at > plane) {
+            self.move_z(plane, false)?;
+        }
+
+        // A region with no loops at all still has to be written out, and past
+        // the last loop's own wipe is the travel that leaves the region —
+        // which belongs at the end however the loops were reordered.
+        let tail = match self.loops.last() {
+            Some(last) => last.end..self.buffer.len(),
+            None => head..self.buffer.len(),
+        };
+
+        let mut waiting = Vec::new();
+        for index in self.order() {
             let current = self.loops[index];
-            let end = current.end;
-
-            // A loop with nothing standing on it stays on the plane however
-            // the parity fell: raising it would leave a bead half a layer
-            // proud of whatever the slicer prints over it next, into a gap it
-            // metered for a whole layer. `extrusion_factor` meters the half
-            // gap the column below already filled.
-            let offset = self.rise_of(current);
-            let raise = offset > 0.0;
-            let plane = self.plane();
-            let target = plane + offset;
-            let carrier = self.carrier(current.lead, current.body, target);
-            for at in current.lead..current.body {
-                match carrier {
-                    Some(at_) if at_ == at => self.ride(at, target, raise, &moved)?,
-                    _ => self.replay(at, 1.0, &moved)?,
-                }
+            if self.rise_of(current) > 0.0 {
+                waiting.push(current);
+                continue;
             }
-            // After the lead, so a slicer's own Z-hop restore cannot undo it.
-            // A no-op where the carrier already took the nozzle there.
-            self.move_z(target, raise)?;
-            let factor = self.extrusion_factor(current);
-            if raise {
-                let half = self.height() / 2.0;
-                self.raise = Some(match self.raise {
-                    Some((low, high)) => (low.min(half), high.max(half)),
-                    None => (half, half),
-                });
-            }
-            // A loop metered exactly as sliced has nothing to book, and
-            // summing its stock is the one cost here worth avoiding.
-            if raise || factor != 1.0 {
-                let geometry = self.geometry(current);
-                self.meter(current.body, current.beads, factor, geometry, raise);
-            }
-            // The nozzle has to come back down before whatever the slicer
-            // prints next, and the travel that leaves the region can carry it
-            // just as well as the lead carried the way up — unless the height
-            // that follows is already going somewhere, in which case a reset
-            // would fight it. That is either a `G1 Z` the slicer put in this
-            // region's own tail, or, where the file states no layers, the one
-            // held back for the layer about to open: both take the nozzle to
-            // the next plane themselves.
-            let commanded = self.buffer[current.body..end]
-                .iter()
-                .any(|buffered| buffered.z.is_some());
-            let closing = (index + 1 == self.loops.len() && raise && !commanded && !self.holding)
-                .then(|| self.carrier(current.body, end, plane))
-                .flatten();
-            for at in current.body..end {
-                // Past the last bead the flow no longer applies: what is left
-                // is the retraction and wipe that leave the loop, and scaling
-                // those pulls back a length the priming move will not put back.
-                let factor = if at < current.beads { factor } else { 1.0 };
-                match closing {
-                    Some(at_) if at_ == at => self.ride(at, plane, false, &moved)?,
-                    _ => self.replay(at, factor, &moved)?,
-                }
-            }
-
-            standing = raise.then_some(target);
-            // Gap fill rides in the buffer to keep the wall around it whole,
-            // but it is not one of the wall's loops and counting it would put
-            // beads in the report that nothing was ever going to raise.
-            self.loops_seen += usize::from(!current.filler);
-            self.raised += usize::from(raise);
-            self.capped += usize::from(current.raised && current.capped);
+            self.write_loop(current, plane, &moved)?;
         }
 
-        // Only where the nozzle is still standing at the raise. A region whose
-        // last lines are the slicer's own retract and lift has already left it,
-        // and writing a height there would pull the nozzle back down through
-        // whatever the lift was for. A region whose tail is being held has not
-        // ended at all: those lines still run before anything else, and they
-        // are what takes the nozzle to the next plane.
-        if !self.holding && standing.is_some_and(|target| self.nozzle_z == Some(target)) {
-            self.move_z(self.plane(), false)?;
+        for at in tail.clone() {
+            // Past the last bead the flow no longer applies: what is left is
+            // the retraction and wipe that leave the loop, and scaling those
+            // pulls back a length the priming move will not put back.
+            self.replay(at, 1.0, &moved)?;
+        }
+        if tail.end > tail.start {
+            self.at_now = self.buffer[tail.end - 1].at;
         }
 
-        self.arena.clear();
-        self.buffer.clear();
         self.loops.clear();
         self.travelled = false;
+        if !waiting.is_empty() {
+            let held = self.hold(&waiting, plane);
+            self.held.push(held);
+        }
+        self.arena.clear();
+        self.buffer.clear();
+        self.raised_cells.clear();
         Ok(())
+    }
+
+    /// The lines of a region that belong to the region rather than to any one
+    /// of its loops, and so are written before all of them.
+    ///
+    /// It is the first loop's lead that decides this, and the first loop's
+    /// lead is where a slicer puts the layer's own height. That loop may now
+    /// be written last, and a height that travels with it leaves every loop
+    /// written before it printing at the layer below's plane.
+    ///
+    /// Only a line that goes nowhere may be hoisted. Klipper and Orca put the
+    /// layer's height on the travel that *reaches* the first bead, and taking
+    /// that into the head takes the loop's only travel with it: the loop is
+    /// then written from wherever the reorder left the nozzle, and its first
+    /// bead is drawn straight there. Measured on a 10-object plate, that put
+    /// **28 extruding moves over 60 mm** into the output, the worst 155.9 mm
+    /// carrying 0.01 mm of filament — a line dragged across the whole bed.
+    ///
+    /// Where the height rides a travel it is therefore left on it, and nothing
+    /// is lost by that: whichever loop is written first has a travel of its
+    /// own in its lead, and [`Pass::carrier`] puts the plane on that travel
+    /// exactly as it puts a raise on one. The plane still arrives before the
+    /// first bead of the region, and it arrives without stopping the toolhead.
+    fn region_head(&mut self) -> usize {
+        let Some(first) = self.loops.first().copied() else {
+            return self.buffer.len();
+        };
+        // Up to the first move that goes anywhere, and no further. The head is
+        // a prefix, so stopping at the height alone still hoists the travel in
+        // front of it.
+        let head = (first.lead..first.body)
+            .find(|&at| self.buffer[at].steers)
+            .unwrap_or(first.body);
+        if let Some(loop_) = self.loops.first_mut() {
+            loop_.lead = head;
+        }
+        head
+    }
+
+    /// with every index they carry rewritten to point into the copy.
+    ///
+    /// The region itself is dropped with the rest of the flush, so what is
+    /// carried to the end of the layer is the raised beads and the travels
+    /// that reach them rather than a layer of perimeter text. Nothing they
+    /// hold is moved sideways: only the visible wall is, and the visible wall
+    /// anchors the alternation at phase zero and so is never raised.
+    fn hold(&self, waiting: &[Loop], plane: f64) -> Held {
+        let mut held = Held {
+            arena: Vec::new(),
+            buffer: Vec::new(),
+            cells: Vec::new(),
+            loops: Vec::with_capacity(waiting.len()),
+            marker: self.marker.clone(),
+            plane,
+        };
+        for current in waiting {
+            let mut copy = *current;
+            let base = held.buffer.len();
+            for at in current.lead..current.end {
+                let mut line = self.buffer[at];
+                let start = held.arena.len();
+                held.arena
+                    .extend_from_slice(&self.arena[line.start..line.end]);
+                line.start = start;
+                line.end = held.arena.len();
+                held.buffer.push(line);
+            }
+            copy.body = base + (current.body - current.lead);
+            copy.beads = base + (current.beads - current.lead);
+            copy.trail = base + (current.trail - current.lead);
+            copy.end = base + (current.end - current.lead);
+            copy.lead = base;
+            let (from, to) = current.cells;
+            copy.cells = (held.cells.len(), held.cells.len() + (to - from));
+            held.cells.extend_from_slice(&self.raised_cells[from..to]);
+            held.loops.push(copy);
+        }
+        held
+    }
+
+    /// Writes the loops this layer held back, at the plane they belong to.
+    ///
+    /// Ordered by height across every region that held any, for the reason
+    /// [`Pass::order`] gives: a settled column and one still climbing are a
+    /// quarter of a layer apart, and two regions of a layer can stand beside
+    /// each other. Nothing is written to bring the nozzle back down — these
+    /// are the last beads on their layer, and the layer change that follows
+    /// commands the next plane itself.
+    fn write_held(&mut self) -> io::Result<()> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let mut regions = std::mem::take(&mut self.held);
+        let mut plan: Vec<(usize, usize)> = Vec::new();
+        for (at, held) in regions.iter().enumerate() {
+            plan.extend((0..held.loops.len()).map(|loop_| (at, loop_)));
+        }
+        plan.sort_by(|left, right| {
+            self.rise_of(regions[left.0].loops[left.1])
+                .total_cmp(&self.rise_of(regions[right.0].loops[right.1]))
+        });
+
+        let arena = std::mem::take(&mut self.arena);
+        let buffer = std::mem::take(&mut self.buffer);
+        let cells = std::mem::take(&mut self.raised_cells);
+        let mut wrote = Ok(());
+        let mut said: Vec<u8> = Vec::new();
+        for (at, loop_) in plan {
+            let current = regions[at].loops[loop_];
+            let plane = regions[at].plane;
+            if !regions[at].marker.is_empty() && regions[at].marker != said {
+                said.clear();
+                said.extend_from_slice(&regions[at].marker);
+                write_line(&mut self.out, &said)?;
+            }
+            std::mem::swap(&mut self.arena, &mut regions[at].arena);
+            std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
+            std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
+            let moved = vec![None; self.buffer.len()];
+            wrote = self.write_loop(current, plane, &moved);
+            std::mem::swap(&mut self.arena, &mut regions[at].arena);
+            std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
+            std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
+            if wrote.is_err() {
+                break;
+            }
+        }
+        self.arena = arena;
+        self.buffer = buffer;
+        self.raised_cells = cells;
+        wrote
+    }
+
+    /// Writes one loop: the travel that reaches it, the height it is printed
+    /// at, and its beads at the flow its own geometry asks for.
+    fn write_loop(&mut self, current: Loop, plane: f64, moved: &[Option<Moved>]) -> io::Result<()> {
+        // A loop with nothing standing on it stays on the plane however the
+        // parity fell: raising it would leave a bead half a layer proud of
+        // whatever the slicer prints over it next, into a gap it metered for a
+        // whole layer. `extrusion_factor` meters the half gap the column below
+        // already filled.
+        let offset = self.rise_of(current);
+        let raise = offset > 0.0;
+        let target = plane + offset;
+        // A height that rides a travel arrives half way along it, which is no
+        // use where the travel has to be clear of something for the whole of
+        // its length. Where both ends of the ride are already above whatever
+        // the travel crosses there is nothing to do; otherwise the nozzle goes
+        // up first and only comes down once the travel is over.
+        let clear = self
+            .clearance(current.lead, current.body, self.at_now)
+            .unwrap_or(f64::NEG_INFINITY);
+        let standing = self.nozzle_z.unwrap_or(target);
+        let rides = target >= clear && standing >= clear;
+        let carrier = rides
+            .then(|| self.carrier(current.lead, current.body, target))
+            .flatten();
+        if !rides && standing < clear {
+            self.move_z(clear, true)?;
+        }
+        for at in current.lead..current.body {
+            match carrier {
+                Some(at_) if at_ == at => self.ride(at, target, raise, moved)?,
+                _ => self.replay(at, 1.0, moved)?,
+            }
+        }
+        // A slicer states the width once for a whole region and this pass
+        // writes that region's loops in another order, so every loop after the
+        // first inherits whatever the region before it declared. Measured on a
+        // real plate, 8460 of 28178 beads were drawn at the wrong width.
+        if current.width != self.wrote_width {
+            let width = self.widths[current.width].clone();
+            self.out.write_all(&width)?;
+            self.out.write_all(b"\n")?;
+            self.wrote_width = current.width;
+        }
+        // After the lead, so a slicer's own Z-hop restore cannot undo it. A
+        // no-op where the carrier already took the nozzle there.
+        self.move_z(target, raise)?;
+        let factor = self.extrusion_factor(current);
+        if raise {
+            let half = self.height() / 2.0;
+            self.raise = Some(match self.raise {
+                Some((low, high)) => (low.min(half), high.max(half)),
+                None => (half, half),
+            });
+        }
+        // A loop metered exactly as sliced has nothing to book, and summing
+        // its stock is the one cost here worth avoiding.
+        if raise || factor != 1.0 {
+            let geometry = self.geometry(current);
+            self.meter(current.body, current.beads, factor, geometry, raise);
+        }
+        for at in current.body..current.end {
+            // Past the last bead the flow no longer applies: what is left is
+            // the retraction and the wipe, and scaling those pulls back a
+            // length the priming move will not put back.
+            //
+            // To `end`, not to `trail`. A slicer writes the wipe as a comment,
+            // an `M204` and only THEN the negative move, so `trail` stops at
+            // the comment and everything after it — the wipe, the retraction,
+            // the `M73` beside them — belongs to no range at all. Written only
+            // for the region's last loop, as it was, every other loop's
+            // retraction was dropped: measured on a real plate, 44951 of
+            // 52498 gone and the part 12.46% heavier, with the nozzle
+            // travelling primed the whole way.
+            let factor = if at < current.beads { factor } else { 1.0 };
+            // A wipe retraces the bead it follows, so a loop that was raised
+            // carries its wipe up with it. The slicer's own descent to the
+            // plane sits inside that block and would drop the nozzle onto the
+            // bead it has just left standing proud; held at the raise, the
+            // next travel puts it back where it belongs.
+            match self.buffer[at].z {
+                Some(z) if raise && z < target => self.ride(at, target, raise, moved)?,
+                _ => self.replay(at, factor, moved)?,
+            }
+        }
+        if current.end > current.lead {
+            self.at_now = self.buffer[current.end - 1].at;
+        }
+        // Only now is the bead really in anything's way.
+        if raise {
+            let (from, to) = current.cells;
+            let Self {
+                laid, raised_cells, ..
+            } = self;
+            laid.absorb(&raised_cells[from..to]);
+            laid.settle();
+            self.laid_top = self.laid_top.max(target);
+        }
+        // Gap fill rides in the buffer to keep the wall around it whole, but
+        // it is not one of the wall's loops and counting it would put beads in
+        // the report that nothing was ever going to raise.
+        self.loops_seen += usize::from(!current.filler);
+        self.raised += usize::from(raise);
+        self.capped += usize::from(current.raised && current.capped);
+        Ok(())
+    }
+
+    /// The order this region's loops are laid in, which is not the order the
+    /// slicer wrote them.
+    ///
+    /// A bead laid on the plane beside one already standing half a layer proud
+    /// is plowed by the nozzle's own underside on the way past: the loops of a
+    /// wall run about 0.39 mm apart, which puts the raised bead's edge inside
+    /// the bore of the nozzle laying its neighbour. The only order free of that
+    /// is every flat loop of a contour before any raised one — a raised bead
+    /// then never has a lower neighbour laid after it.
+    ///
+    /// It is not the same as the wall order a slicer offers. Printing the
+    /// visible wall first is free of it at two walls and not at three, because
+    /// either of the two orders a slicer will write still leaves a flat loop
+    /// somewhere in the stack to be laid after a raised one. This is why
+    /// nothing here reads `external_perimeters_first` to decide it.
+    ///
+    /// It is a sort by height rather than a flat-then-raised split because a
+    /// layer has more than two heights in it: a column part way up the ramp
+    /// stands at half the offset, so a settled loop laid before a climbing one
+    /// beside it is plowed exactly as a raised one laid before a flat one is.
+    /// Lowest first covers all of them.
+    ///
+    /// It is the whole region rather than each contour in turn, because two
+    /// contours of one region can run beside each other — a hole's wall inside
+    /// an island's — and one climbing while the other has settled puts the
+    /// same quarter-layer step between them. The sort is stable, so loops at
+    /// the same height keep the order the slicer wrote them in and each
+    /// contour is still walked in one direction; a region is visited once per
+    /// height it holds, and there are at most three.
+    fn order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.loops.len()).collect();
+        order.sort_by(|left, right| {
+            self.rise_of(self.loops[*left])
+                .total_cmp(&self.rise_of(self.loops[*right]))
+        });
+        order
+    }
+
+    /// The height the moves in `from..to` have to be clear of, or `None`
+    /// where they cross nothing this layer has left standing proud.
+    ///
+    /// The slicer had no reason to lift over those beads: when it wrote the
+    /// travel they topped out at the plane the travel runs along, and raising
+    /// them afterwards is what put material in the way. So clearing them is
+    /// this pass's debt rather than the slicer's.
+    ///
+    /// It is the height actually laid, not the offset a full raise would take:
+    /// a column part way up the ramp stands lower, and a nozzle already at the
+    /// height of what it crosses is where it is on every ordinary travel a
+    /// slicer writes over its own layer.
+    fn clearance(&self, from: usize, to: usize, mut at: (f64, f64)) -> Option<f64> {
+        if self.laid.is_empty() {
+            return None;
+        }
+        let grid = self.laid.grid();
+        let mut crosses = false;
+        for index in from..to {
+            let buffered = self.buffer[index];
+            if buffered.steers && !crosses {
+                footprint::cells(grid, at, buffered.at, buffered.arc, |cell| {
+                    crosses |= self.laid.has(cell);
+                });
+            }
+            at = buffered.at;
+        }
+        crosses.then_some(self.laid_top)
     }
 
     /// Groups the region's loops into contours and numbers them.
@@ -1512,22 +1951,43 @@ impl<'a, W: Write> Pass<'a, W> {
     /// seam can sit anywhere on the loop.
     fn assign_contours(&mut self) {
         for index in 0..self.loops.len() {
-            let end = self
-                .loops
-                .get(index + 1)
-                .map_or(self.buffer.len(), |next| next.lead);
             let body = self.loops[index].body;
-            // The travel out of one loop is pulled into the next one's lead,
-            // so only the region's last loop ever holds a tail of its own —
-            // and that one holds everything to the end of the region.
+            let end = match self.loops.get(index + 1) {
+                // A lead is walked back over everything that lays nothing and
+                // stops at the retraction, so this already lands between one
+                // loop's wipe and the travel that reaches the next.
+                Some(next) => next.lead,
+                // The region's last loop takes its own wipe and no more. The
+                // travel that LEAVES the region belongs to the region, and
+                // giving it to the loop moves it wherever that loop is
+                // reordered to — which left the infill after it drawn from
+                // wherever the nozzle happened to be.
+                None => {
+                    let stop = self.buffer.len();
+                    let laid = (body..stop)
+                        .rev()
+                        .find(|&at| self.buffer[at].extrudes)
+                        .map_or(body, |at| at + 1);
+                    (laid..stop)
+                        .rfind(|&at| self.buffer[at].delta.is_some_and(|delta| delta < 0.0))
+                        .map_or(laid, |at| at + 1)
+                }
+            };
             let beads = (body..end)
                 .rev()
                 .find(|&at| self.buffer[at].extrudes)
                 .map_or(body, |at| at + 1);
+            // The wipe and retraction that follow the last bead retrace it, so
+            // they go where it goes.
+            let mut trail = beads;
+            while trail < end && self.buffer[trail].delta.is_some_and(|delta| delta < 0.0) {
+                trail += 1;
+            }
             let (outline, points) = self.measure(body, end);
             let current = &mut self.loops[index];
             current.end = end;
             current.beads = beads;
+            current.trail = trail;
             current.outline = outline;
             current.points = points;
         }
@@ -1901,6 +2361,9 @@ impl<'a, W: Write> Pass<'a, W> {
         // for a path nothing drew. A line naming neither coordinate is the one
         // case `Line::write_moved` refuses.
         let to = moved[index].filter(|_| buffered.places);
+        if let Some(width) = buffered.width {
+            self.wrote_width = width;
+        }
         if let Some(z) = buffered.z {
             self.nozzle_z = Some(z);
         }
@@ -2265,6 +2728,9 @@ impl<'a, W: Write> Pass<'a, W> {
             let current = self.loops[index];
             if self.rise_of(current) > 0.0 {
                 rising.absorb(&path);
+                let start = self.raised_cells.len();
+                self.raised_cells.extend_from_slice(&path);
+                self.loops[index].cells = (start, self.raised_cells.len());
                 // The intermediate step of the ramp, which the layer above
                 // has to meter against rather than against the full offset.
                 if current.steps < RAMP {
