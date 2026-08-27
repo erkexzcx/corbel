@@ -697,6 +697,17 @@ pub struct Ledger {
     /// once for all of them. Length, not moves: the surface transform splits
     /// one move into many and draws exactly the same line.
     pub widths: HashMap<String, f64>,
+    /// How far the toolhead travels while the nozzle still holds pressure.
+    ///
+    /// A slicer leaves short hops between two loops of one wall unretracted,
+    /// because a few millimetres primed cost nothing. Move one of those loops
+    /// somewhere else and the same unretracted hop becomes a journey across
+    /// the plate, which is where stringing comes from. The retraction COUNT is
+    /// untouched by that, which is why counting them cannot see it.
+    pub primed_travel: f64,
+    /// Height changes written as a move of their own while primed, which stop
+    /// the toolhead dead with a full nozzle over the seam.
+    pub primed_stops: usize,
 }
 
 pub fn ledger(gcode: &str) -> Ledger {
@@ -710,7 +721,11 @@ pub fn ledger(gcode: &str) -> Ledger {
         bead_feed: (f64::INFINITY, 0.0),
         backwards: Vec::new(),
         widths: HashMap::new(),
+        primed_travel: 0.0,
+        primed_stops: 0,
     };
+    // Filament pulled back and not yet put in. Only a nozzle at zero oozes.
+    let mut withdrawn = 0.0_f64;
     let mut width = String::new();
     let mut layer = 0usize;
     let mut feed = 0.0_f64;
@@ -757,6 +772,24 @@ pub fn ledger(gcode: &str) -> Ledger {
         }
         let from = modal.position();
         let delta = line.e.filter(|_| line.draws()).map(|e| extruder.observe(e));
+        // A retraction and its prime name no coordinate; a bead's own
+        // filament is not a prime and must not cancel one, but a bead does
+        // prove the nozzle is full.
+        // A wipe pulls filament back along a path, so most of a retraction is
+        // named on a line that also names a coordinate. Counting only the bare
+        // ones reads a wiped nozzle as a full one.
+        if let Some(value) = delta {
+            withdrawn = (withdrawn - value).max(0.0);
+        }
+        if line.draws()
+            && line.z.is_some()
+            && line.x.is_none()
+            && line.y.is_none()
+            && delta.is_none()
+            && withdrawn <= 1e-9
+        {
+            book.primed_stops += 1;
+        }
         if let Some(value) = delta {
             if value > 0.0 {
                 book.extruded += value;
@@ -783,6 +816,8 @@ pub fn ledger(gcode: &str) -> Ledger {
             };
             book.drawn[layer] += along;
             *book.widths.entry(width.clone()).or_default() += along;
+        } else if (line.x.is_some() || line.y.is_some()) && withdrawn <= 1e-9 {
+            book.primed_travel += (to.0 - from.0).hypot(to.1 - from.1);
             if feed > 0.0 {
                 book.bead_feed.0 = book.bead_feed.0.min(feed);
                 book.bead_feed.1 = book.bead_feed.1.max(feed);
@@ -829,6 +864,13 @@ const PATH_DRIFT: f64 = 0.02;
 /// exists to catch was **13 percentage points** out, so there is a wide empty
 /// valley between the two and this sits in it.
 const CLAIM_SLACK: f64 = 1.0;
+
+/// How much further than the input the nozzle may travel primed.
+///
+/// Nothing, to within rounding. The transform reorders loops; it has no reason
+/// to move the toolhead further with a full nozzle than the slicer already
+/// did, and every millimetre it adds is a millimetre of string.
+const PRIMED_SLACK: f64 = 0.01;
 
 /// Everything one file must still be able to say about another that came out
 /// of the transform, gathered in one place so every suite asks the same
@@ -903,6 +945,29 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
              for it ({:.1}%) — a region states its `; LINE_WIDTH:` once and its loops were \
              reordered away from it",
             astray / drawn * 100.0
+        ));
+    }
+
+    // Stringing has one cause: the nozzle moving, or standing still, with
+    // pressure behind it. A slicer decides where that is cheap — a hop between
+    // two loops of one wall — and moving a loop somewhere else turns its cheap
+    // hop into a journey. Neither the retraction count nor the filament total
+    // changes when that happens, which is why both had to be joined by this.
+    if after.primed_travel > before.primed_travel * (1.0 + PRIMED_SLACK) {
+        found.push(format!(
+            "the nozzle travels {:.0} mm primed against {:.0} mm in the input ({:+.0}%) \
+             — a loop was moved away from the hop the slicer left unretracted, and it \
+             strings the whole way",
+            after.primed_travel,
+            before.primed_travel,
+            (after.primed_travel / before.primed_travel.max(1.0) - 1.0) * 100.0
+        ));
+    }
+    if after.primed_stops > before.primed_stops {
+        found.push(format!(
+            "{} height changes are written as a move of their own while the nozzle is \
+             primed, against {} in the input — each one stops the toolhead dead over a seam",
+            after.primed_stops, before.primed_stops
         ));
     }
 

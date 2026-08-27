@@ -1570,7 +1570,7 @@ fn the_retraction_that_leaves_a_region_is_not_metered_at_the_wall_flow() {
     let out = run(&source, &Config::default());
     let retractions: Vec<&str> = out
         .lines()
-        .filter(|line| line.starts_with("G1 E-"))
+        .filter(|line| line.starts_with("G1 E-") && !line.contains(BRICK_STAMP))
         .collect();
     assert!(
         !retractions.is_empty(),

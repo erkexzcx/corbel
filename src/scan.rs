@@ -147,6 +147,12 @@ pub struct Survey {
     pub nozzle: Option<f64>,
     /// Slowest feedrate the file itself uses to move Z alone, in mm/min.
     pub z_feedrate: Option<f64>,
+    /// Shortest travel the slicer says it retracts for, in mm. Reordering can
+    /// turn a hop the slicer left open into a journey, and this is the file's
+    /// own word on how far is far enough to be worth closing.
+    pub hop_travel: Option<f64>,
+    /// How much filament the slicer pulls back for a travel, in mm.
+    pub retract_length: Option<f64>,
     /// True when [`brick`](crate::brick) has already run over this file.
     pub bricked: bool,
     /// True when [`zaa`](crate::zaa) has already run over this file.
@@ -343,6 +349,8 @@ struct Scan {
     /// one can stand in for a layer height the file never states.
     z_steps: Vec<(i64, usize)>,
     z_feedrate: Option<f64>,
+    hop_travel: Option<f64>,
+    retract_length: Option<f64>,
     bricked: bool,
     contoured: bool,
     arc_extrusions: usize,
@@ -481,6 +489,19 @@ impl Scan {
                     self.skin_width.get_or_insert_with(|| value.to_owned());
                 } else if is_wall_width(key) {
                     self.wall_width.get_or_insert_with(|| value.to_owned());
+                } else if key.eq_ignore_ascii_case("retraction_minimum_travel") {
+                    if let Ok(far) = value.split(',').next().unwrap_or("").trim().parse() {
+                        self.hop_travel.get_or_insert(far);
+                    }
+                } else if key.eq_ignore_ascii_case("retraction_length")
+                    || key.eq_ignore_ascii_case("retract_length")
+                {
+                    if let Ok(pull) = value.split(',').next().unwrap_or("").trim().parse::<f64>()
+                        && pull > 0.0
+                        && pull < 20.0
+                    {
+                        self.retract_length.get_or_insert(pull);
+                    }
                 } else if key.eq_ignore_ascii_case("nozzle_diameter") {
                     self.nozzle.get_or_insert_with(|| value.to_owned());
                 } else if key.eq_ignore_ascii_case("wall_sequence")
@@ -883,6 +904,8 @@ impl Scan {
             wall_width: width(self.wall_width.as_deref(), nozzle),
             nozzle,
             z_feedrate: self.z_feedrate,
+            hop_travel: self.hop_travel,
+            retract_length: self.retract_length,
             bricked: self.bricked,
             contoured: self.contoured,
             arc_extrusions: self.arc_extrusions,
