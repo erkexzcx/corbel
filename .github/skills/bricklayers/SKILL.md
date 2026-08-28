@@ -825,6 +825,19 @@ not "fix" it.
 - `fetch_webpage` silently summarises JSON. Use `curl` + `jq` for anything that
   must be complete.
 
+### The plane restore in `flush` cancels a slicer's hop, and two fixes for it were wrong
+
+`flush` writes `G1 Z<plane> ; corbel brick reset` between the region head and the first loop, so a descent a deferred region carried away is put back before anything is drawn. It cannot tell that descent from a hop the slicer made *for the travel that reaches the first loop* — measured on a user's 1000-wall bushing, **71 of the slicer's own hops cancelled, one a layer, each in front of 10 to 12 mm of travel then made at bead height**.
+
+It is latent rather than active: on that part every one of those travels crosses the empty bore, and `Field::crest` reports **zero** collisions along them. `Pass::clearance` is what stops a real one.
+
+Two narrower conditions were tried and both regress `plates::a_square_lift_between_islands` and `a_helical_lift_between_islands` to **a bead 600 µm above its plane** — a crash, far worse than the hop:
+
+- skip the restore where the first loop's lead holds a steering move
+- skip it where the lead holds a descent to the plane or below
+
+So the descent that reaches the nozzle on those files is not the one in the lead, and something between `region_head`, `Pass::carrier` and the clearance lift consumes it. Start there, not at the condition.
+
 ## Verifying a change
 
 Never ship a change to loop handling without running all of these.
