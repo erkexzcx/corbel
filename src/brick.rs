@@ -3082,6 +3082,12 @@ impl<'a, W: Write> Pass<'a, W> {
     /// the pull that answers it, so the amount taken out here is exactly the
     /// amount that lead will put back and the filament still balances.
     fn unprime(&mut self, charge: f64) -> io::Result<()> {
+        // Nothing to move is nothing to write: a bead that emptied the nozzle
+        // exactly leaves a prime of zero, which is a line the printer reads
+        // and a stop it makes for no filament at all.
+        if charge.abs() < f64::EPSILON {
+            return Ok(());
+        }
         let value = self.extruder.advance(charge);
         let rate = self.retract_feed.unwrap_or(1800.0);
         let mut line = Vec::with_capacity(32);
