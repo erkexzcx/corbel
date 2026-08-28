@@ -783,6 +783,15 @@ struct Pass<'a, W: Write> {
     /// Filament put in ahead of a bead the reordering left dry, waiting for
     /// the prime it was owed to.
     debt: f64,
+    /// A plane a deferred region carried the descent away from, owed until
+    /// something is actually drawn.
+    ///
+    /// Writing it where it is discovered puts it in front of the travel the
+    /// slicer hopped for, and that journey is then made at bead height —
+    /// measured on a user's 1000-wall bushing, 71 of the slicer's own hops
+    /// cancelled, one a layer, each ahead of 10 to 12 mm. The slicer itself
+    /// comes down on arrival, and so does this.
+    owed_plane: Option<f64>,
     /// A pull taken out for a height move of this pass's own, given back once
     /// that move has been written. Kept apart from `owing` so replaying the
     /// loop's lead cannot hand it back early and leave the stop primed.
@@ -906,6 +915,7 @@ impl<'a, W: Write> Pass<'a, W> {
             wrote_marker: 0,
             withdrawn: 0.0,
             owing: None,
+            owed_plane: None,
             wrote_at: (0.0, 0.0),
             was_at: (0.0, 0.0),
             debt: 0.0,
@@ -1638,13 +1648,8 @@ impl<'a, W: Write> Pass<'a, W> {
             let borrowed = (self.withdrawn <= 0.0)
                 .then_some(self.retract_charge)
                 .flatten();
-            if let Some(charge) = borrowed {
-                self.unprime(-charge)?;
-            }
-            self.move_z(plane, false)?;
-            if let Some(charge) = borrowed {
-                self.unprime(charge)?;
-            }
+            let _ = borrowed;
+            self.owed_plane = Some(plane);
         }
 
         // A region with no loops at all still has to be written out, and past
@@ -2503,6 +2508,9 @@ impl<'a, W: Write> Pass<'a, W> {
         // Filling it here is what makes the travel that follows correct too:
         // the prime the slicer left stranded is now unanswered, so the rule
         // below pulls for it and the filament comes back to where it was.
+        if buffered.places && buffered.delta.is_some_and(|delta| delta > 0.0) {
+            self.settle_plane()?;
+        }
         if self.withdrawn > 0.0
             && buffered.places
             && buffered.delta.is_some_and(|delta| delta > 0.0)
@@ -2655,6 +2663,13 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(charge) = self.owing.filter(|_| line.e.is_some() && line.draws()) {
             self.owing = None;
             self.unprime(charge)?;
+        }
+        if line.draws_in_plane()
+            && line
+                .e
+                .is_some_and(|e| e > 0.0 || !self.extruder.is_absolute())
+        {
+            self.settle_plane()?;
         }
         let Some(e) = line.e.filter(|_| line.draws()) else {
             return self.push(line.origin());
@@ -3103,11 +3118,37 @@ impl<'a, W: Write> Pass<'a, W> {
         Ok(())
     }
 
+    /// Puts the nozzle back on the plane a deferred region left it above,
+    /// at the moment something is about to be drawn there.
+    fn settle_plane(&mut self) -> io::Result<()> {
+        let Some(plane) = self
+            .owed_plane
+            .filter(|&at| self.nozzle_z.is_some_and(|now| now > at))
+        else {
+            self.owed_plane = None;
+            return Ok(());
+        };
+        // The same dead stop as anywhere else: this height has no move of the
+        // slicer's own to ride, so empty the nozzle for it and fill it again.
+        let borrowed = (self.withdrawn <= 0.0)
+            .then_some(self.retract_charge)
+            .flatten();
+        if let Some(charge) = borrowed {
+            self.unprime(-charge)?;
+        }
+        self.move_z(plane, false)?;
+        if let Some(charge) = borrowed {
+            self.unprime(charge)?;
+        }
+        Ok(())
+    }
+
     fn move_z(&mut self, z: f64, raised: bool) -> io::Result<()> {
         if self.nozzle_z.is_some_and(|current| current == z) {
             return Ok(());
         }
         self.nozzle_z = Some(z);
+        self.owed_plane = None;
         let note = if raised { "raised" } else { "reset" };
         let rate = self.z_feedrate;
         // Plain `Display`, not `{:.0}`: both rates were read off the file, and

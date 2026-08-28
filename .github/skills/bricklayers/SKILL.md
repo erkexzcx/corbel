@@ -825,18 +825,20 @@ not "fix" it.
 - `fetch_webpage` silently summarises JSON. Use `curl` + `jq` for anything that
   must be complete.
 
-### The plane restore in `flush` cancels a slicer's hop, and two fixes for it were wrong
+### The plane a deferred region carried away is OWED, not written where it is found
 
-`flush` writes `G1 Z<plane> ; corbel brick reset` between the region head and the first loop, so a descent a deferred region carried away is put back before anything is drawn. It cannot tell that descent from a hop the slicer made *for the travel that reaches the first loop* — measured on a user's 1000-wall bushing, **71 of the slicer's own hops cancelled, one a layer, each in front of 10 to 12 mm of travel then made at bead height**.
+`flush` discovers, between a region's head and its first loop, that the nozzle stands above the plane because a deferred region took the slicer's descent with it. Writing the descent there puts it in front of the travel the slicer hopped for, and the journey is then made at bead height: measured on a user's 1000-wall bushing, **71 of the slicer's own hops cancelled, one a layer, each ahead of 10 to 12 mm of travel**.
 
-It is latent rather than active: on that part every one of those travels crosses the empty bore, and `Field::crest` reports **zero** collisions along them. `Pass::clearance` is what stops a real one.
+`Pass.owed_plane` records it instead, and `Pass::settle_plane` discharges it at the first thing actually drawn, on both write paths. That is where the slicer puts its own descent too. `move_z` clears the debt, so a loop that sets its own height — a raised one at plane plus half a layer — is never dragged back down to the plane by it.
 
-Two narrower conditions were tried and both regress `plates::a_square_lift_between_islands` and `a_helical_lift_between_islands` to **a bead 600 µm above its plane** — a crash, far worse than the hop:
+The two conditions that do NOT work, both of which put **a bead 600 µm above its plane** on `plates::a_square_lift_between_islands` and `a_helical_lift_between_islands`:
 
 - skip the restore where the first loop's lead holds a steering move
 - skip it where the lead holds a descent to the plane or below
 
-So the descent that reaches the nozzle on those files is not the one in the lead, and something between `region_head`, `Pass::carrier` and the clearance lift consumes it. Start there, not at the condition.
+Neither can work, because the descent is missing from the lead in exactly the case that needs it: the region that had it was deferred, and what follows the hop is often an infill region with no loops at all, so nothing in the buffer answers for it. The debt has to outlive the flush.
+
+Pinned by `dropped_hops` in `tests/nozzle/mod.rs` — a height move that puts the nozzle down and is then travelled away from before anything is drawn. Without the fix the plates report 8 to 29 against the input's own 7.
 
 ## Verifying a change
 

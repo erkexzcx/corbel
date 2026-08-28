@@ -15,6 +15,15 @@ nobody asked for.
 **Anything you find is either a bug or a limitation. There is no third
 category, and "worth doing later" is not one.**
 
+**NEVER write that something is "not fixed", "left standing", "latent", "known"
+or any other word for a defect you found and walked away from.** There is no
+such state. A defect is fixed, or it is proved to be a limitation and written
+into README.md with the measurement behind it — and a limitation is something
+that CANNOT be fixed, not something that was hard or that broke a test on the
+first two attempts. A fix that regresses another test is not a reason to
+abandon the fix; it is the next thing to understand. Keep going until the whole
+suite is green with the defect gone.
+
 - If it can genuinely be fixed, **fix it, without asking**. Large is not an
   excuse to defer: if the fix is a week of work, do the week of work.
 - Only something that truly cannot be fixed is a limitation, and a limitation
@@ -214,6 +223,7 @@ in the way.
   `a_rise_on_one_row_still_reaches_the_rows_either_side_of_it` and
   `a_pocket_a_row_cuts_in_two_is_still_one_pocket`; the real proof is
   byte-identical output on six real files.
+- **A plane a deferred region carried the descent away from is OWED, never written where it is found.** `flush` sees the nozzle standing above the plane between a region's head and its first loop, but writing the descent there puts it in FRONT of the travel the slicer hopped for, and that journey is then made at bead height — measured on a user's 1000-wall bushing, **71 of the slicer's own hops cancelled, one a layer, each ahead of 10 to 12 mm**. `Pass.owed_plane` holds it and `Pass::settle_plane` discharges it at the first thing drawn, on BOTH write paths, which is where the slicer puts its own descent. `move_z` clears the debt, so a loop that sets its own height is never dragged back to the plane. Do NOT try to answer this with a condition on the first loop's lead: the descent is missing from the lead in exactly the case that needs it, and what follows the hop is often an infill region with no loops at all. Two such conditions were tried and both put a bead 600 µm above its plane on the island-lift plates. Pinned by `dropped_hops` in `tests/nozzle/mod.rs`.
 - **Every write goes through `Sink`** — a temp file beside the target, renamed
   over it in `commit()`, so a crash leaves the original intact.
 - **Match both marker dialects**: `;TYPE:` and `; FEATURE:`. A grep for one alone

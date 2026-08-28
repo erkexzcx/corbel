@@ -716,6 +716,13 @@ pub struct Ledger {
     /// — measured on a real tree-support print, 5136 wall beads came out under
     /// `; FEATURE: Support`, which is 20% fan on a wall.
     pub regions: HashMap<String, f64>,
+    /// Height moves that drop the nozzle and are then travelled away from
+    /// before anything is drawn.
+    ///
+    /// A slicer lifts before a long travel and comes down on arrival. Putting
+    /// the nozzle down in front of that travel makes the journey at bead
+    /// height instead, over whatever the layer has already laid.
+    pub dropped_hops: usize,
     /// Every place a support region lays a bead, in the order it lays them.
     ///
     /// Support is not the part. It is printed to be broken off, it is a single
@@ -740,12 +747,14 @@ pub fn ledger(gcode: &str) -> Ledger {
         primed_travel: 0.0,
         primed_stops: 0,
         regions: HashMap::new(),
+        dropped_hops: 0,
         supports: Vec::new(),
     };
     // Filament pulled back and not yet put in. Only a nozzle at zero oozes.
     let mut withdrawn = 0.0_f64;
     let mut standing = false;
     let mut supporting = false;
+    let mut dropped: Option<f64> = None;
     let mut region = String::new();
     let mut width = String::new();
     let mut layer = 0usize;
@@ -846,6 +855,20 @@ pub fn ledger(gcode: &str) -> Ledger {
         };
         // Material, not travel: where the nozzle passes over a support is
         // the slicer's business, but where it lays a bead is the support.
+        if line.draws() {
+            let fell = line.z.is_some_and(|z| z < from.2 - 1e-9);
+            let steers = line.x.is_some() || line.y.is_some();
+            let draws = delta.is_some_and(|value| value > 0.0);
+            match (fell, steers, draws) {
+                (true, false, false) => dropped = Some(from.2),
+                (_, true, false) if dropped.is_some() => {
+                    book.dropped_hops += 1;
+                    dropped = None;
+                }
+                (_, _, true) => dropped = None,
+                _ => {}
+            }
+        }
         if supporting
             && (line.x.is_some() || line.y.is_some())
             && delta.is_some_and(|value| value > 0.0)
@@ -1031,6 +1054,14 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
                 now
             ));
         }
+    }
+    if after.dropped_hops > before.dropped_hops {
+        found.push(format!(
+            "{} height moves put the nozzle down and are then travelled away from, against \
+             {} in the input — a slicer lifts before a long travel and comes down on arrival, \
+             so dropping it first makes that journey at bead height",
+            after.dropped_hops, before.dropped_hops
+        ));
     }
     if after.supports != before.supports {
         let moved = before
