@@ -84,3 +84,23 @@ object. `ironing_type` will not take on this project at any of its four values.
 
 3DBenchy is by Creative Tools, CC BY-ND 4.0 (unmodified). The remaining
 primitives are Bambu Studio's own built-in shapes.
+
+
+support.gcode.zst
+
+A ten-layer window of a real tree-support print, sliced by Bambu Studio for a
+0.4 mm nozzle, kept behind the file's own header and config block and
+compressed with zstd. It carries 51 `; FEATURE: Support` regions and 30 of
+`Support interface`.
+
+It is not the same plate as the rest, and it could not be: `enable_support` on
+that plate exits -101, because the objects sit close enough that their support
+paths conflict. So the suite had no supports at all until this, and every
+question about what this tool does to material it must not touch went unasked.
+Two defects were sitting in that gap — 5136 wall beads written under the
+support's own `; FEATURE:` marker, and so at its fan speed, and 8902 retractions
+added to a file with 13234.
+
+The window is where it is because the tree supports are there: ten layers with
+supports under an overhang, walls flaring above them, and enough of both
+transforms to matter (379 loops raised, 23 surfaces followed).

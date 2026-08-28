@@ -555,13 +555,6 @@ struct Held {
     buffer: Vec<Buffered>,
     cells: Vec<u32>,
     loops: Vec<Loop>,
-    /// The marker line that declared the region these came out of.
-    ///
-    /// They are written past the markers of everything laid after them, so
-    /// without it a reader takes a wall for whatever region it lands in — and
-    /// one of those readers is [`zaa`](crate::zaa), which would reshape it as
-    /// a top surface.
-    marker: Vec<u8>,
     /// The plane they belong to, since they are written after the regions that
     /// followed them and a plane is read off the layer rather than the stream.
     plane: f64,
@@ -687,6 +680,14 @@ struct Loop {
     /// whole region, so a loop written out of that region's order inherits
     /// whatever the region before it declared unless this is put back.
     width: usize,
+    /// The `; FEATURE:` line that declared the region this loop came out of.
+    ///
+    /// A wall's two regions are buffered as one, so the region cannot answer
+    /// this: the visible loops and the hidden ones behind them arrive under
+    /// different markers and are then written in another order. A region
+    /// states the fan, the speed and the acceleration once, so a loop written
+    /// under someone else's marker prints at their settings.
+    marker: usize,
     /// True where this loop is the visible wall, which anchors the numbering
     /// of the contour it belongs to and is the one loop that gets moved
     /// sideways.
@@ -774,14 +775,16 @@ struct Pass<'a, W: Write> {
     /// This layer's raised loops, waiting for everything laid against them to
     /// be written first. See [`Held`].
     held: Vec<Held>,
-    /// The marker line that declared the region being buffered, so the loops
-    /// held out of it can say what they are when they are written.
-    marker: Vec<u8>,
     /// Every distinct `; LINE_WIDTH:` line the file has stated, the one in
     /// force now, and the one the output last carried.
     widths: Vec<Vec<u8>>,
     width: usize,
     wrote_width: usize,
+    /// The same for `; FEATURE:`, which a loop carries with it because a
+    /// wall's two regions are buffered as one and written in another order.
+    markers: Vec<Vec<u8>>,
+    marker: usize,
+    wrote_marker: usize,
     /// Filament pulled back and not yet put in, as the OUTPUT has it. Only a
     /// nozzle at zero oozes, and only what was actually written counts.
     withdrawn: f64,
@@ -793,6 +796,9 @@ struct Pass<'a, W: Write> {
     /// written in the order they were read, so how far a travel runs is only
     /// knowable from the output.
     wrote_at: (f64, f64),
+    /// Where the INPUT stood before the line being read, so the travel the
+    /// slicer planned can be told from the one the reorder produced.
+    was_at: (f64, f64),
     /// Filament put in ahead of a bead the reordering left dry, waiting for
     /// the prime it was owed to.
     debt: f64,
@@ -911,13 +917,16 @@ impl<'a, W: Write> Pass<'a, W> {
             raised_cells: Vec::new(),
             at_now: (0.0, 0.0),
             held: Vec::new(),
-            marker: Vec::new(),
             widths: vec![Vec::new()],
             width: 0,
             wrote_width: 0,
+            markers: vec![Vec::new()],
+            marker: 0,
+            wrote_marker: 0,
             withdrawn: 0.0,
             owing: None,
             wrote_at: (0.0, 0.0),
+            was_at: (0.0, 0.0),
             debt: 0.0,
             stopped: None,
             retract_feed: None,
@@ -1028,9 +1037,23 @@ impl<'a, W: Write> Pass<'a, W> {
                     self.flush()?;
                 }
                 self.feature = feature;
-                if feature.is_perimeter() {
-                    self.marker.clear();
-                    self.marker.extend_from_slice(line.origin());
+                // Gap fill and a thin wall are buffered with the wall so the
+                // loops either side of them stay in one contour, but they are
+                // regions of their own with their own fan and speed.
+                if with_the_wall(feature) {
+                    let raw = line.origin();
+                    self.marker = match self.markers.iter().position(|had| had == raw) {
+                        Some(at) => at,
+                        None => {
+                            self.markers.push(raw.to_vec());
+                            self.markers.len() - 1
+                        }
+                    };
+                    self.wrote_marker = self.marker;
+                } else {
+                    // Some other region has now declared itself, so whatever a
+                    // loop last said is no longer what the output is under.
+                    self.wrote_marker = usize::MAX;
                 }
                 if continues && !self.buffer.is_empty() {
                     self.buffer(line, self.at);
@@ -1069,6 +1092,8 @@ impl<'a, W: Write> Pass<'a, W> {
                 // The toolhead has not moved and the frame it is named in has,
                 // so the next move starts from where the reset says it stands.
                 let (x, y, _) = self.modal.position();
+                self.was_at = self.at;
+                self.was_at = self.at;
                 self.at = (x, y);
             }
             _ => {}
@@ -1104,6 +1129,8 @@ impl<'a, W: Write> Pass<'a, W> {
         if !self.modal.is_plain() {
             self.flush()?;
             if let Some((x, y, _)) = moved {
+                self.was_at = self.at;
+                self.was_at = self.at;
                 self.at = (x, y);
             }
             if line.z.is_some() && line.is_move() {
@@ -1142,6 +1169,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // the last one left off.
         let from = self.at;
         if let Some((x, y, _)) = moved {
+            self.was_at = self.at;
             self.at = (x, y);
             // With nothing buffered the output has caught up with the input,
             // so this is where the nozzle really stands — which is what a held
@@ -1495,6 +1523,7 @@ impl<'a, W: Write> Pass<'a, W> {
             trail: 0,
             contour: 0,
             width: self.width,
+            marker: self.marker,
             external: self.feature == Feature::ExternalPerimeter,
             hidden: self.feature == Feature::InternalPerimeter,
             filler: is_filler(self.feature),
@@ -1727,7 +1756,6 @@ impl<'a, W: Write> Pass<'a, W> {
             buffer: Vec::new(),
             cells: Vec::new(),
             loops: Vec::with_capacity(waiting.len()),
-            marker: self.marker.clone(),
             plane,
         };
         for current in waiting {
@@ -1781,15 +1809,9 @@ impl<'a, W: Write> Pass<'a, W> {
         let buffer = std::mem::take(&mut self.buffer);
         let cells = std::mem::take(&mut self.raised_cells);
         let mut wrote = Ok(());
-        let mut said: Vec<u8> = Vec::new();
         for (at, loop_) in plan {
             let current = regions[at].loops[loop_];
             let plane = regions[at].plane;
-            if !regions[at].marker.is_empty() && regions[at].marker != said {
-                said.clear();
-                said.extend_from_slice(&regions[at].marker);
-                write_line(&mut self.out, &said)?;
-            }
             std::mem::swap(&mut self.arena, &mut regions[at].arena);
             std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
             std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
@@ -1873,6 +1895,11 @@ impl<'a, W: Write> Pass<'a, W> {
         // writes that region's loops in another order, so every loop after the
         // first inherits whatever the region before it declared. Measured on a
         // real plate, 8460 of 28178 beads were drawn at the wrong width.
+        if current.marker != self.wrote_marker && !self.markers[current.marker].is_empty() {
+            let marker = self.markers[current.marker].clone();
+            write_line(&mut self.out, &marker)?;
+            self.wrote_marker = current.marker;
+        }
         if current.width != self.wrote_width {
             let width = self.widths[current.width].clone();
             self.out.write_all(&width)?;
@@ -2438,34 +2465,35 @@ impl<'a, W: Write> Pass<'a, W> {
     /// pull away with the loop it belonged to and leave the prime behind, and
     /// then the travel is made with a full nozzle. Nothing is scanned past the
     /// first bead, because a travel that reaches one needed no prime at all.
-    /// True where the travel starting at `from` comes back down as a height
-    /// move of its own before it draws again. That move brings the toolhead to
-    /// a dead stop over the seam, which is where a full nozzle leaves a blob.
-    fn restores(&self, from: usize) -> bool {
-        for line in &self.buffer[from + 1..] {
-            if line.delta.is_some_and(|delta| delta > 0.0) {
-                return false;
-            }
-            if line.z.is_some() && !line.steers {
-                return true;
-            }
-        }
-        false
+    /// How far the travel starting at `from` runs before it draws again,
+    /// measured from `start`.
+    fn hop(&self, from: usize, start: (f64, f64)) -> f64 {
+        self.buffer[from..]
+            .iter()
+            .take_while(|line| !line.delta.is_some_and(|delta| delta > 0.0))
+            .filter(|line| line.places)
+            .last()
+            .map_or(0.0, |line| (line.at.0 - start.0).hypot(line.at.1 - start.1))
     }
 
-    /// How far the travel starting at `from` runs before it draws again.
-    fn hop(&self, from: usize) -> f64 {
-        // A region can open on the travel that reaches it, and then where the
-        // nozzle stands is not in this buffer at all.
-        let start = match from {
+    /// How far the travel at `from` runs, where the reorder has moved it.
+    ///
+    /// A travel the slicer planned itself needs nothing: it decided, knowing
+    /// its own geometry, that the hop was not worth closing. What it could not
+    /// know is that the loop would be written somewhere else, so the length is
+    /// only asked where the nozzle is not where the slicer left it. Asking the
+    /// length alone pulled 8997 times on a real tree-support print against the
+    /// file's own 13234, median travel 1.19 mm.
+    fn displaced(&self, from: usize) -> f64 {
+        let planned = match from {
             0 => self.wrote_at,
             _ => self.buffer[from - 1].at,
         };
-        self.buffer[from..]
-            .iter()
-            .take_while(|line| line.delta.is_none_or(|delta| delta <= 0.0))
-            .last()
-            .map_or(0.0, |line| (line.at.0 - start.0).hypot(line.at.1 - start.1))
+        let adrift = (planned.0 - self.wrote_at.0).hypot(planned.1 - self.wrote_at.1);
+        match adrift > f64::EPSILON {
+            true => self.hop(from, self.wrote_at),
+            false => 0.0,
+        }
     }
 
     fn answering(&self, from: usize) -> Option<f64> {
@@ -2517,31 +2545,25 @@ impl<'a, W: Write> Pass<'a, W> {
         // A height move of the slicer's own, reached with a full nozzle
         // because the pull that used to precede it went elsewhere. It is a
         // dead stop over the seam either way, so empty the nozzle for it.
-        if buffered.z.is_some()
-            && !buffered.steers
-            && buffered.delta.is_none()
+        // Every pull below is gated on the slicer's OWN minimum travel. A
+        // retraction is not free — it costs a stop, a gap where the bead
+        // restarts, and a bite out of the filament — so one taken for a hop
+        // the slicer would not have bothered with is damage, not safety.
+        // Measured on a user's 17 MB tree-support print, ungated: 8902 pulls
+        // added to a file with 13234, 6437 of them for a travel under 3 mm and
+        // 4195 for one under 1 mm.
+        let worth_it = self
+            .hop_travel
+            .is_some_and(|far| self.displaced(index) > far)
             && self.withdrawn <= 0.0
-            && self.owing.is_none()
-            && let Some(charge) = self.retract_charge
-        {
-            self.unprime(-charge)?;
-            self.owing = Some(charge);
-        }
-        if buffered.steers
-            && buffered.delta.is_none()
-            && self.withdrawn <= 0.0
-            && self.owing.is_none()
-        {
-            let charge = self.answering(index).or_else(|| {
-                // No prime ahead means the slicer judged this hop too short to
-                // close. It judged the hop it planned, not the one reordering
-                // left behind, so where the hop comes back down as a move of
-                // its own — a dead stop over the seam — ask its threshold again.
-                self.retract_charge.filter(|_| {
-                    self.restores(index) || self.hop_travel.is_some_and(|far| self.hop(index) > far)
-                })
-            });
-            if let Some(charge) = charge {
+            && self.owing.is_none();
+        if worth_it && buffered.z.is_some() && !buffered.steers && buffered.delta.is_none() {
+            if let Some(charge) = self.retract_charge {
+                self.unprime(-charge)?;
+                self.owing = Some(charge);
+            }
+        } else if worth_it && buffered.steers && buffered.delta.is_none() {
+            if let Some(charge) = self.answering(index).or(self.retract_charge) {
                 self.unprime(-charge)?;
                 self.owing = Some(charge);
             }
@@ -2624,26 +2646,31 @@ impl<'a, W: Write> Pass<'a, W> {
     }
 
     fn emit(&mut self, line: Line<'_>, factor: f64) -> io::Result<()> {
+        // The same rule as in `replay`, for the travels that never reach it:
+        // a region's own tail crosses to wherever the reorder left the nozzle,
+        // and only the growth over the travel the slicer planned is worth a
+        // pull.
+        if line.is_move() && (line.x.is_some() || line.y.is_some()) {
+            let grew = (self.at.0 - self.wrote_at.0).hypot(self.at.1 - self.wrote_at.1)
+                - (self.at.0 - self.was_at.0).hypot(self.at.1 - self.was_at.1);
+            if !line.draws()
+                && self.withdrawn <= 0.0
+                && self.owing.is_none()
+                && self.hop_travel.is_some_and(|far| grew > far)
+                && let Some(charge) = self.retract_charge
+            {
+                self.unprime(-charge)?;
+                self.owing = Some(charge);
+            }
+            self.wrote_at = self.at;
+        }
         if line.code == Code::SetPosition {
             if let Some(value) = line.e {
                 self.extruder.advance_origin(value);
             }
         }
-        // The same two rules as in `replay`, for the lines that never reach
-        // it: a bare height move written with a full nozzle is emptied for,
-        // and a pull taken out that way is given back at the next filament.
-        if line.is_move()
-            && line.z.is_some()
-            && line.x.is_none()
-            && line.y.is_none()
-            && line.e.is_none()
-            && self.withdrawn <= 0.0
-            && self.owing.is_none()
-            && let Some(charge) = self.retract_charge
-        {
-            self.unprime(-charge)?;
-            self.owing = Some(charge);
-        }
+        // A pull taken out for a travel is given back here too, for the
+        // lines that never reach `replay`.
         if let Some(charge) = self.owing.filter(|_| line.e.is_some() && line.draws()) {
             self.owing = None;
             self.unprime(charge)?;
@@ -3091,16 +3118,6 @@ impl<'a, W: Write> Pass<'a, W> {
             return Ok(());
         }
         self.nozzle_z = Some(z);
-        // This is a move of its own, so the planner brings the toolhead to a
-        // dead stop to run it — over the seam, where a full nozzle oozes.
-        // `replay` fills it again the moment anything is drawn.
-        if self.withdrawn <= 0.0
-            && self.owing.is_none()
-            && let Some(charge) = self.retract_charge
-        {
-            self.unprime(-charge)?;
-            self.owing = Some(charge);
-        }
         let note = if raised { "raised" } else { "reset" };
         let rate = self.z_feedrate;
         // Plain `Display`, not `{:.0}`: both rates were read off the file, and

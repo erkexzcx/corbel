@@ -708,6 +708,22 @@ pub struct Ledger {
     /// Height changes written as a move of their own while primed, which stop
     /// the toolhead dead with a full nozzle over the seam.
     pub primed_stops: usize,
+    /// How much bead is laid under each `; FEATURE:` the slicer declared.
+    ///
+    /// A slicer states the region once and then sets the fan, the speed and
+    /// the acceleration for it. Writing a wall's loops after some other
+    /// region without re-stating theirs prints them at that region's settings
+    /// — measured on a real tree-support print, 5136 wall beads came out under
+    /// `; FEATURE: Support`, which is 20% fan on a wall.
+    pub regions: HashMap<String, f64>,
+    /// Every place a support region lays a bead, in the order it lays them.
+    ///
+    /// Support is not the part. It is printed to be broken off, it is a single
+    /// bead wide, and a tree support is tall and unbraced — so nothing this
+    /// tool does may reach it. It has no wall to raise, no surface to follow
+    /// and nothing above it that a step could meet, which makes "identical" a
+    /// bound that can be asserted outright rather than a budget.
+    pub supports: Vec<(i64, i64, i64)>,
 }
 
 pub fn ledger(gcode: &str) -> Ledger {
@@ -723,9 +739,14 @@ pub fn ledger(gcode: &str) -> Ledger {
         widths: HashMap::new(),
         primed_travel: 0.0,
         primed_stops: 0,
+        regions: HashMap::new(),
+        supports: Vec::new(),
     };
     // Filament pulled back and not yet put in. Only a nozzle at zero oozes.
     let mut withdrawn = 0.0_f64;
+    let mut standing = false;
+    let mut supporting = false;
+    let mut region = String::new();
     let mut width = String::new();
     let mut layer = 0usize;
     let mut feed = 0.0_f64;
@@ -745,6 +766,13 @@ pub fn ledger(gcode: &str) -> Ledger {
             layer += 1;
         }
         let trimmed = text.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("; FEATURE:")
+            .or_else(|| trimmed.strip_prefix(";TYPE:"))
+        {
+            region = rest.trim().to_ascii_lowercase();
+            supporting = region.contains("support");
+        }
         if let Some(rest) = trimmed.strip_prefix("; LINE_WIDTH:") {
             width = rest.trim().to_owned();
         }
@@ -781,6 +809,16 @@ pub fn ledger(gcode: &str) -> Ledger {
         if let Some(value) = delta {
             withdrawn = (withdrawn - value).max(0.0);
         }
+        // A height written as a move of its own stops the toolhead dead.
+        // What escapes while it stands there only matters if the nozzle then
+        // goes somewhere: a stop that draws again on the spot oozes into its
+        // own bead. So the stop is only counted once a travel follows it.
+        if line.draws() && (line.x.is_some() || line.y.is_some()) {
+            if standing && delta.is_none_or(|value| value <= 0.0) {
+                book.primed_stops += 1;
+            }
+            standing = false;
+        }
         if line.draws()
             && line.z.is_some()
             && line.x.is_none()
@@ -788,7 +826,7 @@ pub fn ledger(gcode: &str) -> Ledger {
             && delta.is_none()
             && withdrawn <= 1e-9
         {
-            book.primed_stops += 1;
+            standing = true;
         }
         if let Some(value) = delta {
             if value > 0.0 {
@@ -806,6 +844,21 @@ pub fn ledger(gcode: &str) -> Ledger {
         let Some(to) = modal.apply(&line) else {
             continue;
         };
+        // Material, not travel: where the nozzle passes over a support is
+        // the slicer's business, but where it lays a bead is the support.
+        if supporting
+            && (line.x.is_some() || line.y.is_some())
+            && delta.is_some_and(|value| value > 0.0)
+        {
+            // A micron is finer than any printer resolves and far finer than
+            // the offset the visible wall is moved by, so this is exact
+            // without asking two f64 to be bit-identical.
+            book.supports.push((
+                (to.0 * 1000.0).round() as i64,
+                (to.1 * 1000.0).round() as i64,
+                (to.2 * 1000.0).round() as i64,
+            ));
+        }
         if line.draws_in_plane() && delta.is_some_and(|value| value > 0.0) {
             while book.drawn.len() <= layer {
                 book.drawn.push(0.0);
@@ -816,6 +869,7 @@ pub fn ledger(gcode: &str) -> Ledger {
             };
             book.drawn[layer] += along;
             *book.widths.entry(width.clone()).or_default() += along;
+            *book.regions.entry(region.clone()).or_default() += along;
         } else if (line.x.is_some() || line.y.is_some()) && withdrawn <= 1e-9 {
             book.primed_travel += (to.0 - from.0).hypot(to.1 - from.1);
             if feed > 0.0 {
@@ -961,6 +1015,37 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
             after.primed_travel,
             before.primed_travel,
             (after.primed_travel / before.primed_travel.max(1.0) - 1.0) * 100.0
+        ));
+    }
+    for (region, was) in &before.regions {
+        let now = after.regions.get(region).copied().unwrap_or_default();
+        // A tenth is far wider than the visible wall's own inward offset moves
+        // any region's length, and far narrower than a region gaining another
+        // region's loops.
+        if (now - was).abs() > was * 0.1 {
+            found.push(format!(
+                "{:.0} mm of bead is laid under `{region}` against {was:.0} mm in the \
+                 input — a region states the fan, the speed and the acceleration \
+                 once, so a loop written under someone else's marker prints at \
+                 their settings",
+                now
+            ));
+        }
+    }
+    if after.supports != before.supports {
+        let moved = before
+            .supports
+            .iter()
+            .zip(&after.supports)
+            .filter(|(one, two)| one != two)
+            .count();
+        found.push(format!(
+            "the support is not where the slicer put it: {} of its {} moves \
+             changed and {} were added or lost — support is printed to be \
+             broken off, so nothing here may reach it",
+            moved,
+            before.supports.len(),
+            after.supports.len().abs_diff(before.supports.len())
         ));
     }
     if after.primed_stops > before.primed_stops {

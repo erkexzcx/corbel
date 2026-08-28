@@ -343,3 +343,48 @@ surfaces! {
     a_surface_over_six_walls => "walls-6",
     a_surface_over_every_awkward_setting_at_once => "nasty-combo",
 }
+
+/// A plate with supports under it.
+///
+/// Not the same plate as the rest: `enable_support` will not slice on that one
+/// — the objects sit too close and their support paths conflict — so this is a
+/// window of a real tree-support print instead. It is the only fixture here
+/// that carries `; FEATURE: Support`, and without it nothing in the suite ever
+/// asked what this tool does to material it must not touch.
+#[test]
+fn supports_are_left_exactly_where_the_slicer_put_them() {
+    let source = plate("support");
+    for args in [
+        ["--bricks"].as_slice(),
+        ["--zaa"].as_slice(),
+        ["--bricks", "--zaa"].as_slice(),
+    ] {
+        let (gcode, said) = processed("support", &source, args);
+        // Only a run without the surface transform can be held to its own
+        // printed claim; the surface transform re-meters what it reshapes.
+        let following = args.contains(&"--zaa");
+        let claim = (!following).then_some(said.as_str());
+        let allowance = if following { SURFACE_CREST } else { 0.0 };
+        assert_sound("support", args, &source, &gcode, allowance, claim);
+    }
+}
+
+/// The same window, proving it reaches the transforms at all — a fixture that
+/// does not is worse than none, because it reports a pass nobody earned.
+#[test]
+fn the_support_plate_reaches_both_transforms() {
+    let source = plate("support");
+    let (gcode, _) = processed("support", &source, &["--bricks", "--zaa"]);
+    let raised = gcode
+        .lines()
+        .filter(|line| line.contains("corbel brick raised"))
+        .count();
+    let followed = gcode
+        .lines()
+        .filter(|line| line.contains("corbel zaa"))
+        .count();
+    assert!(
+        raised > 0 && followed > 0,
+        "support: {raised} raised, {followed} followed"
+    );
+}
