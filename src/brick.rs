@@ -112,25 +112,6 @@ const RAMP: usize = 2;
 /// uncovered end to end.
 const CAP_SHARE: f64 = 0.75;
 
-/// How much of a loop's path has to stand on what the layer below left proud
-/// before the loop is metered as being laid on a raise.
-///
-/// A different question from [`CAP_SHARE`] and biased the other way. Getting
-/// this wrong in the direction of "there is no raise under me" feeds a bead
-/// for a whole layer of gap when the raise below has already filled half of
-/// it — twice the material the gap can hold — while getting it wrong the other
-/// way leaves a bead a little short, which an internal wall absorbs. So it
-/// sits low.
-///
-/// It can sit low because the two populations barely touch. Measured over two
-/// real Benchy slices, 95% to 99% of loops laid on the plane share a tenth of
-/// their path or less with the raise below, while a loop carrying a raised
-/// column on has 0.4 to 1.0 of its path over one — the wall shifts sideways as
-/// it climbs, so even an unbroken column rarely reaches 1.0. The valley
-/// between the two is empty, and [`CAP_SHARE`] would cut straight through the
-/// upper population.
-const SEAM_SHARE: f64 = 0.25;
-
 /// Most lines held back between one region's last bead and the next region's
 /// first, so that a wall's opening travel can carry its height.
 ///
@@ -714,7 +695,7 @@ struct Loop {
     /// the layer below. Read off that layer's own footprint rather than
     /// assumed from this loop's parity, which can differ from the one the
     /// column had beneath it.
-    on_a_raise: bool,
+    on_a_raise: f64,
     /// True where that raise was a column still climbing rather than one that
     /// had settled, so it stood at half the offset. Measured for the same
     /// reason: how old a column is cannot be read off its own loop's age.
@@ -1530,7 +1511,7 @@ impl<'a, W: Write> Pass<'a, W> {
             raised: false,
             capped: false,
             steps: 0,
-            on_a_raise: false,
+            on_a_raise: 0.0,
             on_a_climb: false,
             outline: None,
             points: 0,
@@ -2877,10 +2858,11 @@ impl<'a, W: Write> Pass<'a, W> {
     /// is the roof of every bridged hole and the underside of every shelf, two
     /// layers above the column's first bead.
     fn rise_below(&self, current: Loop) -> f64 {
-        let Some(below) = self.layer.checked_sub(1).filter(|_| current.on_a_raise) else {
+        let share = current.on_a_raise;
+        let Some(below) = self.layer.checked_sub(1).filter(|_| share > 0.0) else {
             return 0.0;
         };
-        self.rise_at(if current.on_a_climb { 1 } else { RAMP }, below)
+        share * self.rise_at(if current.on_a_climb { 1 } else { RAMP }, below)
     }
 
     /// Layers printed since this object's first. A file that completes objects
@@ -2961,7 +2943,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 self.loops[index].raised = false;
                 self.loops[index].capped = false;
                 self.loops[index].steps = object;
-                self.loops[index].on_a_raise = false;
+                self.loops[index].on_a_raise = 0.0;
                 self.loops[index].on_a_climb = false;
                 continue;
             }
@@ -2972,8 +2954,10 @@ impl<'a, W: Write> Pass<'a, W> {
                 (_, true) => 1,
                 _ => object,
             };
-            self.loops[index].on_a_raise =
-                points > 0 && share[3] as f64 > points as f64 * SEAM_SHARE;
+            self.loops[index].on_a_raise = match points {
+                0 => 0.0,
+                _ => share[3] as f64 / points as f64,
+            };
             // What is climbing is a subset of what is standing, so the raise
             // below is a climbing one where most of what stands under this
             // loop is. A mix takes the settled height, which is the taller of

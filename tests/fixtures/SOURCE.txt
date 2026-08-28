@@ -104,3 +104,17 @@ added to a file with 13234.
 The window is where it is because the tree supports are there: ten layers with
 supports under an overhang, walls flaring above them, and enough of both
 transforms to matter (379 loops raised, 23 surfaces followed).
+
+
+cone.gcode.zst
+
+A 24-layer window of a real funnel — a thin cone whose wall walks outward by a
+fraction of a bead every layer, kept behind the file's own header and config
+block.
+
+Nothing else here has that shape, and it is the shape that matters: on a wall
+that stacks, a loop either sits over the raise below it or it does not, and a
+threshold on the share of its path that does answers correctly. On a wall that
+walks, every loop sits partly over the raise, and a threshold rounds all of
+them the same way. Measured on this window, v3.0.1 said it added 1.37% of
+filament and the part lost 8.01%.

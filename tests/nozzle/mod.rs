@@ -1066,9 +1066,23 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
             after.extruded - after.retracted,
         );
         let real = (now / was - 1.0) * 100.0;
-        if (real - claim).abs() > CLAIM_SLACK {
+        // A raise is charged where a column starts and given back where it
+        // ends, so over a whole part the geometry nets out and only the flow
+        // is left. A fixture is a WINDOW, and its top layer's raises are never
+        // landed on: that half-layer of material really is in what was
+        // written, and nothing later in the file pays it back. So the part may
+        // run over the claim by up to the last layer's own share of it, and
+        // may not fall short by anything — falling short is starvation, which
+        // is what a threshold on that geometry used to cause.
+        let standing = match before.drawn.iter().sum::<f64>() {
+            total if total > 0.0 => 50.0 * before.drawn.last().copied().unwrap_or_default() / total,
+            _ => 0.0,
+        };
+        if claim - real > CLAIM_SLACK || real - claim > CLAIM_SLACK + standing {
             found.push(format!(
-                "it says it added {claim:+.2}% of filament and the part gained {real:+.2}%"
+                "it says it added {claim:+.2}% of filament and the part gained {real:+.2}%, \
+                 outside the {:+.2} the last layer's own raises could account for",
+                CLAIM_SLACK + standing
             ));
         }
     }

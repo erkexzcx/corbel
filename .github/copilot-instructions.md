@@ -162,12 +162,7 @@ in the way.
   path, and `Pass::geometry` reads BOTH ends of the span off what actually
   happened. Do NOT reuse `CAP_SHARE` for it: capping asks whether a column ENDS,
   where being wrong costs a void, and this asks what a bead SITS ON, where being
-  wrong the same way costs a blob. `SEAM_SHARE` is 0.25 and sits in the empty
-  valley between the two measured populations — a loop on the plane shares ≤0.1
-  of its path with the raise below, a loop carrying a raised column on shares
-  0.4–1.0, and `CAP_SHARE` cuts straight through the upper one. Record the cells
-  during the walk `shares` already makes (`Cells::absorb`): walking a second time
-  for them cost +22% of `brick` against +16% folded in.
+  wrong the same way costs a blob. **How much of a bead sits on a raise is a SHARE, not a verdict.** `Loop.on_a_raise` is the fraction of the loop's path that lies over the raise below, and `rise_below` scales the half layer by it. A threshold there was `SEAM_SHARE = 0.25`, chosen from a Benchy where the two populations really are bimodal — but a wall that WALKS sideways has no valley between them: measured on a user's 492-layer funnel, flat loops sit on a raise over shares spread evenly from 0.1 to 1.0, and the threshold rounded **3314 of them to "fully on a raise" against 52 loops metered as climbing**. Every rounding removes material, so the part came out **8.01% light on a claim of +1.37%**, and the loops just under the threshold poured a full layer into a gap a quarter of which was already filled. Metering by the share is exact where the threshold was bimodal and correct where it was not. Pinned by `plates::a_cone_whose_wall_walks_outward`, whose fixture is the only one whose wall does not stack.
 - **A height change must never be a `G1 Z` of its own.** A Z-only move names no
   other axis, so the planner brings the toolhead to a dead stop to run it — on
   the loop's start point, which is the seam, with the nozzle primed. Measured on

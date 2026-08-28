@@ -296,6 +296,7 @@ macro_rules! plates {
 
 plates! {
     the_stock_profile => "baseline",
+    a_cone_whose_wall_walks_outward => "cone",
     the_visible_wall_printed_first => "outer-first",
     a_wall_printed_from_both_sides_inward => "inner-outer-inner",
     a_single_wall_with_nothing_behind_it => "walls-1",

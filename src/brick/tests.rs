@@ -2637,7 +2637,7 @@ fn a_visible_wall_drawn_with_an_arc_moves_with_its_centre() {
     );
     // Start (10.000, -0.054) plus J puts the centre back at (10, 5).
     assert!(
-        out.contains("G1 X10.000 Y-0.054 E1.29311 ; arcskin"),
+        out.contains("G1 X10.000 Y-0.054 E1.27029 ; arcskin"),
         "{out}"
     );
 }
@@ -3490,7 +3490,7 @@ fn a_visible_wall_drawn_with_a_radius_moves_with_the_centre_that_radius_names() 
         "the arc must keep the circle it was drawn on: {out}"
     );
     assert!(
-        out.contains("G1 X10.000 Y-0.054 E1.29311 ; arcskin"),
+        out.contains("G1 X10.000 Y-0.054 E1.27029 ; arcskin"),
         "{out}"
     );
 }
