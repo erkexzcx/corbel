@@ -118,3 +118,17 @@ threshold on the share of its path that does answers correctly. On a wall that
 walks, every loop sits partly over the raise, and a threshold rounds all of
 them the same way. Measured on this window, v3.0.1 said it added 1.37% of
 filament and the part lost 8.01%.
+
+
+coupon.gcode.zst
+
+An eight-layer window of a real test coupon — a flat link with two holes
+through it — kept behind the file's own header and config block.
+
+It is here because a top surface with holes in it is the shape where the
+coverage answer flips back and forth along one path: the layer above closes
+over the surface at every hole, and a bead running past one grazes the cells
+that close it. `--bricks --zaa` wrote 25 beads standing above both their
+neighbours more steeply than one in one, against none for either transform on
+its own — bricking moves the visible wall inward, so its path meets those
+cells at a different angle. They are the dots a preview draws around the holes.

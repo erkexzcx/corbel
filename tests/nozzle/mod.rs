@@ -716,6 +716,15 @@ pub struct Ledger {
     /// — measured on a real tree-support print, 5136 wall beads came out under
     /// `; FEATURE: Support`, which is 20% fan on a wall.
     pub regions: HashMap<String, f64>,
+    /// Beads that stand above both their neighbours more steeply than the
+    /// nozzle could climb to them and back off.
+    ///
+    /// A flat nozzle cannot rear up and come straight back within its own
+    /// underside; asked to, it smears the crest and the pass beside it comes
+    /// down on whatever is left. In a preview they are dots. One in one is far
+    /// looser than anything a surface really does — a real ramp measures under
+    /// a fifth of that — so this only ever catches a jab.
+    pub jabs: usize,
     /// Height moves that drop the nozzle and are then travelled away from
     /// before anything is drawn.
     ///
@@ -747,6 +756,7 @@ pub fn ledger(gcode: &str) -> Ledger {
         primed_travel: 0.0,
         primed_stops: 0,
         regions: HashMap::new(),
+        jabs: 0,
         dropped_hops: 0,
         supports: Vec::new(),
     };
@@ -755,6 +765,7 @@ pub fn ledger(gcode: &str) -> Ledger {
     let mut standing = false;
     let mut supporting = false;
     let mut dropped: Option<f64> = None;
+    let mut crest: Vec<(f64, f64)> = Vec::new();
     let mut region = String::new();
     let mut width = String::new();
     let mut layer = 0usize;
@@ -867,6 +878,26 @@ pub fn ledger(gcode: &str) -> Ledger {
                 }
                 (_, _, true) => dropped = None,
                 _ => {}
+            }
+        }
+        // Only along an unbroken run of bead. A height change either side of
+        // a travel is the nozzle lifting and coming back down, which is not a
+        // crest and leaves nothing behind.
+        if !(line.draws_in_plane() && delta.is_some_and(|value| value > 0.0)) {
+            crest.clear();
+        }
+        if line.draws_in_plane() && delta.is_some_and(|value| value > 0.0) {
+            let run = (to.0 - from.0).hypot(to.1 - from.1);
+            crest.push((to.2, run));
+            if crest.len() == 3 {
+                let (low, _) = crest[0];
+                let (top, up) = crest[1];
+                let (next, down) = crest[2];
+                let steep = |rise: f64, run: f64| rise > 0.0 && rise > run;
+                if steep(top - low, up) && steep(top - next, down) {
+                    book.jabs += 1;
+                }
+                crest.remove(0);
             }
         }
         if supporting
@@ -1054,6 +1085,14 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
                 now
             ));
         }
+    }
+    if after.jabs > before.jabs {
+        found.push(format!(
+            "{} beads stand above both their neighbours more steeply than one in one, \
+             against {} in the input — a flat nozzle cannot rear up and come straight \
+             back within its own underside, and in a preview those are dots",
+            after.jabs, before.jabs
+        ));
     }
     if after.dropped_hops > before.dropped_hops {
         found.push(format!(

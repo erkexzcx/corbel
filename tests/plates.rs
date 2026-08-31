@@ -389,3 +389,26 @@ fn the_support_plate_reaches_both_transforms() {
         "support: {raised} raised, {followed} followed"
     );
 }
+
+/// A top surface with holes through it, where the layer above closes over the
+/// surface at every hole and a bead running past one grazes the cells that
+/// close it. Bricking moves the visible wall inward, so its path meets those
+/// cells at a different angle and clips more of them — and a covered sample
+/// pinned to its plane between two followed ones is a jab the nozzle cannot
+/// make. Measured here: 26 with the two transforms together, none with either
+/// on its own.
+#[test]
+fn a_surface_around_holes_is_not_dotted_with_crests() {
+    let source = plate("coupon");
+    let started = nozzle::ledger(&source);
+    for args in [["--zaa"].as_slice(), ["--bricks", "--zaa"].as_slice()] {
+        let (gcode, _) = processed("coupon", &source, args);
+        let after = nozzle::ledger(&gcode);
+        assert_eq!(
+            after.jabs, started.jabs,
+            "coupon {args:?}: {} beads stand above both their neighbours more steeply than \
+             one in one, against {} in the input",
+            after.jabs, started.jabs
+        );
+    }
+}

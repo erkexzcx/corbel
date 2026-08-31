@@ -942,11 +942,16 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             self.covered.push(!open);
             self.samples.push((x, y, along, rise));
         }
+        self.follow_notches();
         // A bead begins exactly where the one before it ended, so the limit on
         // how fast a surface may fall carries across the join: this one may
         // not start above where the bead still held back leaves the nozzle.
+        // From where the nozzle was actually left, not from the held bead's
+        // samples: `release` clears those the moment it writes them, so by the
+        // time the next bead is sampled they are gone and the join went
+        // unbounded. `leaves` records the height itself and it survives.
         let entry = match self.joined() {
-            true => self.pending.samples.last().map(|sample| sample.3),
+            true => self.nozzle_z.map(|z| z - plane),
             false => None,
         };
         self.ease(height, entry);
@@ -1012,6 +1017,52 @@ impl<W: Write, R: BufRead> Pass<W, R> {
     /// `entry` is where the bead before this one leaves the nozzle, which is
     /// this one's first sample seen from the other side of the join. Its
     /// counterpart is [`Pass::carry`], which takes the descent the other way.
+    /// Follows a covered stretch the nozzle cannot step onto.
+    ///
+    /// The mirror of [`Pass::level_slivers`]. That one puts a sliver of
+    /// exposure between two covered stretches back on the plane, because a
+    /// flat nozzle cannot pass a crest narrower than its own underside. A
+    /// sliver of COVERAGE between two exposed stretches is that shape upside
+    /// down: the surface is asked to rear up to the plane and come straight
+    /// back, and the underside spans it just the same.
+    ///
+    /// Measured on a user's coupon, `--bricks --zaa` wrote **34 of them, the
+    /// worst 91 µm up and back over 46 µm of travel**, against 9 for `--zaa`
+    /// alone and none for `--bricks` alone — bricking moves the visible wall
+    /// inward, so its path meets the covered cells at a different angle and
+    /// clips more of them. In a preview they are dots around every hole.
+    ///
+    /// The stretch takes the height of the sample before it rather than the
+    /// field's own, because what is wrong with it is the step, not the value:
+    /// carrying the neighbour across is the one answer that adds no rise the
+    /// surface did not already have.
+    fn follow_notches(&mut self) {
+        let mut start = 0;
+        while start < self.covered.len() {
+            if !self.covered[start] {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < self.covered.len() && self.covered[end] {
+                end += 1;
+            }
+            // A run at the very start of a bead has the bead before it to
+            // carry on from, and one at the very end has the bead after: both
+            // are joins, and neither can be a slope, because the span test
+            // already refuses anything a nozzle could ramp across.
+            let carry = (start > 0 && end < self.covered.len()).then(|| self.samples[start - 1].3);
+            let across = self.samples[end - 1].2 - self.samples[start].2;
+            if let Some(carry) = carry.filter(|_| across < self.bead) {
+                for index in start..end {
+                    self.covered[index] = false;
+                    self.samples[index].3 = carry;
+                }
+            }
+            start = end;
+        }
+    }
+
     fn ease(&mut self, height: f64, entry: Option<f64>) {
         let fall = height / (self.bead * 2.0);
         if !(fall.is_finite() && fall > 0.0) {
@@ -1019,8 +1070,11 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         }
         self.level_slivers();
         let climb = height / self.bead;
+        // Including a covered one. A bead is asked to start where the last
+        // one left the nozzle whatever the coverage says, because there is no
+        // travel between them to climb on — and a covered sample opening a
+        // bead is exactly the notch a flat nozzle cannot step up onto.
         if let (Some(entry), Some(first)) = (entry, self.samples.first_mut())
-            && !self.covered[0]
             && first.3 > entry
         {
             first.3 = entry;
@@ -1039,6 +1093,62 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             let ceiling = under + climb * (along - behind);
             if !self.covered[index] && rise > ceiling {
                 self.samples[index].3 = ceiling;
+            }
+        }
+        self.unjab(climb);
+        // Last, because the pass above only ever lowers and would undo it: a
+        // bead may not START below where the one before it left the nozzle by
+        // more than the fall allows either. There is no travel at a join to
+        // take a step down on.
+        if let Some(entry) = entry {
+            for index in 0..self.samples.len() {
+                let (_, _, along, rise) = self.samples[index];
+                let floor = entry - fall * along;
+                if rise >= floor {
+                    break;
+                }
+                self.samples[index].3 = floor;
+            }
+        }
+    }
+
+    /// Takes out what is left standing above both its neighbours more steeply
+    /// than the nozzle can climb to it and back off.
+    ///
+    /// Everything above works on the coverage answer, and a covered sample is
+    /// pinned to its plane because the layer above prints on it. Where that
+    /// pinning survives between two followed samples with barely any travel
+    /// either side, what it asks for is a jab: measured on a user's coupon,
+    /// `--bricks --zaa` left 26 of them, the worst 91 µm up and straight back
+    /// over 46 µm of travel, against none for either transform alone. A flat
+    /// nozzle cannot make that move — it smears the crest, and the pass beside
+    /// it comes down on whatever is left. In a preview they are dots.
+    ///
+    /// The rate is the climb, not the fall: what bounds a descent is the
+    /// nozzle plowing back through material it laid a bead ago, and this is
+    /// the other direction.
+    fn unjab(&mut self, climb: f64) {
+        // Every sample, including the two at the ends: a bead's LAST sample
+        // rising to the plane while the rest of it follows the surface is the
+        // same jab seen from one side, and the bead after it starts from
+        // wherever this one leaves the nozzle. Where only one neighbour
+        // exists, that one answers; where both do, the higher of the two
+        // ceilings, so an honest ramp in either direction is left alone.
+        for index in 0..self.samples.len() {
+            let (_, _, along, rise) = self.samples[index];
+            let behind = index
+                .checked_sub(1)
+                .map(|at| self.samples[at].3 + climb * (along - self.samples[at].2));
+            let ahead = self
+                .samples
+                .get(index + 1)
+                .map(|next| next.3 + climb * (next.2 - along));
+            let Some(ceiling) = behind.into_iter().chain(ahead).reduce(f64::max) else {
+                continue;
+            };
+            if rise > ceiling {
+                self.samples[index].3 = ceiling;
+                self.covered[index] = false;
             }
         }
     }
