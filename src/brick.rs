@@ -23,7 +23,7 @@ use crate::gcode::feature::{Feature, is_layer_marker};
 use crate::gcode::{Code, Extruder, Line, Lines, MAX_LINE, Modal, repaired, write_e, write_fixed};
 use crate::geometry::Edge;
 use crate::geometry::{Arc, Cells, Trace, footprint, inset};
-use crate::scan::{BRICK_STAMP, FALLBACK_Z_FEEDRATE, Markerless, Survey, is_a_height};
+use crate::scan::{BRICK_STAMP, FALLBACK_Z_FEEDRATE, MELT_GAUGE, Markerless, Survey, is_a_height};
 
 /// How far apart two loops may run and still count as neighbours in one wall,
 /// in mm.
@@ -766,6 +766,11 @@ struct Pass<'a, W: Write> {
     markers: Vec<Vec<u8>>,
     marker: usize,
     wrote_marker: usize,
+    /// The region the INPUT is in, whatever kind it is. A loop held back to
+    /// the end of its layer is written inside whatever region the file had
+    /// reached by then, under its own marker — and a marker is modal, so the
+    /// beads that follow it are that region's until this one is put back.
+    ambient: usize,
     /// Filament pulled back and not yet put in, as the OUTPUT has it. Only a
     /// nozzle at zero oozes, and only what was actually written counts.
     withdrawn: f64,
@@ -842,9 +847,29 @@ struct Pass<'a, W: Write> {
     z_feedrate: f64,
     /// How far the file itself says a travel has to be to be worth retracting.
     hop_travel: Option<f64>,
-    /// Feedrate the output stream is currently left in, since `F` is modal and
-    /// an inserted Z move would otherwise hand its own rate to the next print.
+    /// Feedrate the OUTPUT stream is really left in, which the height moves
+    /// and retractions this pass inserts change as much as the file's own
+    /// lines do.
     feedrate: Option<f64>,
+    /// The rate the next bead is supposed to be laid at: the file's own, at
+    /// the point of the output the stream has reached. Divides from
+    /// `feedrate` exactly where this pass has written a rate of its own.
+    wanted_feed: Option<f64>,
+    /// The fastest the file's own walls melt filament, in mm of it a second,
+    /// and how much the loop being written has to slow down to stay inside it.
+    ///
+    /// A raise gives a bead half a layer more filament and the slicer's rate
+    /// stays where it was, so the hot end is asked for that much more melt.
+    /// Measured on a stock Bambu plate whose filament states 15 mm³/s and
+    /// whose input sits at exactly that for 98.64% of its path, `--bricks`
+    /// asked for **up to 23 mm³/s, 54% over, across 16% of the file** — which
+    /// no hot end delivers, so the one bead that must carry 1.5× to fill the
+    /// gap under a raised column is the one that comes out starved.
+    melt_rate: Option<f64>,
+    /// The filament slot in force, since each has its own melt rate and a
+    /// plate may print two that are 3x apart.
+    tool: usize,
+    survey: &'a Survey,
     /// Text of the region being buffered. Cleared and refilled at each flush,
     /// so it only ever holds one perimeter region.
     arena: Vec<u8>,
@@ -913,6 +938,7 @@ impl<'a, W: Write> Pass<'a, W> {
             markers: vec![Vec::new()],
             marker: 0,
             wrote_marker: 0,
+            ambient: 0,
             withdrawn: 0.0,
             owing: None,
             owed_plane: None,
@@ -945,6 +971,10 @@ impl<'a, W: Write> Pass<'a, W> {
             hop_travel: survey.hop_travel,
             retract_charge: survey.retract_length,
             feedrate: None,
+            wanted_feed: None,
+            melt_rate: survey.melt_at(0),
+            tool: 0,
+            survey,
             arena: Vec::new(),
             buffer: Vec::new(),
             loops: Vec::new(),
@@ -979,6 +1009,25 @@ impl<'a, W: Write> Pass<'a, W> {
 
     fn feed(&mut self, raw: &str, bytes: &[u8]) -> io::Result<()> {
         let line = Line::parse_bytes(raw, bytes);
+        if let Some(tool) = crate::scan::tool_change(raw) {
+            // Everything held goes out FIRST. A raised loop waits for the end
+            // of its layer, and on a plate printing two materials the tool
+            // changes in the middle of one — so a loop still waiting would be
+            // written after the change and laid in the other filament.
+            // Measured on a user's dual-nozzle plate, 41818 mm of bead crossed
+            // from one tool to the other.
+            //
+            // Only where a loop could actually cross it. A slicer also drops a
+            // `T` between a layer's `G1 Z` and its wall, and that one is part
+            // of the tail `keep` holds so the first loop has a move to ride —
+            // flushing there costs every raise its carrier.
+            if !self.loops.is_empty() || !self.held.is_empty() {
+                self.flush()?;
+                self.write_held()?;
+            }
+            self.tool = tool;
+            self.melt_rate = self.survey.melt_at(tool);
+        }
         if is_a_width(line) {
             let raw = line.origin();
             self.width = match self.widths.iter().position(|had| had == raw) {
@@ -996,11 +1045,14 @@ impl<'a, W: Write> Pass<'a, W> {
                 // loops still waiting for an infill that never came have run
                 // out of layer to wait in.
                 self.write_held()?;
-                // Slicers re-declare the region after a layer change, and some
-                // open the next wall with a stray segment before they do.
-                // Carrying the old region across would buffer that segment as
-                // a perimeter loop of its own.
-                self.feature = Feature::Other;
+                // The region is NOT reset here. A `; FEATURE:` is modal: a
+                // slicer states it once and keeps printing, and one that means
+                // to change it says so. Bambu prints a thin tapering wall
+                // straight through a layer change without re-declaring it —
+                // measured on a user's plate, 20 of 274 layers laid 6895 mm
+                // that way, and read as no region at all they were left out of
+                // the footprint, which capped the layer below them to half
+                // flow and stopped the bricking above.
                 self.layer += usize::from(std::mem::replace(&mut self.started, true));
                 self.close_layer();
                 return self.push(line.origin());
@@ -1028,24 +1080,21 @@ impl<'a, W: Write> Pass<'a, W> {
                     self.flush()?;
                 }
                 self.feature = feature;
+                let raw = line.origin();
+                self.ambient = match self.markers.iter().position(|had| had == raw) {
+                    Some(at) => at,
+                    None => {
+                        self.markers.push(raw.to_vec());
+                        self.markers.len() - 1
+                    }
+                };
                 // Gap fill and a thin wall are buffered with the wall so the
                 // loops either side of them stay in one contour, but they are
                 // regions of their own with their own fan and speed.
                 if with_the_wall(feature) {
-                    let raw = line.origin();
-                    self.marker = match self.markers.iter().position(|had| had == raw) {
-                        Some(at) => at,
-                        None => {
-                            self.markers.push(raw.to_vec());
-                            self.markers.len() - 1
-                        }
-                    };
-                    self.wrote_marker = self.marker;
-                } else {
-                    // Some other region has now declared itself, so whatever a
-                    // loop last said is no longer what the output is under.
-                    self.wrote_marker = usize::MAX;
+                    self.marker = self.ambient;
                 }
+                self.wrote_marker = self.ambient;
                 if continues && !self.buffer.is_empty() {
                     self.buffer(line, self.at);
                     return Ok(());
@@ -1129,6 +1178,7 @@ impl<'a, W: Write> Pass<'a, W> {
             }
             if let Some(rate) = line.f {
                 self.feedrate = Some(rate);
+                self.wanted_feed = Some(rate);
             }
             return self.emit(line, 1.0);
         }
@@ -1398,6 +1448,7 @@ impl<'a, W: Write> Pass<'a, W> {
         }
         if let Some(rate) = line.f {
             self.feedrate = Some(rate);
+            self.wanted_feed = Some(rate);
         }
         self.emit(line, 1.0)
     }
@@ -1828,7 +1879,63 @@ impl<'a, W: Write> Pass<'a, W> {
         self.arena = arena;
         self.buffer = buffer;
         self.raised_cells = cells;
+        // These loops were written inside whatever region the file had reached
+        // by the end of the layer, under their own `; FEATURE:`. A marker is
+        // modal, so that region has to be put back or the beads the slicer
+        // writes next are laid as wall. Measured on a user's plate at Z 38.5,
+        // 347 mm of prime tower came out under `Inner wall`.
+        if wrote.is_ok() && self.wrote_marker != self.ambient {
+            let marker = self.markers[self.ambient].clone();
+            if !marker.is_empty() {
+                wrote = write_line(&mut self.out, &marker);
+                self.wrote_marker = self.ambient;
+            }
+        }
         wrote
+    }
+
+    /// The rate one bead has to be laid at so the filament it is given is not
+    /// asked for faster than the file's own walls melt it, or `None` where
+    /// this bead has the headroom to run as the slicer asked.
+    ///
+    /// Per BEAD, never per loop. The multiple of filament is one number for a
+    /// whole loop, but what each bead already flows at is not: a slicer slows
+    /// a bridge or an overhang right down and gives it a fatter bead, so that
+    /// one segment sits at the ceiling while the rest of its wall has room to
+    /// spare. Taking the tightest bead and slowing the loop to it put the
+    /// bridge's speed on the whole wall.
+    ///
+    /// Measured on the bead as it will be WRITTEN, not as it was read. The
+    /// visible wall is moved sideways, and a corner does not change length by
+    /// the same proportion as the ring it belongs to — so on a wall that walks
+    /// outward the two differ, and reading the input's geometry left a bead
+    /// 1.9% over. At the three decimals it is written to, for the same reason:
+    /// a micron of rounding on a half-millimetre bead is a fifth of a percent
+    /// of its flow.
+    fn metered_rate(&self, index: usize, factor: f64, moved: &[Option<Moved>]) -> Option<f64> {
+        let ceiling = self.melt_rate?;
+        let buffered = self.buffer[index];
+        let delta = buffered.delta.filter(|delta| *delta > 0.0)?;
+        let asked = buffered.f.or(self.wanted_feed)?;
+        let previous = index.checked_sub(1)?;
+        let to = written(moved[index].map_or(buffered.at, |moved| moved.to));
+        let from = written(moved[previous].map_or(self.buffer[previous].at, |moved| moved.to));
+        let arc = buffered
+            .arc
+            .map(|arc| match moved[index].and_then(|to| to.centre) {
+                Some(centre) => Arc {
+                    i: centre.0,
+                    j: centre.1,
+                    ..arc
+                },
+                None => arc,
+            });
+        let along = footprint::along(from, to, arc);
+        if along < MELT_GAUGE {
+            return None;
+        }
+        let rate = delta * factor / along * asked / 60.0;
+        (rate > ceiling).then(|| asked * ceiling / rate)
     }
 
     /// Writes one loop: the travel that reaches it, the height it is printed
@@ -2404,9 +2511,13 @@ impl<'a, W: Write> Pass<'a, W> {
         moved: &[Option<Moved>],
     ) -> io::Result<()> {
         let buffered = self.buffer[index];
+        if buffered.f.is_none() {
+            self.settle_feed()?;
+        }
         self.nozzle_z = Some(z);
         if let Some(rate) = buffered.f {
             self.feedrate = Some(rate);
+            self.wanted_feed = Some(rate);
         }
         let note = if raised { "raised" } else { "reset" };
         let to = moved[index];
@@ -2563,6 +2674,28 @@ impl<'a, W: Write> Pass<'a, W> {
         // for a path nothing drew. A line naming neither coordinate is the one
         // case `Line::write_moved` refuses.
         let to = moved[index].filter(|_| buffered.places);
+        // Only a bead melts anything, so only a bead carries a rate of this
+        // pass's own: a `G92`, a travel, a wipe and a retraction all keep what
+        // the slicer gave them. The rate goes ON the bead's line, whether or
+        // not it named one, because a `G1 F` in front of it is a line the
+        // surface transform can reorder away from the bead it was written for
+        // — and only where it differs from what the line would otherwise run
+        // at, so a file with melt to spare comes through byte for byte.
+        let needed = buffered.delta.filter(|delta| *delta > 0.0).and_then(|_| {
+            self.metered_rate(index, factor * to.map_or(1.0, |moved| moved.ratio), moved)
+                .or(buffered.f)
+                .or(self.wanted_feed)
+        });
+        let slowed = needed.filter(|rate| buffered.f.or(self.feedrate) != Some(*rate));
+        // After every pull above, and never in front of a bead: a bead settles
+        // its own rate, and a resume written ahead of one hands it the file's
+        // rate back after this pass has just decided it cannot have it.
+        if buffered.f.is_none()
+            && needed.is_none()
+            && (buffered.places || buffered.z.is_some() || buffered.delta.is_some())
+        {
+            self.settle_feed()?;
+        }
         if let Some(delta) = buffered.delta {
             // A wipe pulls back along a path, so most of a retraction is
             // named on a line that also names a coordinate. Reading only the
@@ -2586,6 +2719,9 @@ impl<'a, W: Write> Pass<'a, W> {
             self.nozzle_z = Some(z);
         }
         if let Some(rate) = buffered.f {
+            self.wanted_feed = Some(rate);
+        }
+        if let Some(rate) = slowed.or(buffered.f) {
             self.feedrate = Some(rate);
         }
         if let Some(value) = buffered.e.filter(|_| buffered.resets_origin) {
@@ -2615,9 +2751,16 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(moved) = to {
             let text = repaired(raw);
             let line = Line::parse_bytes(&text, raw);
-            if line.write_moved(out, moved.to, moved.centre, value, None)? {
+            if line.write_moved_at(out, moved.to, moved.centre, value, None, slowed)? {
                 return out.write_all(b"\n");
             }
+        }
+
+        if let Some(rate) = slowed {
+            let text = repaired(raw);
+            let line = Line::parse_bytes(&text, raw);
+            line.write_e_at(out, value, Some(rate))?;
+            return out.write_all(b"\n");
         }
 
         let Some(value) = value else {
@@ -2635,6 +2778,12 @@ impl<'a, W: Write> Pass<'a, W> {
     }
 
     fn emit(&mut self, line: Line<'_>, factor: f64) -> io::Result<()> {
+        // Every line that goes straight out states the rate the file wants in
+        // force, not just the ones a region held on to.
+        if let Some(rate) = line.f {
+            self.feedrate = Some(rate);
+            self.wanted_feed = Some(rate);
+        }
         // The same rule as in `replay`, for the travels that never reach it:
         // a region's own tail crosses to wherever the reorder left the nozzle,
         // and only the growth over the travel the slicer planned is worth a
@@ -2670,6 +2819,11 @@ impl<'a, W: Write> Pass<'a, W> {
                 .is_some_and(|e| e > 0.0 || !self.extruder.is_absolute())
         {
             self.settle_plane()?;
+        }
+        // After `settle_plane`, which inserts a height move of its own. An
+        // arc counts: a slicer that fits them writes whole regions as `G2`.
+        if line.draws() && line.f.is_none() {
+            self.settle_feed()?;
         }
         let Some(e) = line.e.filter(|_| line.draws()) else {
             return self.push(line.origin());
@@ -3114,8 +3268,39 @@ impl<'a, W: Write> Pass<'a, W> {
         line.extend_from_slice(BRICK_STAMP.as_bytes());
         line.extend_from_slice(if charge < 0.0 { b"retract" } else { b"prime" });
         write_line(&mut self.out, &line)?;
+        self.feedrate = Some(rate);
         self.withdrawn = (self.withdrawn - charge).max(0.0);
         Ok(())
+    }
+
+    /// Puts back the rate the file asked for, where a height move or a
+    /// retraction of this pass's own has left the stream in its own.
+    ///
+    /// `F` is modal and a retraction is written at the retraction rate, so
+    /// every bead behind one that states no rate is laid at it. Measured on a
+    /// stock 1000-wall Bambu plate, **39446 mm of bead — 44% of the whole
+    /// file — came out at F1800 where the slicer asked for F11054**: the
+    /// prime that answers a reordered loop's travel sits between the slicer's
+    /// own `G1 F11054` and the loop's first bead, so the wall printed at
+    /// 30 mm/s instead of 184. Half the walls, and only the reordered half,
+    /// which is what makes it look random.
+    ///
+    /// A bare `G1 F` names no axis, so it queues no move and stops nothing —
+    /// it is how the slicer states its own rate, and it is written lazily so
+    /// that a run of inserts costs one line rather than one each.
+    fn settle_feed(&mut self) -> io::Result<()> {
+        // Never inside a `G20`/`G91` section: a rate read in one mode means
+        // something else in the other, and nothing there is a bead anyway.
+        let Some(rate) = self
+            .wanted_feed
+            .filter(|rate| self.feedrate != Some(*rate) && self.modal.is_plain())
+        else {
+            return Ok(());
+        };
+        self.feedrate = Some(rate);
+        // Plain `Display`, not `{:.0}`: the rate was read off the file, and
+        // rounding it hands the print back a speed it never asked for.
+        writeln!(self.out, "G1 F{rate} ; {BRICK_STAMP}resume")
     }
 
     /// Puts the nozzle back on the plane a deferred region left it above,
@@ -3155,12 +3340,11 @@ impl<'a, W: Write> Pass<'a, W> {
         // rounding them to whole mm/min hands the print back a speed it never
         // asked for — `F0` for anything under half a unit.
         writeln!(self.out, "G1 Z{z:.3} F{rate} ; {BRICK_STAMP}{note}")?;
-        match self.feedrate {
-            Some(previous) if previous != rate => {
-                writeln!(self.out, "G1 F{previous} ; {BRICK_STAMP}resume")
-            }
-            _ => Ok(()),
-        }
+        // What the file asked for goes back on the next move that states no
+        // rate of its own, rather than here: a move that states one needs no
+        // line, and a run of inserts then costs one line between them all.
+        self.feedrate = Some(rate);
+        Ok(())
     }
 
     fn push(&mut self, line: &[u8]) -> io::Result<()> {
@@ -3171,6 +3355,15 @@ impl<'a, W: Write> Pass<'a, W> {
 fn write_line<W: Write>(out: &mut W, line: &[u8]) -> io::Result<()> {
     out.write_all(line)?;
     out.write_all(b"\n")
+}
+
+/// A point as it will be written: three decimals, which is the micron every
+/// slicer resolves to.
+fn written(at: (f64, f64)) -> (f64, f64) {
+    (
+        (at.0 * 1000.0).round() / 1000.0,
+        (at.1 * 1000.0).round() / 1000.0,
+    )
 }
 
 /// The `M82`/`M83` that puts the extruder in the convention `absolute` names.

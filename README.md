@@ -137,6 +137,14 @@ So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle,
 
 The formula is the slicer's own bead model: PrusaSlicer's [`Flow::rounded_rectangle_extrusion_spacing`](https://github.com/prusa3d/PrusaSlicer/blob/master/src/libslic3r/Flow.cpp) spaces beads at `width − height × (1 − π/4)` and meters each at `height × spacing`, which was checked against real slices rather than assumed. The default itself is a **chosen constant**, small on purpose because it is paid on every wall and sets how far the visible wall is drawn in; only how it *scales* is derived. Micro-CT work supports the direction without having been used to fit it: [Faizaan *et al.* 2025](https://doi.org/10.1038/s41598-025-87348-2) found the voids in concentric-filled PLA to be **axially connected in every reconstruction**.
 
+### ⏱️ Why some walls print slower
+
+**A bead given more filament is given more time to melt it.** The first bead of a raised column spans one and a half layers, so it carries 1.5× the filament — at the slicer's own speed that is 1.5× the throughput, and your hot end does not have it. Your slicer already caps every bead against the filament's `filament_max_volumetric_speed`: measured on a stock Bambu plate whose filament states 15 mm³/s, **98.64% of the sliced path sits at exactly 15**. There is no headroom left to take.
+
+So where a bead would go over, `F` comes down by just enough to stay inside it. **The filament is never changed for this** — the same material goes down, over slightly more time. Left alone, the one bead that has to fill the gap under a raised column is the one that comes out starved, which is the transform's whole benefit lost exactly where it was meant to happen.
+
+It costs nothing where your filament has room: a bead at 5 mm³/s scaled to 7.7 is still well inside a 15 mm³/s limit and is left at full speed. **Each bead is judged on its own**, so a bridge the slicer already slowed to the limit does not drag the rest of its wall down with it. Measured across the stored plates, the bulk of a wall is slowed to **97-100%** of its own speed and only the beads that start a raised column reach **65%**, for **+4.4% to +4.7%** of the time spent laying bead.
+
 ---
 
 ## 🪄 Z anti-aliasing

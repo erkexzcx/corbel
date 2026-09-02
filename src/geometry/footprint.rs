@@ -405,6 +405,19 @@ pub fn turn(from: (f64, f64), to: (f64, f64), arc: Arc) -> Option<((f64, f64), f
     ))
 }
 
+/// How far one move actually travels in the plane, in mm.
+///
+/// An arc is followed round rather than cut across: a ring drawn as two 180°
+/// `G2`s has ends that share a coordinate, so its chord is nothing at all
+/// while its path is the whole circumference. Anything dividing filament by
+/// distance has to use this or it reads a curve as far more flow than it is.
+pub fn along(from: (f64, f64), to: (f64, f64), arc: Option<Arc>) -> f64 {
+    match arc.and_then(|arc| turn(from, to, arc)) {
+        Some((_, radius, _, sweep)) => radius * sweep.abs(),
+        None => (to.0 - from.0).hypot(to.1 - from.1),
+    }
+}
+
 /// The smallest box the path of one move fits in, as `[left, front, right,
 /// back]` in mm.
 ///

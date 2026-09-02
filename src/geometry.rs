@@ -13,5 +13,5 @@
 pub mod footprint;
 pub mod inset;
 
-pub use footprint::{Arc, CELL, Cells, Grid, Trace, cells, turn};
+pub use footprint::{Arc, CELL, Cells, Grid, Trace, along, cells, turn};
 pub use inset::Edge;

@@ -9,7 +9,7 @@ use std::io::{self, BufRead};
 use crate::gcode::feature::{Feature, is_layer_marker, unrecognised_region};
 use crate::gcode::{Code, Extruder, Line, Lines, MAX_LINE, Modal};
 use crate::geometry::Cells;
-use crate::geometry::footprint::extent;
+use crate::geometry::footprint::{self, Arc, extent};
 use crate::slicer::{self, WallOrder};
 
 /// Layer height assumed when the file says nothing useful.
@@ -30,7 +30,14 @@ const SAME_HEIGHT: f64 = 0.001;
 /// 12 mm/s is slow enough for any Z axis, including a delta moving all three
 /// towers at once.
 pub const FALLBACK_Z_FEEDRATE: f64 = 720.0;
-
+/// Shortest bead whose filament-per-mm is worth reading, in mm. Coordinates
+/// are written to the micron, so a bead a few microns long divides one
+/// rounding by another.
+pub(crate) const MELT_GAUGE: f64 = 0.5;
+/// Filament slots a `T` line may name. Past this a `T` is a slicer's own
+/// bookkeeping rather than a material — Bambu brackets a tool change with
+/// `T1000` and `T1001`.
+const MAX_TOOLS: usize = 64;
 /// Comment left on the lines this tool inserts. Repeating the transform
 /// compounds it, so a run recognises its own earlier work by these.
 pub const BRICK_STAMP: &str = "corbel brick ";
@@ -153,6 +160,16 @@ pub struct Survey {
     pub hop_travel: Option<f64>,
     /// How much filament the slicer pulls back for a travel, in mm.
     pub retract_length: Option<f64>,
+    /// The fastest each filament slot is asked to melt, in mm of filament a
+    /// second, indexed by the tool that selects it.
+    ///
+    /// One ceiling for a whole file is wrong the moment it prints two
+    /// materials. Measured on a user's dual-nozzle plate stating
+    /// `filament_max_volumetric_speed = 8,18,18,25,25`, **T0 peaks at exactly
+    /// 8.00 mm³/s over 282 m of path and T3 at exactly 25.00 over 145 m** —
+    /// each pinned to its own limit, and 3.1x apart. A single ceiling takes
+    /// the higher and lets the slower filament run 54% over.
+    pub melt_rate: Vec<Option<f64>>,
     /// True when [`brick`](crate::brick) has already run over this file.
     pub bricked: bool,
     /// True when [`zaa`](crate::zaa) has already run over this file.
@@ -285,6 +302,20 @@ impl Survey {
         self.object_tops.contains(&layer)
     }
 
+    /// The fastest `tool`'s filament may be melted, in mm of it a second.
+    ///
+    /// A file that never names a tool prints from slot zero, and one whose
+    /// tool this survey saw nothing extruded under falls back to the only
+    /// slot it did see — a plate may load a filament it barely uses.
+    pub fn melt_at(&self, tool: usize) -> Option<f64> {
+        self.melt_rate.get(tool).copied().flatten().or_else(|| {
+            match self.melt_rate.iter().flatten().count() {
+                1 => self.melt_rate.iter().flatten().copied().next(),
+                _ => None,
+            }
+        })
+    }
+
     /// Where `layer`'s walls have nothing above them, or `None` where the file
     /// gave the survey no way to tell.
     pub fn uncovered(&self, layer: usize) -> Option<&Cells> {
@@ -351,6 +382,17 @@ struct Scan {
     z_feedrate: Option<f64>,
     hop_travel: Option<f64>,
     retract_length: Option<f64>,
+    /// The rate every move is read at, since `F` is modal.
+    feed: Option<f64>,
+    /// Peak melt per tool, and the tool in force, since a file may print more
+    /// than one filament and each has its own limit.
+    melt_rate: Vec<Option<f64>>,
+    tool: usize,
+    /// `filament_max_volumetric_speed` in mm³/s per slot and
+    /// `filament_diameter` in mm, which together are a rate in the units a
+    /// bead is written in.
+    melt_stated: Vec<f64>,
+    filament: Option<f64>,
     bricked: bool,
     contoured: bool,
     arc_extrusions: usize,
@@ -444,6 +486,10 @@ impl Scan {
         // anything, stands on it a layer later.
         let line = Line::parse(raw);
 
+        if let Some(tool) = tool_change(raw) {
+            self.tool = tool;
+        }
+
         if let Some(comment) = line.comment() {
             // A stamp rides the Z move it was written beside, so this cannot
             // be folded into the marker handling below.
@@ -465,7 +511,6 @@ impl Scan {
                     self.forget_the_markerless_layout();
                 }
                 self.layers += 1;
-                self.feature = Feature::Other;
                 self.close_layer();
                 self.open_layer = Some(self.layers - 1);
                 self.wall_top_at_open = self.last_wall_layer;
@@ -501,6 +546,24 @@ impl Scan {
                         && pull < 20.0
                     {
                         self.retract_length.get_or_insert(pull);
+                    }
+                } else if key.eq_ignore_ascii_case("filament_max_volumetric_speed") {
+                    // Every slot, in order: the tool selects which one is in
+                    // force, and a file printing two materials pins each of
+                    // them to its own limit.
+                    self.melt_stated = value
+                        .split(',')
+                        .map(|piece| match piece.trim().parse::<f64>() {
+                            Ok(rate) if rate > 0.0 && rate < 1000.0 => rate,
+                            _ => 0.0,
+                        })
+                        .collect();
+                } else if key.eq_ignore_ascii_case("filament_diameter") {
+                    if let Ok(across) = value.split(',').next().unwrap_or("").trim().parse::<f64>()
+                        && across > 0.5
+                        && across < 5.0
+                    {
+                        self.filament.get_or_insert(across);
                     }
                 } else if key.eq_ignore_ascii_case("nozzle_diameter") {
                     self.nozzle.get_or_insert_with(|| value.to_owned());
@@ -598,6 +661,10 @@ impl Scan {
         if extrudes && matches!(self.feature, Feature::InternalPerimeter | Feature::ThinWall) {
             self.last_wall_layer = self.open_layer;
         }
+        if let Some(rate) = line.f.filter(|rate| *rate > 0.0) {
+            self.feed = Some(rate);
+        }
+        self.observe_melt(delta, from, to, arc, extrudes);
         if self.feature == Feature::InternalPerimeter && extrudes {
             if self.open_layer.is_some() {
                 self.here.draw(from, to, arc);
@@ -629,6 +696,76 @@ impl Scan {
         }
         if line.z.is_some() {
             self.observe_height(self.modal.position().2);
+        }
+    }
+
+    /// The fastest this file may melt filament, in mm of it a second.
+    ///
+    /// The profile's figure where there is one, and never below what the
+    /// slicer already asked for. A stated rate belongs to a filament slot and
+    /// a file need never say which slot it prints from, so the measured peak
+    /// is a floor under it rather than a rival: no rate the slicer itself
+    /// demanded may be treated as impossible. Where nothing is stated the
+    /// measured peak stands alone — what this hot end has already been asked
+    /// for is the only evidence of what it can do.
+    fn melt_ceiling(&self) -> Vec<Option<f64>> {
+        let area = std::f64::consts::PI * (self.filament.unwrap_or(1.75) / 2.0).powi(2);
+        let slots = self.melt_stated.len().max(self.melt_rate.len());
+        (0..slots)
+            .map(|slot| {
+                let stated = self
+                    .melt_stated
+                    .get(slot)
+                    .copied()
+                    .filter(|rate| *rate > 0.0)
+                    .map(|rate| rate / area);
+                let measured = self.melt_rate.get(slot).copied().flatten();
+                match (stated, measured) {
+                    (Some(stated), Some(measured)) => Some(stated.max(measured)),
+                    (stated, measured) => stated.or(measured),
+                }
+            })
+            .collect()
+    }
+
+    /// Books how fast a bead is asked to melt filament, in mm of it a second,
+    /// keeping the fastest each tool reaches.
+    ///
+    /// Every bead, not just the walls. A top surface runs faster than a
+    /// perimeter on most profiles and [`zaa`](crate::zaa) re-meters one, so a
+    /// ceiling read off the walls alone slows it for nothing — measured on a
+    /// synthetic slice, a surface bead came out at 5116 mm/min against the
+    /// 9000 the file asked for. A rate the slicer already demanded is one this
+    /// print was expected to make.
+    ///
+    /// Anything shorter than [`MELT_GAUGE`] is skipped: a coordinate is
+    /// written to the micron, so filament divided by a path a few microns long
+    /// is rounding rather than flow.
+    fn observe_melt(
+        &mut self,
+        delta: f64,
+        from: (f64, f64),
+        to: (f64, f64),
+        arc: Option<Arc>,
+        extrudes: bool,
+    ) {
+        if !extrudes {
+            return;
+        }
+        let Some(feed) = self.feed else {
+            return;
+        };
+        let along = footprint::along(from, to, arc);
+        if along < MELT_GAUGE {
+            return;
+        }
+        let rate = delta / along * feed / 60.0;
+        if rate.is_finite() && rate > 0.0 {
+            if self.melt_rate.len() <= self.tool {
+                self.melt_rate.resize(self.tool + 1, None);
+            }
+            let seen = &mut self.melt_rate[self.tool];
+            *seen = Some(seen.map_or(rate, |fastest: f64| fastest.max(rate)));
         }
     }
 
@@ -906,6 +1043,7 @@ impl Scan {
             z_feedrate: self.z_feedrate,
             hop_travel: self.hop_travel,
             retract_length: self.retract_length,
+            melt_rate: self.melt_ceiling(),
             bricked: self.bricked,
             contoured: self.contoured,
             arc_extrusions: self.arc_extrusions,
@@ -935,6 +1073,21 @@ impl Scan {
 /// Splits `; layer_height = 0.2` from a slicer's settings block into its key
 /// and value, given the text after the `;`. Keys are matched whole, so
 /// `first_layer_height` is its own setting rather than a `layer_height` line.
+/// The filament slot a `T` line selects, and `None` for anything else.
+///
+/// Slicers use high numbers for bookkeeping rather than for a filament —
+/// Bambu brackets a change with `T1000` and `T1001` — so only an index that
+/// could name a slot counts. The rest of the line is ignored: a real one
+/// carries words after it, as in `T3 H-1`.
+pub(crate) fn tool_change(raw: &str) -> Option<usize> {
+    let word = raw.split_whitespace().next()?;
+    let digits = word.strip_prefix('T').or_else(|| word.strip_prefix('t'))?;
+    match digits.parse::<usize>() {
+        Ok(slot) if slot < MAX_TOOLS => Some(slot),
+        _ => None,
+    }
+}
+
 fn setting(comment: &str) -> Option<(&str, &str)> {
     let (key, value) = comment.split_once('=')?;
     Some((key.trim(), value.trim()))
@@ -1686,6 +1839,111 @@ G1 X2 Y0 E1
     fn ignores_feedrates_of_moves_that_also_travel() {
         let survey = Survey::of(";LAYER_CHANGE\nG1 X1 Y1 Z0.2 F9000\n");
         assert_eq!(survey.z_feedrate, None);
+    }
+
+    /// A slicer clamps a bead's speed so its filament stays inside the melt
+    /// rate the profile states, so the fastest bead in the file is that rate.
+    /// Measured on a stock Bambu plate, 98.64% of the bead path sits at
+    /// exactly the 15 mm³/s its filament declares, and the rate measured off
+    /// its beads comes out at that same figure.
+    #[test]
+    fn takes_the_fastest_rate_the_file_melts_filament_at() {
+        // 0.05 mm of filament over 1 mm at F1200 is 1 mm of filament a
+        // second; the second bead asks for half that and must not lower it.
+        let survey = Survey::of(&melt_profile(
+            "M83\n;TYPE:Perimeter\nG1 F1200\nG1 X1 Y0 E0.05\nG1 X2 Y0 E0.025\n",
+        ));
+        assert_eq!(survey.melt_at(0), Some(1.0));
+    }
+
+    /// A top surface runs faster than a wall on most profiles and the surface
+    /// transform re-meters one, so a ceiling read off the walls alone would
+    /// slow it for nothing. A rate the slicer already asked for is one this
+    /// print was expected to make.
+    #[test]
+    fn every_bead_sets_the_melt_rate_not_only_the_walls() {
+        let survey = Survey::of(&melt_profile(
+            "M83\n;TYPE:Perimeter\nG1 F1200\nG1 X1 Y0 E0.05\n\
+             ;TYPE:Top surface\nG1 F2400\nG1 X2 Y0 E0.05\n",
+        ));
+        assert_eq!(survey.melt_at(0), Some(2.0));
+    }
+
+    /// One ceiling for a whole file is wrong the moment it prints two
+    /// materials. Measured on a user's dual-nozzle plate stating
+    /// `filament_max_volumetric_speed = 8,18,18,25,25`, T0 peaks at exactly
+    /// 8.00 mm³/s and T3 at exactly 25.00 — each pinned to its own limit, and
+    /// 3.1x apart.
+    #[test]
+    fn each_tool_carries_its_own_melt_rate() {
+        let survey = Survey::of(
+            "; filament_max_volumetric_speed = 0.5,2\n; filament_diameter = 1.1283791671\n\
+             M83\nT0\n;TYPE:Perimeter\nG1 F1200\nG1 X1 Y0 E0.02\n\
+             T1\nG1 F1200\nG1 X2 Y0 E0.02\n",
+        );
+        assert!(
+            survey
+                .melt_at(0)
+                .is_some_and(|rate| (rate - 0.5).abs() < 1e-6),
+            "{:?}",
+            survey.melt_at(0)
+        );
+        assert!(
+            survey
+                .melt_at(1)
+                .is_some_and(|rate| (rate - 2.0).abs() < 1e-6),
+            "{:?}",
+            survey.melt_at(1)
+        );
+    }
+
+    /// A slicer brackets a tool change with codes of its own — Bambu uses
+    /// `T1000` and `T1001` — and those name no filament.
+    #[test]
+    fn a_slicers_own_bookkeeping_is_not_a_filament() {
+        assert_eq!(tool_change("T3 H-1"), Some(3));
+        assert_eq!(tool_change("T0"), Some(0));
+        assert_eq!(tool_change("T1000"), None);
+        assert_eq!(tool_change("T1001"), None);
+        assert_eq!(tool_change("G1 X1"), None);
+    }
+
+    /// A coordinate is written to the micron, so a bead a few microns long
+    /// divides one rounding by another and reads as any rate at all — so the
+    /// stated ceiling stands alone.
+    #[test]
+    fn a_bead_too_short_to_measure_sets_no_melt_rate() {
+        let survey = Survey::of(&melt_profile(
+            "M83\n;TYPE:Perimeter\nG1 F1200\nG1 X0.005 Y0 E0.05\n",
+        ));
+        let rate = survey.melt_at(0).expect("the stated rate stands alone");
+        assert!((rate - 0.5).abs() < 1e-9, "{rate}");
+    }
+
+    /// Where the file declares no limit, what it already asked for is the
+    /// only evidence there is of what the hot end can do.
+    #[test]
+    fn a_file_that_states_no_melt_rate_falls_back_to_its_own_walls() {
+        let survey = Survey::of("M83\n;TYPE:Perimeter\nG1 F1200\nG1 X1 Y0 E0.05\n");
+        assert_eq!(survey.melt_at(0), Some(1.0));
+    }
+
+    /// The stated rate belongs to a filament slot and a file need never say
+    /// which one it prints from, so the slowest slot must not make the print
+    /// slower than the slicer already had it.
+    #[test]
+    fn the_measured_rate_is_a_floor_under_the_stated_one() {
+        let survey = Survey::of(
+            "; filament_max_volumetric_speed = 0.5,8\n; filament_diameter = 1.1283791671\n\
+             M83\n;TYPE:Perimeter\nG1 F1200\nG1 X1 Y0 E0.05\n",
+        );
+        assert_eq!(survey.melt_at(0), Some(1.0));
+    }
+
+    /// A filament exactly 1 mm² in section, so a stated mm³/s reaches the
+    /// walls as the same figure in the units their `E` is written in.
+    fn melt_profile(body: &str) -> String {
+        format!("; filament_max_volumetric_speed = 0.5\n; filament_diameter = 1.1283791671\n{body}")
     }
 
     #[test]

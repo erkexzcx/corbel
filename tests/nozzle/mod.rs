@@ -690,6 +690,28 @@ pub struct Ledger {
     pub retracted: f64,
     /// The slowest and fastest feedrate in force while laying a bead.
     pub bead_feed: (f64, f64),
+    /// The fastest each tool's filament is asked to melt, in mm of it a
+    /// second.
+    ///
+    /// A raise gives a bead more filament and the slicer's own rate stays
+    /// where it was, so the hot end is asked for that much more melt — which
+    /// it cannot deliver, so the one bead that has to carry a layer and a half
+    /// comes out starved. Per TOOL: a plate printing two materials pins each
+    /// to its own limit, and they can be 3x apart. Only beads long enough to
+    /// measure: a coordinate is written to the micron, so a bead a few microns
+    /// long divides one rounding by another.
+    pub peak_melt: Vec<f64>,
+    /// The line each peak was measured on, so a failure names it.
+    pub peak_line: Vec<String>,
+    /// Seconds spent laying bead. The rate a bead is laid at may be brought
+    /// DOWN on purpose, to give the extra filament a raise adds the time it
+    /// needs, so what has to be bounded is how much of that is spent — not
+    /// whether any single rate changed.
+    pub seconds: f64,
+    /// What the file says each filament slot melts at, in mm of it a second.
+    /// Read here rather than through the crate's own settings code, so a
+    /// defect in that cannot hide an over-fed bead from this.
+    pub melt_ceiling: Vec<f64>,
     /// Moves that wind an absolute extruder backwards without retracting.
     pub backwards: Vec<(usize, String)>,
     /// How much bead is drawn at each width the slicer declared. Reordering a
@@ -751,6 +773,10 @@ pub fn ledger(gcode: &str) -> Ledger {
         extruded: 0.0,
         retracted: 0.0,
         bead_feed: (f64::INFINITY, 0.0),
+        peak_melt: Vec::new(),
+        peak_line: Vec::new(),
+        melt_ceiling: stated_melt(gcode),
+        seconds: 0.0,
         backwards: Vec::new(),
         widths: HashMap::new(),
         primed_travel: 0.0,
@@ -770,6 +796,7 @@ pub fn ledger(gcode: &str) -> Ledger {
     let mut width = String::new();
     let mut layer = 0usize;
     let mut feed = 0.0_f64;
+    let mut tool = 0usize;
 
     for (index, text) in gcode.lines().enumerate() {
         let line = Line::parse(text);
@@ -786,6 +813,13 @@ pub fn ledger(gcode: &str) -> Ledger {
             layer += 1;
         }
         let trimmed = text.trim();
+        if let Some(digits) = trimmed.split_whitespace().next().and_then(|word| {
+            word.strip_prefix('T')
+                .and_then(|rest| rest.parse::<usize>().ok())
+        }) && digits < 64
+        {
+            tool = digits;
+        }
         if let Some(rest) = trimmed
             .strip_prefix("; FEATURE:")
             .or_else(|| trimmed.strip_prefix(";TYPE:"))
@@ -924,12 +958,26 @@ pub fn ledger(gcode: &str) -> Ledger {
             book.drawn[layer] += along;
             *book.widths.entry(width.clone()).or_default() += along;
             *book.regions.entry(region.clone()).or_default() += along;
-        } else if (line.x.is_some() || line.y.is_some()) && withdrawn <= 1e-9 {
-            book.primed_travel += (to.0 - from.0).hypot(to.1 - from.1);
             if feed > 0.0 {
                 book.bead_feed.0 = book.bead_feed.0.min(feed);
                 book.bead_feed.1 = book.bead_feed.1.max(feed);
+                book.seconds += along / (feed / 60.0);
+                if along >= MELT_GAUGE
+                    && let Some(value) = delta.filter(|value| *value > 0.0)
+                {
+                    let melt = value / along * feed / 60.0;
+                    if book.peak_melt.len() <= tool {
+                        book.peak_melt.resize(tool + 1, 0.0);
+                        book.peak_line.resize(tool + 1, String::new());
+                    }
+                    if melt > book.peak_melt[tool] {
+                        book.peak_melt[tool] = melt;
+                        book.peak_line[tool] = format!("{}: {}", index + 1, text.trim());
+                    }
+                }
             }
+        } else if (line.x.is_some() || line.y.is_some()) && withdrawn <= 1e-9 {
+            book.primed_travel += (to.0 - from.0).hypot(to.1 - from.1);
         }
     }
     book
@@ -961,6 +1009,27 @@ fn swept(from: (f64, f64), to: (f64, f64), arc: Arc) -> f64 {
 /// whole percent.
 const PATH_DRIFT: f64 = 0.02;
 
+/// How much longer the beads of a file may take to lay.
+///
+/// A rate is brought down on purpose where a raise would otherwise ask the
+/// hot end for melt it cannot deliver, and the deepest that can go is the
+/// climb's own 1.54 — but only on the loops that climb, so across a file it
+/// is a few percent. The bug this exists to catch put 44% of a plate at
+/// F1800 against the F11054 it asked for, which is that bead running six
+/// times as long.
+const TIME_SLACK: f64 = 0.25;
+
+/// The deepest a bead's rate is ever divided by. Slowing one to stay inside
+/// the file's own melt rate divides its rate by the filament it was given,
+/// and the most any bead is given is the climb's 1.54 — with a little room
+/// for the flow multiplier on top of it.
+const MOST_SLOWED: f64 = 1.65;
+
+/// Shortest bead whose filament-per-mm is worth reading, in mm. A coordinate
+/// is written to the micron, so anything shorter divides one rounding by
+/// another.
+const MELT_GAUGE: f64 = 0.5;
+
 /// How far the filament a run actually adds may sit from the figure it prints.
 ///
 /// The printed figure is the wall FLOW alone. A column also ramps on at its
@@ -979,7 +1048,6 @@ const CLAIM_SLACK: f64 = 1.0;
 /// to move the toolhead further with a full nozzle than the slicer already
 /// did, and every millimetre it adds is a millimetre of string.
 const PRIMED_SLACK: f64 = 0.01;
-
 /// Everything one file must still be able to say about another that came out
 /// of the transform, gathered in one place so every suite asks the same
 /// questions of every run.
@@ -989,6 +1057,44 @@ const PRIMED_SLACK: f64 = 0.01;
 /// actually added — a transform cannot be wrong in the same direction twice,
 /// so agreeing with its own account is a stronger test than any bound picked
 /// here.
+/// The rate the file says its filament melts at, in mm of filament a second:
+/// the slowest slot's `filament_max_volumetric_speed` over the filament's own
+/// section. A print may use every bit of that, whether or not the slicer
+/// happened to.
+fn stated_melt(gcode: &str) -> Vec<f64> {
+    let (mut rates, mut across) = (Vec::new(), 1.75);
+    for line in gcode
+        .lines()
+        .take_while(|line| !line.contains("EXECUTABLE"))
+    {
+        let Some((key, value)) = line.trim_start_matches(';').split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "filament_max_volumetric_speed" => {
+                rates = value
+                    .split(',')
+                    .map(|piece| match piece.trim().parse::<f64>() {
+                        Ok(slot) if slot > 0.0 && slot < 1000.0 => slot,
+                        _ => 0.0,
+                    })
+                    .collect();
+            }
+            "filament_diameter" => {
+                if let Ok(value) = value.split(',').next().unwrap_or("").trim().parse::<f64>()
+                    && value > 0.5
+                    && value < 5.0
+                {
+                    across = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    let area = std::f64::consts::PI * (across / 2.0).powi(2);
+    rates.iter().map(|rate| rate / area).collect()
+}
+
 pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String> {
     let mut found = Vec::new();
 
@@ -1020,13 +1126,31 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
         ));
     }
 
-    if after.bead_feed.1 > before.bead_feed.1 * 1.001
-        || after.bead_feed.0 < before.bead_feed.0 * 0.999
-    {
+    // One-sided: a rate is brought DOWN on purpose where a raise would
+    // otherwise ask the hot end for melt it cannot deliver, and `seconds`
+    // bounds how much of that is spent. Faster than the slicer asked is
+    // never anything but a bug.
+    if after.bead_feed.1 > before.bead_feed.1 * 1.001 {
         found.push(format!(
-            "beads are laid between {:.0} and {:.0} mm/min, against {:.0} to {:.0} in the input \
+            "a bead is laid at {:.0} mm/min, against {:.0} at the fastest in the input \
              — a feedrate was lost, so a bead runs at a travel's speed",
-            after.bead_feed.0, after.bead_feed.1, before.bead_feed.0, before.bead_feed.1
+            after.bead_feed.1, before.bead_feed.1
+        ));
+    }
+
+    // The other side has a floor, so it is checkable too. Slowing a bead to
+    // stay inside the file's own melt rate divides its rate by the filament
+    // it was given, and the most any bead is ever given is the climb's 1.54 —
+    // so nothing may come out below that. Deeper than that is a rate that
+    // belongs to something else: a height move at F600 under a wall printed
+    // at F18000 is 30x, which reads as a bead at a thirtieth of the flow and
+    // draws a line across the part.
+    if after.bead_feed.0 < before.bead_feed.0 / MOST_SLOWED {
+        found.push(format!(
+            "a bead is laid at {:.0} mm/min, against {:.0} at the slowest in the input \
+             — no metering divides a rate by more than {MOST_SLOWED}, so that rate \
+             belongs to a height move or a retraction",
+            after.bead_feed.0, before.bead_feed.0
         ));
     }
 
@@ -1054,6 +1178,58 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
              reordered away from it",
             astray / drawn * 100.0
         ));
+    }
+
+    // The same shape, for the same reason, one axis over. A slicer states the
+    // rate once and every bead behind it inherits one; a retraction or a
+    // height move written between the two hands the wall the retraction's own
+    // rate instead. Measured on a stock 1000-wall plate, 39446 mm of bead —
+    // 44% of the file — came out at F1800 where the slicer asked for F11054,
+    // with the bead's own `E`, the filament total and the feedrate RANGE all
+    // untouched, because F1800 is a rate the file does use.
+    //
+    // Not the rates themselves: a rate is brought down ON PURPOSE where a
+    // raise would otherwise ask the hot end for melt it cannot deliver, so
+    // what is bounded is the TIME that costs. F1800 against F11054 over 44% of
+    // a file is a wall running six times as long; a throttle is a few percent.
+    if before.seconds > 1.0 && after.seconds > before.seconds * (1.0 + TIME_SLACK) {
+        found.push(format!(
+            "the beads take {:.0} s to lay against {:.0} s in the input ({:+.1}%) — `F` is \
+             modal, so a bead behind an inserted retraction or height move is drawn at that \
+             line's rate",
+            after.seconds,
+            before.seconds,
+            (after.seconds / before.seconds - 1.0) * 100.0
+        ));
+    }
+
+    // A raise gives a bead half a layer more filament and leaves the slicer's
+    // rate where it was, so the hot end is asked for that much more melt per
+    // second. Measured on a stock Bambu plate whose filament states 15 mm³/s
+    // and whose input sits at exactly that for 98.64% of its path, `--bricks`
+    // asked for up to 23 mm³/s — 54% over, across 16% of the file — and no hot
+    // end delivers that, so the one bead that must carry a layer and a half to
+    // fill the gap under a raised column is the one that comes out starved.
+    //
+    // Against the file's own stated ceiling as well as its fastest bead: a
+    // profile may allow more melt than the slicer happened to use, and a print
+    // with that headroom must not be slowed for nothing. Per TOOL, because a
+    // plate printing two materials pins each to its own limit — measured on a
+    // user's dual-nozzle plate, T0 peaks at exactly 8.00 mm³/s and T3 at
+    // exactly 25.00, which is 3.1x apart.
+    for (tool, &now) in after.peak_melt.iter().enumerate() {
+        let was = before.peak_melt.get(tool).copied().unwrap_or_default();
+        let stated = before.melt_ceiling.get(tool).copied().unwrap_or_default();
+        let allowed = was.max(stated);
+        if now > allowed * 1.001 {
+            found.push(format!(
+                "a bead is asked to melt filament {:.1}% faster than T{tool}'s filament \
+                 allows — the hot end cannot deliver it, so the bead a raise depends on \
+                 comes out starved\n    {}\n    against a ceiling of {allowed:.4} mm/s",
+                (now / allowed.max(f64::MIN_POSITIVE) - 1.0) * 100.0,
+                after.peak_line.get(tool).map_or("", String::as_str),
+            ));
+        }
     }
 
     // Stringing has one cause: the nozzle moving, or standing still, with

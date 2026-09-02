@@ -30,3 +30,13 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The suite is compute-bound — footprint walks, surface grids, a nozzle
+# replayed over 25 real plates — so unoptimised it spends minutes in code the
+# binary runs in seconds. Every assertion, overflow check and `debug_assert`
+# is still on; only the code generation changes.
+[profile.test]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 3

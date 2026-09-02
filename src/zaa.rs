@@ -35,7 +35,7 @@ use std::io::{self, BufRead, Write};
 use crate::gcode::feature::{Feature, is_layer_marker};
 use crate::gcode::{Code, Extruder, Line, MAX_LINE, Modal, repaired, write_e, write_fixed};
 use crate::geometry::{Arc, Cells, Grid, turn};
-use crate::scan::{FALLBACK_Z_FEEDRATE, Survey, ZAA_STAMP, is_a_height, is_stamp};
+use crate::scan::{FALLBACK_Z_FEEDRATE, MELT_GAUGE, Survey, ZAA_STAMP, is_a_height, is_stamp};
 use crate::zaa::scout::Scout;
 use crate::zaa::surface::{Builder, Field, MAX_WINDOW, Slice};
 
@@ -124,6 +124,12 @@ const TOLERANCE: f64 = 0.005;
 /// was checked: 73 of 341 inserted height changes were exactly that.
 fn same_height(a: f64, b: f64) -> bool {
     (a * 1000.0).round() == (b * 1000.0).round()
+}
+
+/// A coordinate as it will be written: three decimals, which is the micron
+/// every slicer resolves to.
+fn written(value: f64) -> f64 {
+    (value * 1000.0).round() / 1000.0
 }
 
 /// Points one move may be sampled at. A move longer than a bed is not a move,
@@ -316,7 +322,20 @@ pub struct Pass<W, R> {
     /// not raise, and so one this may move.
     commanded: Option<f64>,
     nozzle_z: Option<f64>,
+    /// The rate the OUTPUT is really left in, which the height moves this pass
+    /// inserts and the beads it slows both change.
     feedrate: Option<f64>,
+    /// The fastest this file's walls melt filament, in mm of it a second.
+    ///
+    /// A stretch lowered into a thicker gap is metered for that gap, so it
+    /// carries up to half a layer more filament — and at the slicer's own
+    /// rate that is up to half again as much melt a second, which the hot end
+    /// does not deliver. Measured across the stored plates before this,
+    /// `--zaa` asked for **46.7% more than anything in the input**.
+    melt_rate: Option<f64>,
+    /// The ceiling of every filament slot, since a tool change swaps which one
+    /// is in force and a plate may print two that are 3x apart.
+    melt_rates: Vec<Option<f64>>,
     at: (f64, f64),
     /// Layer [`Pass::field`] describes, so it is built once per layer and only
     /// for a layer that has a surface on it.
@@ -398,6 +417,8 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             commanded: None,
             nozzle_z: None,
             feedrate: None,
+            melt_rate: survey.melt_at(0),
+            melt_rates: survey.melt_rate.clone(),
             at: (0.0, 0.0),
             built: None,
             warned: false,
@@ -482,10 +503,18 @@ impl<W: Write, R: BufRead> Pass<W, R> {
     fn feed(&mut self, raw: &str, bytes: &[u8]) -> io::Result<()> {
         let line = Line::parse_bytes(raw, bytes);
 
+        if let Some(tool) = crate::scan::tool_change(raw) {
+            self.melt_rate = self
+                .melt_rates
+                .get(tool)
+                .copied()
+                .flatten()
+                .or(self.melt_rate);
+        }
+
         if let Some(text) = line.marker() {
             if is_layer_marker(text) {
                 self.layer += usize::from(std::mem::replace(&mut self.started, true));
-                self.feature = Feature::Other;
                 self.plane = None;
             } else if let Some(feature) = Feature::from_marker(text) {
                 self.feature = feature;
@@ -1240,18 +1269,70 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         }
     }
 
+    /// The rate a piece carrying `e` mm of filament over `run` mm of ground
+    /// has to be laid at, so it does not ask the hot end to melt faster than
+    /// anything the file itself asks for. `None` where it already fits.
+    ///
+    /// Only ever slower. The filament is what the gap needs and is not
+    /// touched; what changes is how long the nozzle is given to deliver it.
+    fn slowed(&self, asked: Option<f64>, e: f64, run: f64) -> Option<f64> {
+        let (ceiling, asked) = (self.melt_rate?, asked?);
+        if run < MELT_GAUGE || e <= 0.0 {
+            return None;
+        }
+        let rate = e / run * asked / 60.0;
+        (rate > ceiling).then(|| asked * ceiling / rate)
+    }
+
+    /// Puts back the rate the file asked for, where a slowed piece of this
+    /// pass's own has left the stream in another.
+    ///
+    /// Written straight away rather than owed to the next move: the rate
+    /// arrives on paths this pass does not write — a travel copied through
+    /// untouched still sets it — so anything held between the two goes stale.
+    fn settle_feed(&mut self, asked: Option<f64>) -> io::Result<()> {
+        let Some(rate) = asked.filter(|rate| self.feedrate != Some(*rate)) else {
+            return Ok(());
+        };
+        self.feedrate = Some(rate);
+        writeln!(self.out, "G1 F{rate} ; {ZAA_STAMP}resume")
+    }
+
     /// Writes the planned moves in place of the one that was read.
     fn write_plan(&mut self, pending: &Pending) -> io::Result<()> {
         let text = repaired(&pending.line);
         let line = Line::parse_bytes(&text, &pending.line);
         let comment = line.comment();
         let rate = line.f;
+        let asked = rate.or(self.feedrate);
         let plane = pending.plane;
         let count = self.plan.len();
         let mut stock = 0.0;
+        // What the piece is metered over and what it is drawn across differ:
+        // the filament is metered along the sampled path, and the move that
+        // gets written is the straight line between two kept samples. Melt is
+        // filament over the ground actually covered, so it takes the latter —
+        // at the three decimals it is WRITTEN to, since a micron of rounding
+        // on a half-millimetre piece is a fifth of a percent of its flow.
+        let mut previous = pending
+            .samples
+            .first()
+            .map_or(self.at, |&(x, y, _, _)| (written(x), written(y)));
         for index in 0..count {
             let (x, y, z, e) = self.plan[index];
+            let (x, y) = (written(x), written(y));
+            let spanned = (x - previous.0).hypot(y - previous.1);
+            previous = (x, y);
             let value = self.extruder.advance(e);
+            // A piece metered for a thicker gap carries more filament over the
+            // same ground, so it is given the time to melt it. `F` is modal,
+            // so only a change is written.
+            let slowed = self
+                .slowed(asked, e, spanned)
+                .filter(|rate| self.feedrate != Some(*rate));
+            if let Some(rate) = slowed {
+                self.feedrate = Some(rate);
+            }
             stock += e;
             self.nozzle_z = Some(z);
             let low = z - plane;
@@ -1269,10 +1350,10 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             write_fixed(out, z, 3)?;
             out.write_all(b" E")?;
             write_fixed(out, value, 5)?;
+            if let Some(rate) = slowed {
+                write!(out, " F{rate}")?;
+            }
             if index == 0 {
-                if let Some(rate) = rate {
-                    write!(out, " F{rate}")?;
-                }
                 write!(out, " ; {ZAA_STAMP}surface")?;
             }
             // The comment the move arrived with rides its last piece, or the
@@ -1287,9 +1368,7 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             }
             out.write_all(b"\n")?;
         }
-        if let Some(rate) = rate {
-            self.feedrate = Some(rate);
-        }
+        self.settle_feed(asked)?;
 
         self.stats.moves += 1;
         self.stats.segments += count;
@@ -1500,7 +1579,7 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             Some(previous) if previous != rate => {
                 writeln!(self.out, "G1 F{previous} ; {ZAA_STAMP}resume")?;
             }
-            _ => {}
+            _ => self.feedrate = Some(rate),
         }
         Ok(None)
     }

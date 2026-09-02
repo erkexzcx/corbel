@@ -134,7 +134,6 @@ impl Trace {
         if let Some(text) = line.marker() {
             if is_layer_marker(text) {
                 self.close();
-                self.feature = Feature::Other;
                 // The same count the rewrite keeps: the first marker opens
                 // layer zero, so both passes name the same layer.
                 self.layers += usize::from(std::mem::replace(&mut self.started, true));

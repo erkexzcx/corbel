@@ -4,8 +4,10 @@ fn layer(z: f64) -> String {
     format!(";LAYER_CHANGE\nG1 Z{z:.2} F600\n")
 }
 
+/// A file printing a filament with melt to spare, so a fixture about
+/// geometry is not also a fixture about the rate a raise has to be slowed to.
 fn relative(body: &str) -> String {
-    format!("; layer_height = 0.2\nM83\n{body}")
+    format!("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM83\n{body}")
 }
 
 /// A file whose middle layer carries `body`, so neither the layers a
@@ -472,7 +474,17 @@ fn inserted_z_moves_carry_a_feedrate_and_hand_the_print_speed_back() {
         out.contains("G1 Z0.900 F600 ; corbel brick raised"),
         "{out}"
     );
-    assert!(out.contains("G1 F1800 ; corbel brick resume"), "{out}");
+    // The rate reaches the bead however it is delivered — on a line of its
+    // own, or on the bead itself where that bead is being rewritten anyway.
+    let rates = bead_feeds(&out);
+    assert!(
+        !rates.contains(&600.0),
+        "a bead was left at the rate of an inserted height move:\n{out}"
+    );
+    assert!(
+        rates.contains(&1800.0),
+        "the file's own rate never reached a bead:\n{out}"
+    );
 }
 
 #[test]
@@ -494,8 +506,9 @@ fn an_inserted_feedrate_hands_back_the_rate_the_file_asked_for() {
          G1 X0 Y0 E0.5\n",
     );
     let out = run(&source, &Config::default());
+    let rates = bead_feeds(&out);
     assert!(
-        out.contains("G1 F1799.5 ; corbel brick resume"),
+        !rates.contains(&600.0) && rates.contains(&1799.5),
         "the restored feedrate was rounded:\n{out}"
     );
 }
@@ -595,7 +608,8 @@ fn a_g92_between_the_layer_and_the_wall_keeps_the_carrier_and_the_origin() {
 /// came out asking for 0.5.
 #[test]
 fn a_mode_change_inside_a_region_reaches_the_beads_in_replay_order() {
-    let mut source = String::from("; layer_height = 0.2\nM82\n");
+    let mut source =
+        String::from("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM82\n");
     let mut position = 0.0;
     let mut relative = false;
     for (index, z) in [0.2, 0.4, 0.6, 0.8, 1.0].into_iter().enumerate() {
@@ -1362,26 +1376,36 @@ fn a_retraction_between_a_wall_s_own_loops_does_not_split_it() {
     );
 }
 
+/// A `; FEATURE:`/`;TYPE:` is modal, so a layer change does not end it.
+///
+/// OrcaSlicer opens the next layer's wall with a segment before it re-declares
+/// the region, and Bambu prints a thin tapering wall straight through a layer
+/// change without re-declaring it at all — measured on a user's plate, 20 of
+/// 274 layers laid 6895 mm that way. Read as no region, that bead is left out
+/// of the footprint, which caps the layer below it to half flow and stops the
+/// bricking above; read as the wall the slicer last named, it is what it is.
 #[test]
-fn a_layer_change_ends_the_region_it_interrupts() {
-    // OrcaSlicer opens the next layer's wall with a stray segment before it
-    // re-declares the region. Carrying the old region across the layer
-    // change would buffer that segment as a perimeter loop of its own, at
-    // the new layer's Z.
+fn a_layer_change_does_not_end_the_region_it_interrupts() {
     let source = relative(&format!(
         ";LAYER_CHANGE\nG1 Z0.20 F600\n;TYPE:Perimeter\n{}\
-         ;LAYER_CHANGE\nG1 Z0.40 F600\nG1 X20 Y20 E0.01 ; stray\n\
+         ;LAYER_CHANGE\nG1 Z0.40 F600\nG1 X20 Y20 E0.01 ; carried\n\
          ;TYPE:Perimeter\n{}",
         wall(2, "first"),
         wall(2, "second"),
     ));
     let outcome = apply(&source, &Config::default());
     assert!(
-        outcome.gcode.contains("G1 X20 Y20 E0.01 ; stray\n"),
-        "{}",
+        outcome
+            .gcode
+            .lines()
+            .any(|line| line.starts_with("G1 X20 Y20 E") && line.ends_with("; carried")),
+        "the carried bead was dropped or moved:\n{}",
         outcome.gcode
     );
-    assert_eq!(outcome.stats.loops, 4, "the stray segment is not a loop");
+    assert_eq!(
+        outcome.stats.loops, 5,
+        "the carried bead is the wall the slicer last named"
+    );
 }
 
 #[test]
@@ -1626,7 +1650,9 @@ fn a_layer_thinner_than_the_seam_beneath_it_never_meters_a_bead_backwards() {
 #[test]
 fn external_perimeters_are_never_raised() {
     let source = middle_layer(";TYPE:External perimeter\nG1 X10 Y0 E0.5\nG1 X20 Y0 E0.5\n");
-    assert!(!run(&source, &Config::default()).contains("corbel"));
+    let out = run(&source, &Config::default());
+    assert!(!out.contains("raised"), "{out}");
+    assert!(out.contains("G1 X10 Y0 E"), "the wall was moved:\n{out}");
 }
 
 /// The multiplier is a flow for the hidden walls, not compensation owed to
@@ -1677,7 +1703,8 @@ fn the_surfaces_that_show_are_left_as_sliced() {
 /// surplus flow there has nowhere to go but sideways.
 #[test]
 fn the_layer_on_the_bed_is_left_as_sliced() {
-    let mut source = String::from("; layer_height = 0.2\nM83\n");
+    let mut source =
+        String::from("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM83\n");
     for index in 0..5 {
         source.push_str(&layer(0.2 + f64::from(index) * 0.2));
         source.push_str(";TYPE:Perimeter\n");
@@ -1923,7 +1950,9 @@ fn the_width_the_file_states_sets_the_flow() {
 #[test]
 fn an_adaptive_slice_meters_each_layer_at_its_own_flow() {
     let walls = |tag: &str| format!(";TYPE:Perimeter\n{}", wall_of(2, tag, 0.0, 10.0, 1.0));
-    let mut source = String::from("; inner_wall_line_width = 0.45\nM83\n");
+    let mut source = String::from(
+        "; inner_wall_line_width = 0.45\n; filament_max_volumetric_speed = 500\nM83\n",
+    );
     // Heights of 0.1 and 0.3 either side of the reference, laid down as
     // planes so the survey measures them rather than reading a nominal.
     for (index, z) in [0.2, 0.3, 0.4, 0.7, 1.0, 1.1].into_iter().enumerate() {
@@ -2661,7 +2690,8 @@ fn an_open_run_of_visible_wall_is_not_moved() {
 /// than in one bead, and given back in one when the column is capped.
 #[test]
 fn a_column_climbs_to_its_offset_instead_of_jumping() {
-    let mut source = String::from("; layer_height = 0.2\nM83\n");
+    let mut source =
+        String::from("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM83\n");
     for index in 0..5 {
         source.push_str(&layer(0.2 + f64::from(index) * 0.2));
         source.push_str(";TYPE:Perimeter\n");
@@ -2699,7 +2729,8 @@ fn a_column_climbs_to_its_offset_instead_of_jumping() {
 /// layer deep.
 #[test]
 fn the_layer_laid_on_the_bed_is_never_raised() {
-    let mut source = String::from("; layer_height = 0.2\nM83\n");
+    let mut source =
+        String::from("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM83\n");
     for index in 0..4 {
         source.push_str(&layer(0.2 + f64::from(index) * 0.2));
         source.push_str(";TYPE:Perimeter\n");
@@ -2727,7 +2758,8 @@ fn the_layer_laid_on_the_bed_is_never_raised() {
 /// half a layer when the wall ended before it finished climbing.
 #[test]
 fn a_cap_gives_back_only_the_climb_the_column_took() {
-    let mut source = String::from("; layer_height = 0.2\nM83\n");
+    let mut source =
+        String::from("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM83\n");
     for index in 0..3 {
         source.push_str(&layer(0.2 + f64::from(index) * 0.2));
         source.push_str(";TYPE:Perimeter\n");
@@ -2872,6 +2904,263 @@ fn a_slicer_annotation_inside_a_wall_is_replayed_in_place() {
     );
 }
 
+/// One wall's loops the way a slicer that states its speed once emits them:
+/// a travel at the travel rate, a bare `G1 F` naming the print rate, then
+/// beads that name none and inherit it.
+fn wall_printed_at(loops: usize, tag: &str, rate: f64) -> String {
+    let mut text = String::new();
+    for index in 0..loops {
+        let step = 0.45 * (loops - 1 - index) as f64;
+        let (near, far) = (step, 10.0 - step);
+        text.push_str(&format!("G1 X{near:.2} Y{near:.2} F9000\n"));
+        text.push_str(&format!("G1 F{rate}\n"));
+        text.push_str(&format!(
+            "G1 X{far:.2} Y{near:.2} E0.5 ; {tag}{}\n",
+            index + 1
+        ));
+        for (x, y) in [(far, far), (near, far), (near, near)] {
+            text.push_str(&format!("G1 X{x:.2} Y{y:.2} E0.5\n"));
+        }
+    }
+    text
+}
+
+/// The rate each bead in `gcode` is laid at. `F` is modal, so a bead that
+/// states none is laid at whatever the line before it left behind.
+fn bead_feeds(gcode: &str) -> Vec<f64> {
+    let mut feed = 0.0;
+    let mut rates = Vec::new();
+    for text in gcode.lines() {
+        let line = Line::parse(text);
+        if let Some(rate) = line.f {
+            feed = rate;
+        }
+        if line.draws_in_plane() && line.e.is_some_and(|e| e > 0.0) {
+            rates.push(feed);
+        }
+    }
+    rates
+}
+
+/// A height move is written at the Z rate and a retraction at the retraction
+/// rate, and `F` is modal — so every bead behind one that states no rate of
+/// its own is laid at it.
+///
+/// Measured on a stock 1000-wall Bambu plate before this: **39446 mm of bead,
+/// 44% of the whole file, came out at F1800 where the slicer asked for
+/// F11054** — 30 mm/s instead of 184, on the reordered half of the wall only,
+/// which is what made it look random. The bead's own `E`, the filament total
+/// and the range of rates in the file were all untouched, so nothing that
+/// counted or summed could see it.
+#[test]
+fn a_bead_behind_an_inserted_height_or_pull_keeps_the_rate_the_slicer_asked_for() {
+    let source = format!(
+        "; retraction_length = 0.8\n; retraction_minimum_travel = 1\n{}",
+        middle_layer(&format!(
+            ";TYPE:Perimeter\n{}",
+            wall_printed_at(3, "loop", 1200.0)
+        ))
+    );
+    let out = run(&source, &Config::default());
+
+    assert!(
+        out.contains(&format!("{BRICK_STAMP}raised")),
+        "the wall has to be bricked for this to measure anything:\n{out}"
+    );
+    assert_eq!(
+        bead_feeds(&source)
+            .into_iter()
+            .filter(|rate| *rate != 1200.0)
+            .count(),
+        0,
+        "the input lays every bead at F1200:\n{source}"
+    );
+    let strayed: Vec<f64> = bead_feeds(&out)
+        .into_iter()
+        .filter(|rate| *rate > 1200.0 || *rate < 1200.0 / 1.6)
+        .collect();
+    assert!(
+        strayed.is_empty(),
+        "{} of {} beads are laid at {:?}, which is neither F1200 nor F1200 slowed for \
+         the filament a raise adds:\n{out}",
+        strayed.len(),
+        bead_feeds(&out).len(),
+        strayed
+    );
+}
+
+/// A slicer states the rate once for a whole region, and this pass writes
+/// that region's loops in another order — but the rate is restated after the
+/// travel that reaches each loop, so it is pulled in with that loop's lead
+/// and travels with it. Measured across all 25 fixtures: carrying the rate on
+/// the loop as well as on its lead leaves every one of them byte-identical.
+#[test]
+fn a_loop_written_out_of_order_carries_the_rate_its_region_stated() {
+    let mut wall = String::new();
+    for (index, rate) in [1200.0, 2400.0].into_iter().enumerate() {
+        let step = 0.45 * (1 - index) as f64;
+        let (near, far) = (step, 10.0 - step);
+        wall.push_str(&format!("G1 X{near:.2} Y{near:.2} F9000\n"));
+        wall.push_str(&format!("G1 F{rate}\n"));
+        wall.push_str(&format!("G1 X{far:.2} Y{near:.2} E0.5 ; rate{rate:.0}\n"));
+        for (x, y) in [(far, far), (near, far), (near, near)] {
+            wall.push_str(&format!("G1 X{x:.2} Y{y:.2} E0.5\n"));
+        }
+    }
+    let source = middle_layer(&format!(";TYPE:Perimeter\n{wall}"));
+    let out = run(&source, &Config::default());
+
+    // Each loop's own rate, or that rate slowed to give the filament a raise
+    // adds the time it needs — never the other loop's, and never a travel's.
+    let strayed: Vec<f64> = bead_feeds(&out)
+        .into_iter()
+        .filter(|rate| {
+            ![1200.0, 2400.0]
+                .into_iter()
+                .any(|asked| *rate <= asked && *rate >= asked / 1.6)
+        })
+        .collect();
+    assert!(
+        strayed.is_empty(),
+        "beads laid at {strayed:?}, which is neither region's rate:\n{out}"
+    );
+}
+
+/// A slicer slows a bridge or an overhang right down and gives it a fatter
+/// bead, so that one segment already sits at the fastest the file melts while
+/// the wall it belongs to has room to spare. Slowing per LOOP put the bridge's
+/// speed on the whole wall.
+#[test]
+fn only_the_bead_that_goes_over_is_slowed() {
+    // No stated ceiling, so the fastest bead in the file sets it — which is
+    // the bridge. Every other bead of the wall is a third of that.
+    let body = ";TYPE:Perimeter\n\
+         G1 X0.45 Y0.45 F9000\n\
+         G1 F1200\n\
+         G1 X9.55 Y0.45 E1.8 ; bridge\n\
+         G1 X9.55 Y9.55 E0.6 ; wall1\n\
+         G1 X0.45 Y9.55 E0.6 ; wall2\n\
+         G1 X0.45 Y0.45 E0.6 ; wall3\n";
+    let same = untagged(body);
+    let source = format!(
+        "; layer_height = 0.2\nM83\n{}{same}{}{same}{}{same}{}{body}{}{same}",
+        layer(0.2),
+        layer(0.4),
+        layer(0.6),
+        layer(0.8),
+        layer(1.0),
+    );
+    let out = run(&source, &Config::default());
+
+    let mut feed = 0.0;
+    let mut laid: Vec<(String, f64)> = Vec::new();
+    for text in out.lines() {
+        let line = Line::parse(text);
+        if let Some(rate) = line.f {
+            feed = rate;
+        }
+        if let Some(tag) = text.split("; ").nth(1)
+            && line.e.is_some_and(|e| e > 0.0)
+        {
+            laid.push((tag.trim().to_owned(), feed));
+        }
+    }
+    let rate = |want: &str| {
+        laid.iter()
+            .find(|(tag, _)| tag == want)
+            .unwrap_or_else(|| panic!("{want} was not written:\n{out}"))
+            .1
+    };
+    assert!(
+        rate("bridge") < 1200.0,
+        "the bead at the ceiling was not slowed:\n{out}"
+    );
+    for tag in ["wall1", "wall2", "wall3"] {
+        assert_eq!(
+            rate(tag),
+            1200.0,
+            "{tag} was slowed to the bridge's rate:\n{out}"
+        );
+    }
+}
+
+/// A raised loop waits for the end of its layer, and a plate printing two
+/// materials changes tool in the MIDDLE of one — so a loop still waiting is
+/// written after the change and laid in the other filament. Measured on a
+/// user's dual-nozzle plate before this: **41818 mm of bead crossed from one
+/// tool to the other**, which prints in the wrong material.
+#[test]
+fn a_loop_is_never_written_under_another_tool() {
+    let body = format!(
+        "T0\n;TYPE:Perimeter\n{}T1\n;TYPE:Solid infill\nG1 X2 Y2 F9000\nG1 X8 Y8 E1.0\n",
+        wall(2, "loop")
+    );
+    let out = run(&middle_layer(&body), &Config::default());
+
+    let mut tool = 0;
+    let mut strayed = Vec::new();
+    for line in out.lines() {
+        if let Some(slot) = crate::scan::tool_change(line) {
+            tool = slot;
+        }
+        if line.contains("; loop") && tool != 0 {
+            strayed.push(line);
+        }
+    }
+    assert!(
+        strayed.is_empty(),
+        "{} wall beads are laid under T1:\n{out}",
+        strayed.len()
+    );
+}
+
+/// A loop held back to the end of its layer is written inside whatever region
+/// the file had reached by then, under its own `; FEATURE:` — and a marker is
+/// modal, so the region the slicer was in has to be put back or its own beads
+/// are laid as wall.
+///
+/// Measured on a user's dual-nozzle plate at Z 38.5, where a top surface sits
+/// between two wall regions and a prime tower follows: **347 mm of prime tower
+/// came out under `Inner wall`**, printed at the wall's fan, speed and
+/// acceleration.
+#[test]
+fn a_region_the_held_loops_interrupt_is_put_back() {
+    let layers: String = [0.2_f64, 0.4, 0.6, 0.8, 1.0]
+        .into_iter()
+        .enumerate()
+        .map(|(index, z)| {
+            format!(
+                "{}{};TYPE:Solid infill\nG1 X2 Y2 F9000\nG1 X8 Y8 E1.0 ; fill{index}\n\
+                 G1 X8 Y2 E1.0 ; carried{index}\n",
+                layer(z),
+                format_args!(";TYPE:Perimeter\n{}", wall(2, &format!("L{index}loop"))),
+            )
+        })
+        .collect();
+    let out = run(&relative(&layers), &Config::default());
+
+    let mut region = String::new();
+    let mut wrong = Vec::new();
+    for line in out.lines() {
+        if let Some(rest) = line.trim().strip_prefix(";TYPE:") {
+            region = rest.trim().to_owned();
+        }
+        if line.contains("; fill") || line.contains("; carried") {
+            if region != "Solid infill" {
+                wrong.push(format!("{line}  under `{region}`"));
+            }
+        } else if line.contains("loop") && line.contains(" E") && region != "Perimeter" {
+            wrong.push(format!("{line}  under `{region}`"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} beads are laid under someone else's region:\n  {}\n{out}",
+        wrong.len(),
+        wrong.join("\n  ")
+    );
+}
+
 #[test]
 fn absolute_extrusion_stays_continuous() {
     let body = ";TYPE:Perimeter\n\
@@ -2888,7 +3177,8 @@ fn absolute_extrusion_stays_continuous() {
     // One absolute stream climbing by 1 mm a move, over a wall that runs
     // the height of the file so the layer under test is neither where its
     // column starts nor where it ends.
-    let mut source = String::from("; layer_height = 0.2\nM82\n");
+    let mut source =
+        String::from("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM82\n");
     let mut e = 0.0;
     let next = |e: &mut f64| {
         let mut text = body.to_string();
@@ -3102,7 +3392,8 @@ fn a_g92_inside_a_wall_keeps_the_absolute_stream_honest() {
 /// starved and bricks the top of every object but the last.
 #[test]
 fn every_object_gets_its_own_first_and_last_layer() {
-    let mut source = String::from("; layer_height = 0.2\nM83\n");
+    let mut source =
+        String::from("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM83\n");
     for object in 1..=2 {
         for index in 0..4 {
             source.push_str(&layer(0.2 + f64::from(index) * 0.2));

@@ -262,6 +262,7 @@ pub struct Line<'a> {
     pub clockwise: bool,
     e_span: Option<(usize, usize)>,
     z_span: Option<(usize, usize)>,
+    f_span: Option<(usize, usize)>,
     x_span: Option<(usize, usize)>,
     y_span: Option<(usize, usize)>,
     i_span: Option<(usize, usize)>,
@@ -327,6 +328,7 @@ impl<'a> Line<'a> {
             clockwise,
             e_span: None,
             z_span: None,
+            f_span: None,
             x_span: None,
             y_span: None,
             i_span: None,
@@ -394,7 +396,10 @@ impl<'a> Line<'a> {
                     line.z = Some(value);
                     line.z_span = Some((start, at));
                 }
-                b'f' => line.f = Some(value),
+                b'f' => {
+                    line.f = Some(value);
+                    line.f_span = Some((start, at));
+                }
                 b'i' => {
                     line.i = Some(value);
                     line.i_span = Some((start, at));
@@ -585,6 +590,26 @@ impl<'a> Line<'a> {
         e: Option<f64>,
         z: Option<f64>,
     ) -> io::Result<bool> {
+        self.write_moved_at(out, to, centre, e, z, None)
+    }
+
+    /// The same, with the line's feedrate replaced as well.
+    ///
+    /// A bead given more filament than the slicer metered has to be given
+    /// more time with it, or it asks the hot end for melt the file's own
+    /// walls never demanded. The rate goes back into the line the bead is
+    /// written on rather than in front of it: a slicer states one on the bead
+    /// itself wherever the width varies, and a rate written ahead of that is
+    /// overruled by it.
+    pub fn write_moved_at<W: Write>(
+        &self,
+        out: &mut W,
+        to: (f64, f64),
+        centre: Option<(f64, f64)>,
+        e: Option<f64>,
+        z: Option<f64>,
+        f: Option<f64>,
+    ) -> io::Result<bool> {
         if self.x_span.is_none() && self.y_span.is_none() {
             return Ok(false);
         }
@@ -634,6 +659,14 @@ impl<'a> Line<'a> {
             (Some(value), None) => append.push((b'Z', value)),
             (None, _) => {}
         }
+        // Written onto the move itself rather than in front of it: a rate on
+        // a line of its own is a line another pass can reorder away from the
+        // bead it belongs to, and the bead then runs at whatever it finds.
+        match (f, self.f_span) {
+            (Some(value), Some(span)) => edits.push((span, value, 3)),
+            (Some(value), None) => append.push((b'F', value)),
+            (None, _) => {}
+        }
         edits.sort_unstable_by_key(|((start, _), _, _)| *start);
         rewrite(out, self.origin, &edits, &append)?;
         Ok(true)
@@ -643,6 +676,28 @@ impl<'a> Line<'a> {
     /// any comment, is copied byte for byte.
     pub fn write_e<W: Write>(&self, out: &mut W, value: f64) -> io::Result<()> {
         write_e(out, self.origin, self.e_span, value)
+    }
+
+    /// Writes the line with its `E` and `F` words replaced, either of which
+    /// may be left as it was found.
+    pub fn write_e_at<W: Write>(
+        &self,
+        out: &mut W,
+        e: Option<f64>,
+        f: Option<f64>,
+    ) -> io::Result<()> {
+        let mut edits: Vec<((usize, usize), f64, usize)> = Vec::new();
+        let mut append: Vec<(u8, f64)> = Vec::new();
+        if let (Some(span), Some(value)) = (self.e_span, e) {
+            edits.push((span, value, 5));
+        }
+        match (f, self.f_span) {
+            (Some(value), Some(span)) => edits.push((span, value, 3)),
+            (Some(value), None) => append.push((b'F', value)),
+            (None, _) => {}
+        }
+        edits.sort_unstable_by_key(|((start, _), _, _)| *start);
+        rewrite(out, self.origin, &edits, &append)
     }
 
     /// Writes the line with its `Z` word set to `value`, adding one where the
