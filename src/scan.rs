@@ -385,6 +385,24 @@ fn covers_a_raise(feature: Feature) -> bool {
     )
 }
 
+/// True for a region whose beads are metered for a whole layer, and so seal a
+/// wall they are printed over on their own layer.
+///
+/// A top surface or ironing is what closes a section: it is laid over the wall
+/// it meets at the same plane, metered as though the wall were flat, so a wall
+/// left raised under one of them stands half a layer proud of material that
+/// cannot pay it back. The layer above the wall says nothing about it, which
+/// is why the seal is a set of its own rather than part of the coverage test.
+///
+/// Solid infill is deliberately NOT one of them. On its own layer it is as
+/// often the fill inside a wall that carries on — the same wall the layer
+/// above stacks on — as it is the surface that closes one, so treating it as a
+/// seal would cap a column that has not ended. A top surface and ironing are
+/// only ever laid facing the air, so they name the end of a column outright.
+fn seals_a_wall(feature: Feature) -> bool {
+    matches!(feature, Feature::TopSurface | Feature::Ironing)
+}
+
 #[derive(Default)]
 struct Scan {
     layers: usize,
@@ -479,6 +497,15 @@ struct Scan {
     /// layer below, where `here` also says which columns begin on this layer
     /// and so have nothing to climb from.
     covering: Cells,
+    /// Cells the open layer's full-height fill runs through — a top surface,
+    /// ironing. These are metered for a whole layer, so a wall printed under
+    /// one on the same layer is capped rather than left raised under material
+    /// that cannot pay it back; see [`seals_a_wall`].
+    sealed: Cells,
+    /// The same, for the layer below the open layer. A wall printed over a
+    /// surface that closed a section starts its own column instead of
+    /// carrying the capped one on.
+    below_sealed: Cells,
     /// Cells the open layer's support and support-interface beads run through.
     /// A wall raised beside these would stand proud of material that is a
     /// single bead wide and meant to break away, so the rewrite holds it flat
@@ -712,6 +739,8 @@ impl Scan {
             }
         } else if extrudes && covers_a_raise(self.feature) && self.open_layer.is_some() {
             self.covering.draw(from, to, arc);
+        } else if extrudes && seals_a_wall(self.feature) && self.open_layer.is_some() {
+            self.sealed.draw(from, to, arc);
         } else if extrudes && self.supporting && self.open_layer.is_some() {
             self.supported.draw(from, to, arc);
         }
@@ -837,13 +866,17 @@ impl Scan {
     /// buffers, it meters against what the layer below actually left standing
     /// there, so a raise printed over by one of those regions is already
     /// accounted for and does not have to be given back — see
-    /// [`covers_a_raise`].
+    /// [`covers_a_raise`]. The mirror of that is [`seals_a_wall`]: a wall the
+    /// layer below left under its own full-height fill was sealed by it, so it
+    /// is capped here whether or not a wall stands over it, and a wall over
+    /// that fill starts its own column rather than carrying the capped one on.
     fn close_footprint(&mut self) {
         let Some(index) = self.open_layer else {
             return;
         };
         self.here.settle();
         self.covering.settle();
+        self.sealed.settle();
         // A move no printer makes leaves cells undrawn, and an answer read off
         // an incomplete set is not a cautious answer but a wrong one. Both
         // fall back to the conservative reading: nothing is known to stand on
@@ -858,13 +891,29 @@ impl Scan {
         // by nothing and raised into a tree tip.
         let unread = self.here.refused()
             + self.covering.refused()
+            + self.sealed.refused()
             + self.below.refused()
+            + self.below_sealed.refused()
             + self.supported.refused()
             > 0;
+        // The cells of the layer below that a column may climb from: its
+        // walls, less the ones its own full-height fill sealed. The seal is
+        // grown by a bead width, for the same reason support is: the fill's
+        // nozzle reaches half a bead past its path, so a wall whose centreline
+        // sits within a bead of it is covered by it rather than standing under
+        // an open column.
+        let seal = self.below_sealed.dilated(2);
+        let supporting = self.below.without(&seal);
         if let Some(below) = self.below_layer {
             let left = match unread {
                 true => self.below.clone(),
-                false => self.below.without(&self.here).without(&self.covering),
+                false => {
+                    let sealed = self.below.without(&supporting);
+                    self.below
+                        .without(&self.here)
+                        .without(&self.covering)
+                        .union(&sealed)
+                }
             };
             self.record(below, left);
         }
@@ -873,7 +922,7 @@ impl Scan {
         // on. At the first layer `below` is empty, so all of it starts here.
         let fresh = match unread {
             true => self.here.clone(),
-            false => self.here.without(&self.below),
+            false => self.here.without(&supporting),
         };
         if unread {
             self.warn_about_the_trace();
@@ -887,8 +936,10 @@ impl Scan {
         // Swapped rather than handed over, so the buffer the layer below used
         // is the one this layer fills.
         std::mem::swap(&mut self.below, &mut self.here);
+        std::mem::swap(&mut self.below_sealed, &mut self.sealed);
         self.here.clear();
         self.covering.clear();
+        self.sealed.clear();
         self.below_layer = Some(index);
     }
 
@@ -941,6 +992,8 @@ impl Scan {
         self.here.clear();
         self.below.clear();
         self.covering.clear();
+        self.sealed.clear();
+        self.below_sealed.clear();
         self.uncovered.clear();
         self.unsupported.clear();
         self.layer_heights.clear();

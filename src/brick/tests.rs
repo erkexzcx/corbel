@@ -76,6 +76,26 @@ fn wall_of(loops: usize, tag: &str, origin: f64, size: f64, flow: f64) -> String
     text
 }
 
+/// A solid fill of a `size` square, as parallel extrusions a third of a
+/// millimetre apart, inset from the wall around it by `inset`. The fill
+/// covers the whole interior of a wall drawn around the square, leaving the
+/// wall's own cells to be reached by the survey's seal dilation rather than
+/// by the fill itself.
+fn filled(size: f64, inset: f64) -> String {
+    let mut text = String::new();
+    for row in 0..=33 {
+        let y = size * row as f64 / 33.0;
+        text.push_str(&format!("G1 X{:.2} Y{y:.2} E0.5\n", size - inset));
+        if row < 33 {
+            text.push_str(&format!(
+                "G1 X{inset:.2} Y{:.2} F9000\n",
+                size * (row + 1) as f64 / 33.0
+            ));
+        }
+    }
+    text
+}
+
 fn run(source: &str, config: &Config) -> String {
     apply(source, config).gcode
 }
@@ -1111,6 +1131,42 @@ fn a_wall_that_ends_partway_up_is_capped_though_the_file_states_no_layers() {
             .filter(|line| line.contains("; on") || line.contains("; end"))
             .collect::<Vec<_>>(),
         "the markers changed what a bead was metered for:\n{out}"
+    );
+}
+
+/// A wall under ironing on its own layer is sealed by it, so it is capped
+/// even though the layer above carries the same wall on — and the wall above
+/// then starts a fresh column, climbing from the plane rather than carrying
+/// the capped one over. Measured on a user's plate, where a wall closed by
+/// ironing at one layer kept being raised through it.
+#[test]
+fn a_wall_under_ironing_on_its_own_layer_is_capped_and_the_wall_above_starts_again() {
+    let body = format!(";TYPE:Perimeter\n{}", wall(2, "loop"));
+    // The ironing is printed over the wall on the same layer, as a fill that
+    // covers the whole interior the wall runs around. It is inset from the
+    // wall, so the wall's own cells are sealed only through the survey's
+    // bead-wide dilation — as they are on a real plate, where the ironing
+    // raster sits between the walls rather than on them.
+    let ironed = format!("{body};TYPE:Ironing\nG1 X0 Y0 F9000\n{}", filled(10.0, 0.3));
+    let mut source = String::new();
+    // The column runs up from the bed, so the layer under test is the steady
+    // state rather than a climb.
+    for z in [0.2, 0.4, 0.6] {
+        source.push_str(&layer(z));
+        source.push_str(&untagged(&body));
+    }
+    source.push_str(&layer(0.8));
+    source.push_str(&ironed);
+    // Above the ironed surface the wall is a fresh column.
+    for z in [1.0, 1.2, 1.4, 1.6] {
+        source.push_str(&layer(z));
+        source.push_str(&untagged(&body));
+    }
+    let out = run(&relative(&source), &plain());
+    assert_eq!(
+        raised_to(&out),
+        ["0.450", "0.700", "1.250", "1.500"],
+        "the ironed layer and the one above it stay on the plane: {out}"
     );
 }
 

@@ -626,6 +626,55 @@ impl Cells {
         }
     }
 
+    /// The cells this set and `other` both hold. Both must be settled.
+    pub fn intersection(&self, other: &Cells) -> Cells {
+        let mut keys = Vec::new();
+        let mut at = 0;
+        for &cell in &self.keys {
+            while at < other.keys.len() && other.keys[at] < cell {
+                at += 1;
+            }
+            if other.keys.get(at) == Some(&cell) {
+                keys.push(cell);
+            }
+        }
+        keys.shrink_to_fit();
+        Cells {
+            grid: self.grid,
+            keys,
+            refused: self.refused.max(other.refused),
+        }
+    }
+
+    /// The cells this set and `other` hold between them, each once. Both must
+    /// be settled.
+    pub fn union(&self, other: &Cells) -> Cells {
+        let mut keys = Vec::with_capacity(self.keys.len() + other.keys.len());
+        let (mut left, mut right) = (0, 0);
+        while left < self.keys.len() && right < other.keys.len() {
+            let a = self.keys[left];
+            let b = other.keys[right];
+            if a < b {
+                keys.push(a);
+                left += 1;
+            } else if b < a {
+                keys.push(b);
+                right += 1;
+            } else {
+                keys.push(a);
+                left += 1;
+                right += 1;
+            }
+        }
+        keys.extend_from_slice(&self.keys[left..]);
+        keys.extend_from_slice(&other.keys[right..]);
+        Cells {
+            grid: self.grid,
+            keys,
+            refused: self.refused.max(other.refused),
+        }
+    }
+
     /// Hands the cells over and leaves this set empty, so a layer's footprint
     /// can become the layer below's without copying it.
     pub fn take(&mut self) -> Cells {
@@ -769,6 +818,32 @@ mod tests {
         let left = mine.without(&theirs);
         assert!(!left.holds(0.5, 0.0));
         assert!(left.holds(2.5, 0.0));
+    }
+
+    #[test]
+    fn an_intersection_keeps_only_what_both_sets_hold() {
+        let mine = cells_of((0.0, 0.0), (3.0, 0.0), None);
+        let theirs = cells_of((1.0, 0.0), (4.0, 0.0), None);
+        let both = mine.intersection(&theirs);
+        assert!(!both.holds(0.5, 0.0));
+        assert!(both.holds(2.0, 0.0));
+        assert!(!both.holds(3.5, 0.0));
+    }
+
+    #[test]
+    fn a_union_holds_each_cell_once() {
+        let mine = cells_of((0.0, 0.0), (2.0, 0.0), None);
+        let theirs = cells_of((1.0, 0.0), (3.0, 0.0), None);
+        let together = mine.union(&theirs);
+        for step in 0..30 {
+            let x = step as f64 / 10.0;
+            assert!(together.holds(x, 0.0), "gap at {x}");
+        }
+        assert!(!together.holds(1.5, 1.0));
+        assert_eq!(
+            together.len(),
+            mine.len() + theirs.len() - mine.intersection(&theirs).len()
+        );
     }
 
     #[test]
