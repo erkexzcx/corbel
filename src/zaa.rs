@@ -386,7 +386,7 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             .wall_width
             .or(survey.skin_width)
             .or(survey.wall_width)
-            .filter(|width| width.is_finite() && *width > 0.0)
+            .filter(is_a_height)
             .unwrap_or(FALLBACK_WIDTH);
         Self {
             out,
@@ -504,6 +504,12 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         let line = Line::parse_bytes(raw, bytes);
 
         if let Some(tool) = crate::scan::tool_change(raw) {
+            // The bead still held back was read under the tool that is
+            // leaving, and is metered when it is written — which is after this
+            // `T` in the input, but it is laid by the previous tool. Release
+            // it now, before the ceiling changes, or its one and only throttle
+            // reads the arriving tool's figure.
+            self.release()?;
             self.melt_rate = self
                 .melt_rates
                 .get(tool)
@@ -1280,7 +1286,11 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         if run < MELT_GAUGE || e <= 0.0 {
             return None;
         }
-        let rate = e / run * asked / 60.0;
+        // The filament that reaches the nozzle is the value as WRITTEN, five
+        // decimals, not the unrounded stock it was derived from — the same
+        // rounding the brick side meters for.
+        let flow = (e * 100_000.0).round() / 100_000.0;
+        let rate = flow / run * asked / 60.0;
         (rate > ceiling).then(|| asked * ceiling / rate)
     }
 

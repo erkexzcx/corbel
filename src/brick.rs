@@ -539,6 +539,17 @@ struct Held {
     /// The plane they belong to, since they are written after the regions that
     /// followed them and a plane is read off the layer rather than the stream.
     plane: f64,
+    /// The modal feedrate their leads were read under.
+    ///
+    /// A held lead opens with a travel that names no `F` of its own: it runs
+    /// at whatever the hop in front of it set, which for a Bambu slice is the
+    /// travel rate, an order of magnitude above the bead rate the region
+    /// prints at. The hop is hoisted into the region head and replayed at
+    /// flush time, so by the time the held loop is written every rate it
+    /// could be inherited from has been overwritten — measured on a user's
+    /// tree-support slice, travels of 121.7 mm came out at F14301 against the
+    /// F60000 the slicer planned them at.
+    rate: Option<f64>,
 }
 
 /// Samples one arc may be cut into. A corrupt `I`/`J` can name a radius no
@@ -723,6 +734,10 @@ struct Pass<'a, W: Write> {
     /// Where each layer's walls have nothing above them, from the survey.
     uncovered: &'a [Cells],
     unsupported: &'a [Cells],
+    /// Where each layer's support and support-interface beads run, from the
+    /// survey. A wall raised beside support stands proud of material a single
+    /// bead wide that is printed to be broken off, so it is held flat instead.
+    support: &'a [Cells],
     /// Cells the layer below was left standing proud in, so a bead can be
     /// metered for the gap it really crosses rather than for the one its own
     /// parity implies.
@@ -923,6 +938,7 @@ impl<'a, W: Write> Pass<'a, W> {
             object_tops: survey.object_tops.clone(),
             uncovered: &survey.uncovered,
             unsupported: &survey.unsupported,
+            support: &survey.support,
             standing: Cells::on(footprint::Grid::default()),
             climbed: Cells::on(footprint::Grid::default()),
             rising: Cells::on(footprint::Grid::default()),
@@ -1021,7 +1037,11 @@ impl<'a, W: Write> Pass<'a, W> {
             // `T` between a layer's `G1 Z` and its wall, and that one is part
             // of the tail `keep` holds so the first loop has a move to ride —
             // flushing there costs every raise its carrier.
-            if !self.loops.is_empty() || !self.held.is_empty() {
+            //
+            // A `T` inside a `G91`/`G20` section is the same as any other line
+            // there: nothing this pass writes says what it means in that mode,
+            // so held loops and the buffer stay put for the next plain boundary.
+            if self.modal.is_plain() && (!self.loops.is_empty() || !self.held.is_empty()) {
                 self.flush()?;
                 self.write_held()?;
             }
@@ -1133,15 +1153,17 @@ impl<'a, W: Write> Pass<'a, W> {
                 // so the next move starts from where the reset says it stands.
                 let (x, y, _) = self.modal.position();
                 self.was_at = self.at;
-                self.was_at = self.at;
                 self.at = (x, y);
             }
             _ => {}
         }
 
         // Klipper and Orca without a Z-hop put a layer's Z on the travel that
-        // reaches the first loop, which lands inside the buffered region.
-        if line.z.is_some() && (line.is_move() || line.code == Code::SetPosition) {
+        // reaches the first loop, which lands inside the buffered region. An
+        // arc that commands Z is the same thing read through a spiral hop, and
+        // the survey's markerless layout reads the plane off the bead itself —
+        // arcs included — so a layer reached by one has to open here too.
+        if line.z.is_some() && (line.draws() || line.code == Code::SetPosition) {
             // Where the move ends, not the number it names: under `G91` a
             // `G1 Z0.6` is a lift and under `G20` it is 15.24 mm.
             let z = self.modal.position().2;
@@ -1154,7 +1176,11 @@ impl<'a, W: Write> Pass<'a, W> {
             // A file with no marker to close a layer on has no run of moves to
             // take the lowest of: its plane comes from the bead that opened
             // the layer.
-            if self.layer_markers {
+            //
+            // The floor is what a marked layer is measured from, and the survey
+            // skips arcs for it exactly as it skips them as heights — a spiral
+            // hop lifts and comes back, so it never sets the plane.
+            if self.layer_markers && (line.is_move() || line.code == Code::SetPosition) {
                 self.floor = Some(self.floor.map_or(z, |floor: f64| floor.min(z)));
             }
         }
@@ -1169,7 +1195,6 @@ impl<'a, W: Write> Pass<'a, W> {
         if !self.modal.is_plain() {
             self.flush()?;
             if let Some((x, y, _)) = moved {
-                self.was_at = self.at;
                 self.was_at = self.at;
                 self.at = (x, y);
             }
@@ -1450,7 +1475,12 @@ impl<'a, W: Write> Pass<'a, W> {
             self.feedrate = Some(rate);
             self.wanted_feed = Some(rate);
         }
-        self.emit(line, 1.0)
+        // A filler that is not buffered with a wall — the whole of its layer
+        // is a thin wall or a gap fill — still crosses whatever the layer
+        // below left standing under it, and is metered for that gap here as a
+        // buffered filler is in [`extrusion_factor`](Self::extrusion_factor).
+        let factor = self.filler_factor(from, self.at, line.arc_between(from, self.at));
+        self.emit(line, factor)
     }
 
     fn buffer(&mut self, line: Line<'_>, from: (f64, f64)) {
@@ -1669,6 +1699,12 @@ impl<'a, W: Write> Pass<'a, W> {
         if head > 0 {
             self.at_now = self.buffer[head - 1].at;
         }
+        // The held loops' leads open with a travel that names no rate of its
+        // own: the rate it was read under is whatever the head just left in
+        // force, and everything written between here and the end of the layer
+        // overwrites it. Captured now, it is the one thing the write has to
+        // restore for those travels to run as the slicer metered them.
+        let head_rate = self.wanted_feed;
         let plane = self.plane();
 
         // Any loop held back to the end of the layer takes its own lead with
@@ -1692,14 +1728,11 @@ impl<'a, W: Write> Pass<'a, W> {
         // carry it.
         let holds = (0..self.loops.len()).any(|at| self.rise_of(self.loops[at]) > 0.0);
         if holds && self.nozzle_z.is_some_and(|at| at > plane) {
-            // Same dead stop as in `write_loop`, one step earlier: the descent
-            // a deferred region left behind has no move of the slicer's own to
-            // ride, so it goes out alone. Borrow the pull and give it straight
-            // back, and the toolhead stops with an empty nozzle instead.
-            let borrowed = (self.withdrawn <= 0.0)
-                .then_some(self.retract_charge)
-                .flatten();
-            let _ = borrowed;
+            // The descent a deferred region left behind has no move of the
+            // slicer's own to ride, so it is owed rather than written here —
+            // writing it would put it in front of the travel the slicer
+            // hopped for. `settle_plane` pays it, dead stop and all, at the
+            // first thing drawn.
             self.owed_plane = Some(plane);
         }
 
@@ -1734,7 +1767,8 @@ impl<'a, W: Write> Pass<'a, W> {
         self.loops.clear();
         self.travelled = false;
         if !waiting.is_empty() {
-            let held = self.hold(&waiting, plane);
+            let mut held = self.hold(&waiting, plane);
+            held.rate = head_rate;
             self.held.push(held);
         }
         self.arena.clear();
@@ -1794,6 +1828,7 @@ impl<'a, W: Write> Pass<'a, W> {
             cells: Vec::new(),
             loops: Vec::with_capacity(waiting.len()),
             plane,
+            rate: None,
         };
         for current in waiting {
             let mut copy = *current;
@@ -1853,12 +1888,28 @@ impl<'a, W: Write> Pass<'a, W> {
             std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
             std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
             let moved = vec![None; self.buffer.len()];
+            // A held lead opens with a travel that names no rate of its own,
+            // and the rate it was read under left the stream the moment the
+            // region was flushed. Put it back, and the travel settles to it
+            // lazily exactly as any other replayed move would.
+            if let Some(rate) = regions[at].rate {
+                self.wanted_feed = Some(rate);
+            }
             // Reached by a travel the slicer never planned. The hop it did
             // plan was a few millimetres of the same wall, so it left the
             // nozzle full; across the plate that same nozzle strings the whole
             // way. `replay` gives the pull back the moment the travel ends.
+            // Gated on the file's own minimum travel, like every other pull:
+            // a held loop written beside a region that happens to end within
+            // a millimetre of it is no journey, and a retraction is not free
+            // — it costs a stop, a gap where the bead restarts and a bite out
+            // of the filament. Measured on a user's tree-support slice, 252
+            // of 422 held writes travelled under 1 mm and pulled for it.
             if self.withdrawn <= 0.0
                 && self.owing.is_none()
+                && self
+                    .hop_travel
+                    .is_some_and(|far| self.hop(current.lead, self.wrote_at) > far)
                 && let Some(charge) = self.retract_charge
             {
                 wrote = self.unprime(-charge);
@@ -1917,9 +1968,16 @@ impl<'a, W: Write> Pass<'a, W> {
         let buffered = self.buffer[index];
         let delta = buffered.delta.filter(|delta| *delta > 0.0)?;
         let asked = buffered.f.or(self.wanted_feed)?;
-        let previous = index.checked_sub(1)?;
         let to = written(moved[index].map_or(buffered.at, |moved| moved.to));
-        let from = written(moved[previous].map_or(self.buffer[previous].at, |moved| moved.to));
+        let from = written(match index.checked_sub(1) {
+            Some(previous) => moved[previous].map_or(self.buffer[previous].at, |moved| moved.to),
+            // The first line of a region starts where the nozzle stood when
+            // the region opened — the same place `trace` starts it. A region
+            // that opens directly on a bead has that bead at index zero, and
+            // metering it against nothing skipped the throttle on a climb's
+            // very first bead.
+            None => self.entry,
+        });
         let arc = buffered
             .arc
             .map(|arc| match moved[index].and_then(|to| to.centre) {
@@ -1934,7 +1992,14 @@ impl<'a, W: Write> Pass<'a, W> {
         if along < MELT_GAUGE {
             return None;
         }
-        let rate = delta * factor / along * asked / 60.0;
+        // The filament that actually reaches the nozzle is the value as
+        // WRITTEN, five decimals, not the unrounded product it was derived
+        // from. Metering the unrounded product under-throttles a bead whose
+        // written `E` rounds up: measured on the cone plate, a bead metered
+        // at 0.0027551 mm came out as E0.00276 and melted 0.18% over the
+        // file's own ceiling.
+        let flow = (delta * factor * 100_000.0).round() / 100_000.0;
+        let rate = flow / along * asked / 60.0;
         (rate > ceiling).then(|| asked * ceiling / rate)
     }
 
@@ -1954,11 +2019,18 @@ impl<'a, W: Write> Pass<'a, W> {
         // its length. Where both ends of the ride are already above whatever
         // the travel crosses there is nothing to do; otherwise the nozzle goes
         // up first and only comes down once the travel is over.
-        let clear = self
-            .clearance(current.lead, current.body, self.at_now)
-            .unwrap_or(f64::NEG_INFINITY);
+        let (laid, over_support) = self.clearance(current.lead, current.body, self.at_now);
         let standing = self.nozzle_z.unwrap_or(target);
-        let rides = target >= clear && standing >= clear;
+        // The ride carries the descent on the travel, so both ends of it have
+        // to clear a raised bead — and the loop's own height has to clear
+        // support, since the travel runs at that height the whole way and a
+        // descent below the support would clip it. A nozzle left below a
+        // raised bead is this pass's own doing, so it is lifted for the
+        // travel; a nozzle left below support is the slicer's plan and is
+        // left alone.
+        let rides = target >= laid.unwrap_or(f64::NEG_INFINITY)
+            && standing >= laid.unwrap_or(f64::NEG_INFINITY)
+            && over_support.is_none_or(|clear| target >= clear);
         let carrier = rides
             .then(|| self.carrier(current.lead, current.body, target))
             .flatten();
@@ -1975,13 +2047,55 @@ impl<'a, W: Write> Pass<'a, W> {
             self.unprime(-charge)?;
             self.stopped = Some(charge);
         }
-        if !rides && standing < clear {
+        if let Some(clear) = laid.filter(|clear| standing < *clear) {
             self.move_z(clear, true)?;
         }
+        // A loop written somewhere the slicer did not plan has a travel that
+        // is a whole journey where the slicer wrote a short hop. The
+        // acceleration the slicer put in front of that hop — Bambu's
+        // `M204 S250`, a tenth of the travel acceleration — was metered for a
+        // fraction of a millimetre, and the journey now inherits it and
+        // crawls. Measured on a user's tree-support slice, the outer wall
+        // written first ran 37 to 80 mm at that crawl rate against the
+        // F60000 the slicer metered it at. The approach acceleration is held
+        // back and put out again after the travel, so the journey runs at
+        // whatever the file already had in force and the bead still gets the
+        // approach the slicer wrote for it.
+        let journey = self.displaced(current.lead) > 0.0;
+        let mut seen_steers = false;
+        let mut held_accel: Vec<usize> = Vec::new();
         for at in current.lead..current.body {
+            // A slicer's spiral Z-hop goes nowhere: it names no `X` or `Y`,
+            // so it starts and ends on the same spot, and its only effect is
+            // the lift. A nozzle that already stands at its height has
+            // nothing to gain from it — and reordering loops replays two of
+            // them back to back, both over the support tree the nozzle was
+            // just printing, because the second loop is written first and its
+            // hop runs where the first loop's already has. Measured on a
+            // user's tree-support slice: two full revolutions over the tree
+            // tops every layer, at 0.4 mm of clearance, where the input held
+            // one. Its `F` is kept: the travel behind it names none, and that
+            // rate is what the file had it running at.
+            if self.redundant_hop(at) {
+                if let Some(rate) = self.buffer[at].f {
+                    self.wanted_feed = Some(rate);
+                }
+                continue;
+            }
+            if journey && !seen_steers && self.is_accel(at) {
+                held_accel.push(at);
+                continue;
+            }
+            let steers = self.buffer[at].steers;
             match carrier {
                 Some(at_) if at_ == at => self.ride(at, target, raise, moved)?,
                 _ => self.replay(at, 1.0, moved)?,
+            }
+            seen_steers |= steers;
+            if steers && !held_accel.is_empty() {
+                for held in held_accel.drain(..) {
+                    self.replay(held, 1.0, moved)?;
+                }
             }
         }
         // A slicer states the width once for a whole region and this pass
@@ -2103,34 +2217,56 @@ impl<'a, W: Write> Pass<'a, W> {
         order
     }
 
-    /// The height the moves in `from..to` have to be clear of, or `None`
-    /// where they cross nothing this layer has left standing proud.
+    /// The height the moves in `from..to` have to be clear of, split by what
+    /// they cross: `(laid, support)`.
     ///
-    /// The slicer had no reason to lift over those beads: when it wrote the
-    /// travel they topped out at the plane the travel runs along, and raising
-    /// them afterwards is what put material in the way. So clearing them is
-    /// this pass's debt rather than the slicer's.
+    /// The first is the debt this pass owes itself: it raised beads the
+    /// slicer metered the travel over, so the travel now runs through them.
+    /// The second is support, which this pass never raised — the slicer
+    /// planned the travel over it and chose its own height.
     ///
-    /// It is the height actually laid, not the offset a full raise would take:
-    /// a column part way up the ramp stands lower, and a nozzle already at the
-    /// height of what it crosses is where it is on every ordinary travel a
-    /// slicer writes over its own layer.
-    fn clearance(&self, from: usize, to: usize, mut at: (f64, f64)) -> Option<f64> {
-        if self.laid.is_empty() {
-            return None;
+    /// The two are answered apart because they call for different action. A
+    /// travel over a raised bead has to be lifted where the nozzle starts
+    /// below the bead, and its descent may ride only where the loop's own
+    /// height clears the bead. A travel over support must only never be
+    /// *ridden down onto it*: the ride carries the descent on the travel, and
+    /// where the loop's height is below the support that descent clips it.
+    /// The slicer already travelled over the support at a height it chose, so
+    /// nothing here lifts for it — only the ride is refused and the descent
+    /// goes out as a move of its own at the destination. Measured on a user's
+    /// tree-support slice, the outer wall written first crossed a tree tip
+    /// 0.5 mm from its edge at plane height — slowly, under the slicer's own
+    /// `M204 S250` — and knocked a double tree off the plate at layer 248.
+    ///
+    /// The laid height is the height actually laid, not the offset a full
+    /// raise would take: a column part way up the ramp stands lower.
+    fn clearance(&self, from: usize, to: usize, mut at: (f64, f64)) -> (Option<f64>, Option<f64>) {
+        let support = self
+            .support
+            .get(self.layer)
+            .filter(|cells| !cells.is_empty())
+            .map(|cells| cells.dilated(2));
+        if self.laid.is_empty() && support.is_none() {
+            return (None, None);
         }
         let grid = self.laid.grid();
         let mut crosses = false;
+        let mut over_support = false;
         for index in from..to {
             let buffered = self.buffer[index];
-            if buffered.steers && !crosses {
+            if buffered.steers {
                 footprint::cells(grid, at, buffered.at, buffered.arc, |cell| {
                     crosses |= self.laid.has(cell);
+                    over_support |= support.as_ref().is_some_and(|cells| cells.has(cell));
                 });
+                at = buffered.at;
             }
-            at = buffered.at;
         }
-        crosses.then_some(self.laid_top)
+        let above_support = self.plane() + self.height();
+        (
+            crosses.then_some(self.laid_top),
+            over_support.then_some(above_support),
+        )
     }
 
     /// Groups the region's loops into contours and numbers them.
@@ -2446,6 +2582,41 @@ impl<'a, W: Write> Pass<'a, W> {
             points += 1;
         }
         (outline, points)
+    }
+
+    /// True where the buffered move is a spiral Z-hop the nozzle already has
+    /// the height of: an arc that names `Z` and no `X` or `Y`, so it starts
+    /// and ends on one spot, with nothing extruded along it.
+    ///
+    /// A hop that LIFTS is never redundant — the nozzle is below it by
+    /// definition, and flattening or skipping it would drag it through what
+    /// the slicer lifted it to clear. A hop that DESCENDS is a descent, and
+    /// skipping it strands the nozzle above the plane the beads are metered
+    /// for. Only a hop that ends exactly where the nozzle already stands is
+    /// pure ceremony, and that is the one reordering runs twice over the
+    /// support tree the slicer lifted off of once.
+    fn redundant_hop(&self, at: usize) -> bool {
+        let buffered = self.buffer[at];
+        buffered.curved
+            && !buffered.places
+            && buffered.delta.is_none()
+            && buffered
+                .z
+                .is_some_and(|z| self.nozzle_z.is_some_and(|now| now == z))
+    }
+
+    /// True where the buffered line sets the acceleration — a `M204 S` of a
+    /// slicer's own.
+    ///
+    /// Read off the bytes rather than the parser, which folds every `M204`
+    /// into [`Code::Other`]. The lead is at most [`TAIL`] lines, so the scan
+    /// is cheap.
+    fn is_accel(&self, at: usize) -> bool {
+        let buffered = self.buffer[at];
+        let text = &self.arena[buffered.start..buffered.end];
+        text.iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|at| text[at..].starts_with(b"M204"))
     }
 
     /// The buffered move in `from..to` that can take the nozzle to `z` on its
@@ -2902,6 +3073,49 @@ impl<'a, W: Write> Pass<'a, W> {
         self.geometry(current) * self.multiplier()
     }
 
+    /// The flow a filler bead takes where it is not buffered with a wall.
+    ///
+    /// A filler is normally buffered with the wall it belongs to and metered
+    /// through [`extrusion_factor`](Self::extrusion_factor) with the loops
+    /// around it. Where its layer is a filler alone — a feature that narrowed
+    /// past two loops, so the whole layer is one thin wall — there is no wall
+    /// to buffer it with and the bead goes straight out. It still crosses the
+    /// same half gap a buffered filler does: the survey counts a filler as
+    /// covering, so the column it stands on was not capped, and the bead has
+    /// to be metered for what that column left standing or it is fed a whole
+    /// layer over half a gap.
+    fn filler_factor(&self, from: (f64, f64), to: (f64, f64), arc: Option<Arc>) -> f64 {
+        if !is_filler(self.feature) {
+            return 1.0;
+        }
+        let Some(below) = self.layer.checked_sub(1) else {
+            return 1.0;
+        };
+        if self.standing.is_empty() && self.climbed.is_empty() {
+            return 1.0;
+        }
+        let standing = &self.standing;
+        let climbing = &self.climbed;
+        let mut points = 0usize;
+        let mut on = 0usize;
+        let mut part = 0usize;
+        let walked = footprint::cells(footprint::Grid::default(), from, to, arc, |cell| {
+            points += 1;
+            on += usize::from(standing.has(cell));
+            part += usize::from(climbing.has(cell));
+        });
+        if walked == Trace::Refused || points == 0 || on == 0 {
+            return 1.0;
+        }
+        // The same share and the same taller-of-the-two rule the loops use in
+        // [`mark_columns`](Self::mark_columns): a bead over a mix of settled
+        // and climbing ground is metered against the settled height.
+        let share = on as f64 / points as f64;
+        let steps = if part * 2 > on { 1 } else { RAMP };
+        let height = self.height();
+        ((height - share * self.rise_at(steps, below)) / height).max(0.0)
+    }
+
     /// How far the bead reaches, as a multiple of its own layer's height,
     /// before the multiplier.
     ///
@@ -3082,6 +3296,18 @@ impl<'a, W: Write> Pass<'a, W> {
             .layer
             .checked_sub(1)
             .and_then(|layer| cells(self.unsupported, layer));
+        // Grown by a bead width: two centrelines a bead apart clip each other,
+        // the nozzle's underside reaching half a bead beyond the wall it lays
+        // and the support bead reaching half a bead back. Support is one bead
+        // wide and printed to be broken off, so a wall touching it is held flat
+        // rather than raised into it — measured on a user's tree-support slice,
+        // a raised wall scraped a tree tip every layer until it knocked it off
+        // the plate at layer 248.
+        let beside = self
+            .support
+            .get(self.layer)
+            .filter(|cells| !cells.is_empty())
+            .map(|cells| cells.dilated(2));
         // Both are held by this pass rather than the survey, so they are taken
         // out for the walk and handed straight back.
         let standing = self.standing.take();
@@ -3094,7 +3320,7 @@ impl<'a, W: Write> Pass<'a, W> {
 
         for index in 0..self.loops.len() {
             let (share, points, traced) = self.shares(
-                [above, here, below, proud, part_way],
+                [above, here, below, proud, part_way, beside.as_ref()],
                 self.loops[index],
                 &mut path,
             );
@@ -3117,7 +3343,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 continue;
             }
             let over = |set: usize| points > 0 && share[set] as f64 > points as f64 * CAP_SHARE;
-            self.loops[index].capped = tops || over(0);
+            self.loops[index].capped = tops || over(0) || share[5] > 0;
             self.loops[index].steps = match (over(1), over(2)) {
                 (true, _) => 0,
                 (_, true) => 1,
@@ -3193,11 +3419,11 @@ impl<'a, W: Write> Pass<'a, W> {
     /// back with it describe part of the loop and are not a share of it.
     fn shares(
         &self,
-        sets: [Option<&Cells>; 5],
+        sets: [Option<&Cells>; 6],
         current: Loop,
         path: &mut Vec<u32>,
-    ) -> ([usize; 5], usize, Trace) {
-        let mut found = [0usize; 5];
+    ) -> ([usize; 6], usize, Trace) {
+        let mut found = [0usize; 6];
         let mut traced = Trace::Whole;
         path.clear();
         self.trace(current, |from, to, arc| {
@@ -3313,6 +3539,12 @@ impl<'a, W: Write> Pass<'a, W> {
             self.owed_plane = None;
             return Ok(());
         };
+        // Never inside a `G20`/`G91` section: a `G1 Z` written there names a
+        // relative displacement or inches, not the plane it means. The debt
+        // survives the section and is paid at the first plain bead after it.
+        if !self.modal.is_plain() {
+            return Ok(());
+        }
         // The same dead stop as anywhere else: this height has no move of the
         // slicer's own to ride, so empty the nozzle for it and fill it again.
         let borrowed = (self.withdrawn <= 0.0)

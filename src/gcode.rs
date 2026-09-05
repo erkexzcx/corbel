@@ -778,6 +778,10 @@ fn rewrite<W: Write>(
             checked.write_all(&[b' ', letter])?;
             write_fixed(&mut checked, value, 3)?;
         }
+        // The body's trailing space was trimmed to make room for the words:
+        // put it back, or the last word lands on the `;` or `*` with no
+        // separator at all.
+        checked.write_all(&head[kept..])?;
     }
 
     let sum = checked.sum;
@@ -1755,6 +1759,16 @@ mod tests {
         assert!(in_place.starts_with("N7 G1 X1 Z0.850*"), "{in_place}");
         assert!(in_place.ends_with(" ; wall"), "{in_place}");
         assert!(verified(&in_place), "{in_place}");
+    }
+
+    /// A word appended to a line with a trailing comment is written in front
+    /// of the comment, and the space that separated them is kept — a line
+    /// whose comment started on the word would be half comment to Marlin.
+    #[test]
+    fn an_appended_word_keeps_the_space_before_its_comment() {
+        let line = Line::parse("G1 X1 Y1 F9000 ; travel");
+        let out = written(|out| line.write_z(out, 0.85));
+        assert_eq!(out, "G1 X1 Y1 F9000 Z0.850 ; travel");
     }
 
     /// `strtof` takes the exponent, so the firmware reads one number where the

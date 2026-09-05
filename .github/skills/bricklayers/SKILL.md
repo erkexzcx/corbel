@@ -280,13 +280,21 @@ Four consequences that are easy to get backwards:
    flares hardest; 2575 mm on the 1000-wall version. So `Pass.rising` collects
    the cells each layer leaves standing proud, `Pass.standing` is the layer
    below's, and `Loop.on_a_raise` tests a loop's own path against it.
-   `SEAM_SHARE` (0.25) is the threshold and it is **not** `CAP_SHARE`: capping
-   asks whether a column *ends*, where being wrong costs a void, and this asks
-   what a bead *sits on*, where being wrong the same way costs a blob, so it is
-   biased the other way. It can be, because the two populations barely touch —
-   a loop laid on the plane shares a tenth of its path or less with the raise
-   below, a loop carrying a raised column on shares 0.4 to 1.0, and the valley
-   between is empty. `CAP_SHARE` cuts straight through the upper population.
+   `on_a_raise` is a SHARE — the fraction of the loop's own path that lies
+   over the raise below — and it is **not** `CAP_SHARE`: capping asks whether
+   a column *ends*, where being wrong costs a void, and this asks what a bead
+   *sits on*, where being wrong the same way costs a blob, so it is metered
+   continuously rather than thresholded. It used to be a `SEAM_SHARE` (0.25)
+   threshold, chosen from a Benchy where the two populations are bimodal — a
+   loop laid on the plane shares a tenth of its path or less, a loop carrying
+   a raised column 0.4 to 1.0 — but a wall that WALKS sideways has no valley
+   between them: measured on a user's 492-layer funnel, flat loops sit on a
+   raise over shares spread evenly from 0.1 to 1.0, and the threshold rounded
+   3314 of them to "fully on a raise" against 52 loops metered as climbing.
+   Every rounding removes material, so the part came out 8.01% light on a
+   claim of +1.37%, and the loops just under the threshold poured a full layer
+   into a gap a quarter of which was already filled. Metering by the share is
+   exact where the threshold was bimodal and correct where it was not.
    Record the cells during the walk `shares` already makes: walking a second
    time for them cost +22% of `brick` where folding them in costs +16%.
 6. **A column has to be capped wherever it ends, not only at the top of the
@@ -620,6 +628,106 @@ Each of these cost a wrong answer or a shipped bug.
 - Result over eighteen real slices: stops down 98% to 100% (26465 → 345,
   13169 → 167, 679 → 0), line conservation exact on every one, audit invariant
   0 everywhere, no bead moved, 0.52 → 0.57 s and 13.9 MiB on a 58 MB file.
+
+### A held loop is written at the layer's end — three things must travel with it
+
+Measured on a user's Bambu Studio tree-support slice (`fixme.gcode`, 315
+layers, 291 support regions) that knocked a double tree off the plate:
+
+- **Its travel's RATE is read off the hoisted head, and it has to be carried
+  into the hold.** A held lead opens with the travel that reached the loop, a
+  line naming no `F` of its own: it ran at whatever the spiral hop in front of
+  it set, which for Bambu is the travel rate. The hop is hoisted into the
+  region head and replayed at flush time, so by write time every rate since
+  has overwritten it — measured on that slice, held travels of **121.7 mm came
+  out at F14301 against the F60000 the slicer metered them at**, and 96.5 mm
+  at F6822. `Held.rate` captures `wanted_feed` right after the head replay and
+  `write_held` puts it back before each loop, so the travel settles to it
+  lazily like any other replayed move. Pinned by
+  `brick::tests::a_held_loop_s_travel_runs_at_the_rate_the_hop_set`.
+- **A redundant spiral hop is dropped, and only a redundant one.** The
+  reordered first-written loop replays its own full-circle `G3` hop right
+  after the head's, two revolutions over the spot the slicer lifted off of
+  once — on that slice, the support tree, at 0.4 mm of clearance, every layer.
+  `redundant_hop` drops a hop that is an arc naming `Z` and no `X`/`Y` (so it
+  goes nowhere), extrudes nothing, and ends at the height the nozzle already
+  stands at — a lift is kept (the nozzle is below it), a descent is kept
+  (skipping it strands the nozzle above the plane), and the `F` is kept too,
+  because the travel behind it names none. Where the slicer's own order
+  survives — the bed layer, the capped top — the hop is still the slicer's own
+  lift at its own place and stays. Pinned by
+  `brick::tests::a_reorder_writes_one_spiral_hop_not_two`.
+- **The pull `write_held` takes is gated on the travel's real length, like
+  every other.** Held loops are "reached by a travel the slicer never
+  planned", but a region that happens to end within a millimetre of the loop
+  makes that travel no journey: measured on that slice, **252 of 422 held
+  writes travelled under 1 mm and pulled 0.8 mm for it**, and a pull is not
+  free — it costs a stop, a gap where the bead restarts and a bite out of the
+  filament. Gated on the file's own `retraction_minimum_travel` (1 mm on that
+  slice), via `hop()` from where the nozzle really stands; the file's own
+  minimum says the slicer would not have pulled either. Pinned by
+  `brick::tests::a_held_loop_reached_within_a_millimetre_is_not_retracted_for`
+  and `a_held_loop_reached_across_the_plate_is_retracted_for`. Afterwards on
+  that slice: 170 long travels still pulled, 0 short ones; retracted total
+  3815 → 3614 mm, primed travel 1108 → 1352 mm (still under the input's own
+  1372).
+
+### Support is one bead wide, and a wall or a travel beside it must not touch it
+
+Two defects on that same `fixme.gcode` slice, both knocking the tree off the
+plate, and both fixed:
+
+- **A wall beside support is held flat, and "beside" is the support's own cells
+  dilated by a bead.** Support is printed to be broken off, so a raise beside it
+  stands proud of material nothing above a step could meet — measured, a raised
+  wall scraped a tree tip every layer until the tree went down at layer 248.
+  `Survey::support` records each layer's support beads (`Scan::supported`, kept
+  whole in `close_footprint`, not differenced — a wall is flat beside support
+  however the layers above or below fall); `mark_columns` dilates it by two
+  cells (`Cells::dilated(2)`: the nozzle's underside reaches half a bead past
+  the wall and the bead reaches half a bead back) and caps any loop whose walk
+  touches it. Pinned by `brick::tests::a_wall_beside_support_is_never_raised`.
+
+- **A travel that crosses support is never ridden down onto it, and the ride is
+  decided on the travel's real path, not the buffer's.** A reordered loop's
+  travel can be a whole journey the slicer never wrote — the outer wall written
+  first from the spiral hop over a tree tip, its travel then running from the
+  tree to the wall. The ride that carries the loop's descent runs the travel at
+  the loop's own height for its whole length, so where that height is below the
+  support the travel clips it: on that slice the outer wall's 80 mm travel was
+  ridden down to the plane and crossed the tree tips at bead height, slowly,
+  under the slicer's own `M204 S250`. `Pass::clearance` walks the lead's steers
+  moves from where the nozzle actually stands (`at_now`) and returns two
+  answers, answered apart because they call for different action: does it cross
+  a bead this pass raised (`laid`, clear to `laid_top`), and does it cross
+  support (clear to `plane + height`)? A raised-bead crossing owes a lift where
+  the nozzle starts below the bead AND refuses the ride where the loop's height
+  is below it; a support crossing only ever refuses the ride — the slicer
+  already travelled over the support at a height it chose, so nothing here
+  lifts for it. **Do NOT walk the lead off the buffer's own `.at`:** a
+  comment's `.at` is inherited from the input's frame, so the first
+  non-steers line clobbers `at_now` and the walk starts from the input's
+  position instead of the nozzle's — that left `over_support` false on the real
+  file and the ride flattened the travel onto the tree. `at` must advance only
+  on a steers move. Pinned by
+  `brick::tests::a_travel_crossing_support_is_not_ridden_down`; after the fix
+  the travel stays at the hop's height and the descent goes out as a move of
+  its own at the destination, exactly as the slicer's own inner-wall approach
+  does.
+
+- **The reordered travel inherits the slicer's approach acceleration, and that
+  crawls it.** Bambu writes `M204 S250` — a tenth of its travel acceleration —
+  before the 0.4 mm hop that reaches the outer wall, metered for a fraction of
+  a millimetre. Written first by the reorder, that hop becomes a 37 to 80 mm
+  journey at `M204 S250`, against the `F60000` the slicer metered it at:
+  the long travel crawls, which is also what made the tree scrape so slow on
+  the pre-fix file. `write_loop` holds any `M204` ahead of the first steers
+  move when the loop is displaced (`Pass::displaced > 0`) and puts it back out
+  right after the travel, so the journey runs at the file's own acceleration
+  and the bead still gets the approach. It is moved, never dropped — the
+  yardstick counts every `M204` in and out and must match. Read off the arena
+  bytes, not the parser, which folds `M204` into `Code::Other`. Pinned by
+  `brick::tests::a_reordered_travel_runs_at_the_file_s_acceleration_not_the_approach_s`.
 
 ### A column that starts partway up
 

@@ -20,6 +20,22 @@ fn config() -> Config {
     Config::default()
 }
 
+/// A width pinned by a caller is a knob, and like every number that reaches
+/// the nozzle it has to read as a length. A kilometre-wide bead is what a
+/// broken settings line parses as, and it must not survive to skew the
+/// descent and climb bounds.
+#[test]
+fn a_pinned_wall_width_is_still_a_length() {
+    let survey = Survey::of("; layer_height = 0.2\nM83\nG1 Z0.2\n");
+    let config = Config {
+        wall_width: Some(1e12),
+        ..Config::default()
+    };
+    let mut out = Vec::new();
+    let pass = Pass::new(&mut out, b"".as_slice(), &config, &survey);
+    assert_eq!(pass.bead, FALLBACK_WIDTH / 2.0);
+}
+
 /// A wall stack as a slicer lays one: the hidden loop first, then the
 /// visible loop on the layer's own outline.
 fn ring(text: &mut String, half: f64) {
@@ -190,6 +206,44 @@ fn a_shallow_surface_is_followed_across_its_own_layer() {
     assert!(highest - plane <= half, "{highest} is over the layer above");
     assert!(plane - lowest <= half, "{lowest} is under the layer below");
     assert_eq!(out.stats.layers, 4, "the bed and the top stay flat");
+}
+
+/// A followed bead is metered when it is written, which is after the next
+/// bead arrives — and a `T` between the two must not let that one-and-only
+/// throttle read the arriving tool's ceiling. The bead was read under the
+/// tool that is leaving and is laid by it, so it is slowed against that
+/// tool's own limit.
+#[test]
+fn a_followed_bead_is_metered_against_the_tool_it_was_read_under() {
+    let mut text = String::from(
+        "; layer_height = 0.2\n; filament_max_volumetric_speed = 5,100\n; filament_diameter = 1.75\nM83\nG1 Z0.200 F600\n",
+    );
+    for layer in 0..6 {
+        let half = HALF - RUN * layer as f64;
+        text.push_str(";LAYER_CHANGE\n");
+        text.push_str(&format!("G1 Z{:.3} F600\n", HEIGHT * (layer + 1) as f64));
+        ring(&mut text, half);
+        surface(&mut text, half, RUN, ";TYPE:Top surface\n");
+        if layer == 3 {
+            text.push_str("T1\n");
+        }
+    }
+
+    let out = apply(&text, &config());
+    // The last followed bead of layer 3 was read under T0 (ceiling 5 mm³/s ÷
+    // area, floored by the file's own peak) and is written after the `T1`.
+    // Metered against T1's 100 mm³/s it fits and stays at F9000; metered
+    // against T0 it has to slow down.
+    let last = steps(&out.gcode)
+        .into_iter()
+        .rfind(|step| step.layer == 3 && step.feature == Feature::TopSurface && step.e > 0.0)
+        .expect("the strip is printed");
+    let feed = Line::parse(&last.raw).f;
+    assert!(
+        feed.is_some_and(|f| f < 9000.0),
+        "the followed bead was not slowed against T0's ceiling: {}",
+        last.raw
+    );
 }
 
 /// A slicer's custom G-code switches to relative positioning to lift and

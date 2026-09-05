@@ -35,6 +35,13 @@ fn run(cli: &Cli) -> Result<()> {
         Source::open(&cli.input)?
     };
     let (bricks, contours) = (cli.bricks, cli.zaa);
+    // The dial's range is only a promise `--bricks` makes, so it is checked
+    // where that transform runs. A leftover out-of-range dial beside a
+    // transform that was never named changes nothing and must not fail the
+    // print.
+    if bricks && let Some(reason) = cli::extra_flow_out_of_range(cli.extra_flow) {
+        return Err(Error::Usage(reason));
+    }
 
     warn_slicer_settings(&slicer, bricks);
     if cli.verbose {

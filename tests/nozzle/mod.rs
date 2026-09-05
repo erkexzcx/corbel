@@ -37,6 +37,7 @@ use std::collections::HashMap;
 
 use corbel::gcode::{Code, Extruder, Line, Modal};
 use corbel::geometry::{Arc, turn};
+use corbel::scan::MELT_GAUGE;
 
 /// How far apart, in mm of path, a move is sampled.
 ///
@@ -1024,11 +1025,6 @@ const TIME_SLACK: f64 = 0.25;
 /// and the most any bead is given is the climb's 1.54 — with a little room
 /// for the flow multiplier on top of it.
 const MOST_SLOWED: f64 = 1.65;
-
-/// Shortest bead whose filament-per-mm is worth reading, in mm. A coordinate
-/// is written to the micron, so anything shorter divides one rounding by
-/// another.
-const MELT_GAUGE: f64 = 0.5;
 
 /// How far the filament a run actually adds may sit from the figure it prints.
 ///

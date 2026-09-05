@@ -32,8 +32,15 @@ const SAME_HEIGHT: f64 = 0.001;
 pub const FALLBACK_Z_FEEDRATE: f64 = 720.0;
 /// Shortest bead whose filament-per-mm is worth reading, in mm. Coordinates
 /// are written to the micron, so a bead a few microns long divides one
-/// rounding by another.
-pub(crate) const MELT_GAUGE: f64 = 0.5;
+/// rounding by another. At 0.05 mm the rounding is still under 3% of the
+/// length, and a slicer's corner segments run 0.1–0.5 mm: with the gauge at
+/// half a millimetre those skipped the melt throttle their neighbours took,
+/// and the rate then flipped between the two at every corner — measured on a
+/// user's box, the wall's long edge came out at F10565 against F13265 on its
+/// own corner beads, both laid at the same flow, so the toolhead braked at
+/// each corner of the print. The yardstick in `tests/nozzle` reads the same
+/// constant, so both sides of a measurement agree on which beads count.
+pub const MELT_GAUGE: f64 = 0.05;
 /// Filament slots a `T` line may name. Past this a `T` is a slicer's own
 /// bookkeeping rather than a material — Bambu brackets a tool change with
 /// `T1000` and `T1001`.
@@ -229,6 +236,13 @@ pub struct Survey {
     /// to span a layer and a half of gap while the slicer metered it for one.
     /// Indexed the same way as [`Survey::uncovered`].
     pub unsupported: Vec<Cells>,
+    /// Where each layer's support and support-interface beads run.
+    ///
+    /// A wall laid beside support must not be raised: support is one bead wide
+    /// and printed to be broken off, so a raise that scrapes it knocks it off
+    /// the plate. Indexed by layer, by [`Markerless`] where the file states no
+    /// layers of its own.
+    pub support: Vec<Cells>,
     /// The box the part's own extrusions cover, as `[left, front, right,
     /// back]` in mm. `None` where nothing was laid down.
     ///
@@ -329,6 +343,12 @@ impl Survey {
             .get(layer)
             .filter(|cells| !cells.is_empty())
     }
+
+    /// Where `layer`'s support and support-interface beads run, or `None`
+    /// where the layer lays none.
+    pub fn support(&self, layer: usize) -> Option<&Cells> {
+        self.support.get(layer).filter(|cells| !cells.is_empty())
+    }
 }
 
 /// True for a region that covers a raise without having to give it back.
@@ -400,6 +420,12 @@ struct Scan {
     unknown_regions: usize,
     unknown_region: Option<String>,
     feature: Feature,
+    /// True while the marker in force is a support or support-interface region.
+    /// Read off the marker text rather than [`Feature`], which folds support
+    /// into [`Feature::Other`]. A wall laid beside support is held flat rather
+    /// than raised over it, since support is a bead wide and a raise that
+    /// scrapes it knocks it off the plate.
+    supporting: bool,
     current_z: f64,
     /// Lowest Z of the layer being read, and of the one before it. A Z-hop
     /// only ever raises the nozzle, so the lowest Z of a layer is the layer's
@@ -453,11 +479,17 @@ struct Scan {
     /// layer below, where `here` also says which columns begin on this layer
     /// and so have nothing to climb from.
     covering: Cells,
+    /// Cells the open layer's support and support-interface beads run through.
+    /// A wall raised beside these would stand proud of material that is a
+    /// single bead wide and meant to break away, so the rewrite holds it flat
+    /// instead.
+    supported: Cells,
     /// Index of the layer `below` describes, which is not `open_layer - 1`
     /// when a layer holds no wall at all.
     below_layer: Option<usize>,
     uncovered: Vec<Cells>,
     unsupported: Vec<Cells>,
+    support: Vec<Cells>,
     /// True once a move that could not be followed has been reported.
     warned: bool,
     /// The box the part's own extrusions cover, in mm.
@@ -516,6 +548,7 @@ impl Scan {
                 self.wall_top_at_open = self.last_wall_layer;
             } else if let Some(feature) = Feature::from_marker(marker) {
                 self.feature = feature;
+                self.supporting = marker.to_ascii_lowercase().contains("support");
                 if feature.is_perimeter() {
                     self.perimeters += 1;
                 }
@@ -535,7 +568,9 @@ impl Scan {
                 } else if is_wall_width(key) {
                     self.wall_width.get_or_insert_with(|| value.to_owned());
                 } else if key.eq_ignore_ascii_case("retraction_minimum_travel") {
-                    if let Ok(far) = value.split(',').next().unwrap_or("").trim().parse() {
+                    if let Ok(far) = value.split(',').next().unwrap_or("").trim().parse::<f64>()
+                        && (0.0..1000.0).contains(&far)
+                    {
                         self.hop_travel.get_or_insert(far);
                     }
                 } else if key.eq_ignore_ascii_case("retraction_length")
@@ -620,7 +655,13 @@ impl Scan {
         // A file that states no layers of its own is laid out from its beads.
         // Ahead of the footprint, so this bead is drawn into the layer it
         // opens rather than into the one it just ended.
-        if extrudes && !self.saw_markers {
+        //
+        // Only a plain bead opens one. A `G91`/`G20` section is custom G-code
+        // — a purge, a colour change — and its extrusions are not part
+        // material; the rewrite refuses to open a layer there, so the survey
+        // must too or the two number the layers differently for the rest of
+        // the file.
+        if extrudes && !self.saw_markers && self.modal.is_plain() {
             let plane = self.modal.position().2;
             if self.markerless.opens_a_layer(plane) {
                 self.layers += 1;
@@ -671,6 +712,8 @@ impl Scan {
             }
         } else if extrudes && covers_a_raise(self.feature) && self.open_layer.is_some() {
             self.covering.draw(from, to, arc);
+        } else if extrudes && self.supporting && self.open_layer.is_some() {
+            self.supported.draw(from, to, arc);
         }
 
         if line.code == Code::Arc {
@@ -809,8 +852,15 @@ impl Scan {
         // leaves a bead half a layer proud under something metered for a whole
         // one.
         // The layer below counts too: every answer here is a difference of the
-        // two, so a hole in either one is a hole in the result.
-        let unread = self.here.refused() + self.covering.refused() + self.below.refused() > 0;
+        // two, so a hole in either one is a hole in the result. Support is
+        // kept whole rather than differenced, but a hole in it is the same
+        // lie: a wall beside the un-traced middle of a support bead is capped
+        // by nothing and raised into a tree tip.
+        let unread = self.here.refused()
+            + self.covering.refused()
+            + self.below.refused()
+            + self.supported.refused()
+            > 0;
         if let Some(below) = self.below_layer {
             let left = match unread {
                 true => self.below.clone(),
@@ -829,6 +879,11 @@ impl Scan {
             self.warn_about_the_trace();
         }
         Self::keep(&mut self.unsupported, index, fresh);
+        // Support cells are kept whole, not differenced: a wall is held flat
+        // beside support however the layers above or below fall, because the
+        // support is the same single bead wide on every one of them.
+        self.supported.settle();
+        Self::keep(&mut self.support, index, self.supported.take());
         // Swapped rather than handed over, so the buffer the layer below used
         // is the one this layer fills.
         std::mem::swap(&mut self.below, &mut self.here);
@@ -914,6 +969,13 @@ impl Scan {
             self.record_height(index, 0.0);
             return;
         };
+        // A drop is the one thing a layer's own height cannot otherwise do,
+        // and it is the only signal there is: a file that completes objects
+        // one at a time takes the nozzle back to the bed, which is a lower
+        // floor than the layer before. An object that is exactly ONE layer
+        // tall and the next one's first layer commands no drop at all — both
+        // sit on the bed — so that boundary is not seen. A G-code file names
+        // no object, and without the drop there is nothing left to find it in.
         let dropped = self.previous_floor.is_some_and(|previous| floor < previous);
         // A layer stands on the one below it, so its own height is how far the
         // plane rose. The first layer of an object stands on the bed instead,
@@ -1051,9 +1113,17 @@ impl Scan {
             unknown_regions: self.unknown_regions,
             unknown_region: self.unknown_region,
             object_starts: {
-                // Every file opens an object at its first layer.
-                let mut starts = vec![0];
-                starts.extend(self.object_starts);
+                // Every file opens an object at its first layer — the first
+                // one that actually stood somewhere, which is not necessarily
+                // layer zero. A leading `;LAYER_CHANGE` before any `G1 Z`
+                // takes number zero without standing, and counting the real
+                // bed layer as a stacked one read the wall flow onto the
+                // plate. `planes` already names each object's first layer; it
+                // is empty only where no layer stood at all.
+                let mut starts = self.planes.clone();
+                if starts.is_empty() {
+                    starts.push(0);
+                }
                 starts
             },
             object_tops: {
@@ -1065,6 +1135,7 @@ impl Scan {
             },
             uncovered: self.uncovered,
             unsupported: self.unsupported,
+            support: self.support,
             footprint: self.footprint,
         }
     }
@@ -1080,12 +1151,38 @@ impl Scan {
 /// could name a slot counts. The rest of the line is ignored: a real one
 /// carries words after it, as in `T3 H-1`.
 pub(crate) fn tool_change(raw: &str) -> Option<usize> {
-    let word = raw.split_whitespace().next()?;
-    let digits = word.strip_prefix('T').or_else(|| word.strip_prefix('t'))?;
-    match digits.parse::<usize>() {
-        Ok(slot) if slot < MAX_TOOLS => Some(slot),
-        _ => None,
+    let bytes = raw.as_bytes();
+    let mut at = 0;
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
     }
+    // Marlin's serial dialect numbers each line and appends a checksum; the
+    // command follows the line number and ends at the `*`. Both surround the
+    // `T` on a real captured stream, so neither may hide it.
+    if bytes.get(at).is_some_and(|byte| byte | 0x20 == b'n') {
+        at += 1;
+        while bytes.get(at).is_some_and(u8::is_ascii_digit) {
+            at += 1;
+        }
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+    }
+    if !bytes.get(at).is_some_and(|byte| byte | 0x20 == b't') {
+        return None;
+    }
+    let start = at + 1;
+    let mut end = start;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    std::str::from_utf8(&bytes[start..end])
+        .ok()
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .filter(|slot| *slot < MAX_TOOLS)
 }
 
 fn setting(comment: &str) -> Option<(&str, &str)> {
@@ -1402,6 +1499,27 @@ G1 X2 Y0 E1
         assert_eq!(survey.layer_height, 0.3);
     }
 
+    /// `retraction_minimum_travel` gates every pull this tool adds, so a
+    /// nonsense value — NaN, a negative, a kilometre — must not silently
+    /// switch them all off or on.
+    #[test]
+    fn a_minimum_travel_that_is_not_a_length_is_ignored() {
+        assert_eq!(
+            Survey::of("; retraction_minimum_travel = nan\nG1 Z0.2\n").hop_travel,
+            None
+        );
+        assert_eq!(
+            Survey::of("; retraction_minimum_travel = -1\nG1 Z0.2\n").hop_travel,
+            None
+        );
+        assert_eq!(
+            Survey::of("; retraction_minimum_travel = 1e9\nG1 Z0.2\n").hop_travel,
+            None
+        );
+        let survey = Survey::of("; retraction_minimum_travel = 1.5\nG1 Z0.2\n");
+        assert_eq!(survey.hop_travel, Some(1.5));
+    }
+
     #[test]
     fn measures_the_layer_height_from_z_steps() {
         let survey = Survey::of("G1 Z0.2\nG1 Z0.4\nG1 Z0.6\nG1 Z1.6\n");
@@ -1601,6 +1719,23 @@ G1 X2 Y0 E1
         assert!(close(varied.layer_heights[3], 0.1), "one layer's rise");
     }
 
+    /// A leading `;LAYER_CHANGE` before any `G1 Z` takes layer number zero
+    /// without ever standing anywhere. The real bed layer is the next one, and
+    /// it has to be counted as that object's first, or the brick pass reads it
+    /// as one layer old and applies the wall flow to the plate.
+    #[test]
+    fn the_first_object_starts_on_the_first_layer_that_stands() {
+        let survey = Survey::of(
+            ";LAYER_CHANGE\n\
+             ;LAYER_CHANGE\nG1 Z0.3\n\
+             ;LAYER_CHANGE\nG1 Z0.5\n\
+             ;LAYER_CHANGE\nG1 Z0.7\n",
+        );
+        assert_eq!(survey.object_starts, [1]);
+        assert_eq!(survey.objects(), 1);
+        assert!(survey.opens_an_object(1) && !survey.opens_an_object(0));
+    }
+
     /// Both transforms find their work through the region markers the slicer
     /// wrote, so a file carrying none in either dialect is one the run
     /// rewrites to no effect. Counting them is what lets that be said out
@@ -1721,6 +1856,29 @@ G1 X2 Y0 E1
         assert!(starts.holds(5.0, 0.0));
     }
 
+    /// The same refusal, on a support bead instead of a wall. Support is kept
+    /// whole rather than differenced, so its hole is not a smaller outline —
+    /// but it is still a lie, and a wall beside the un-traced middle of a
+    /// support bead would be capped by nothing and raised into a tree tip.
+    /// Its refusal has to join the conservative fallback too.
+    #[test]
+    fn a_support_move_that_cannot_be_followed_also_costs_the_layer_its_bricking() {
+        let wall = "G1 X0 Y0 F9000\nG1 X10 Y0 E0.5\nG1 X10 Y10 E0.5\n";
+        let refused = Survey::of(&format!(
+            "M83\n\
+             ;LAYER_CHANGE\nG1 Z0.2 F600\n;TYPE:Perimeter\n{wall}\
+             ;LAYER_CHANGE\nG1 Z0.4 F600\n;TYPE:Perimeter\n{wall}\
+             ;TYPE:Support\nG1 X20000 Y0 E0.1\n"
+        ));
+        let cells = refused
+            .uncovered(0)
+            .expect("a layer that could not be read covers nothing below it");
+        assert!(
+            cells.holds(5.0, 0.0),
+            "the wall below is capped though the support above could not be traced"
+        );
+    }
+
     /// The same two walls as [`finds_the_wall_that_nothing_stands_on`], in a
     /// file that never says where its layers begin.
     ///
@@ -1803,6 +1961,21 @@ G1 X2 Y0 E1
                 );
             }
         }
+    }
+
+    /// A `G91`/`G20` section's extrusions are a purge or a colour change, not
+    /// part material, and the rewrite refuses to open a markerless layer on
+    /// one. The survey has to make the same refusal, or a bead inside a
+    /// relative section off the plane opens a layer that the rewrite never
+    /// sees and the two number every later layer differently.
+    #[test]
+    fn a_bead_inside_a_relative_section_opens_no_markerless_layer() {
+        let survey = Survey::of(
+            "M83\nG1 Z0.2 F600\nG1 X0 Y0 E0.5\n\
+             G91\nG1 X1 Y1 Z2 E0.1\nG90\n\
+             G1 Z0.2 F600\nG1 X2 Y2 E0.5\n",
+        );
+        assert_eq!(survey.layers, 1, "a relative-section bead opened a layer");
     }
 
     #[test]
@@ -1906,6 +2079,17 @@ G1 X2 Y0 E1
         assert_eq!(tool_change("T1000"), None);
         assert_eq!(tool_change("T1001"), None);
         assert_eq!(tool_change("G1 X1"), None);
+    }
+
+    /// A captured Marlin serial stream numbers every line and checksums the
+    /// tail, and a `T` surrounded by either still names a filament.
+    #[test]
+    fn a_serial_dialects_tool_change_is_still_a_filament() {
+        assert_eq!(tool_change("N99 T0*123"), Some(0));
+        assert_eq!(tool_change("N99 T3 H-1*45"), Some(3));
+        assert_eq!(tool_change("T0*123"), Some(0));
+        assert_eq!(tool_change("  N12 T1 *4"), Some(1));
+        assert_eq!(tool_change("N99 G1 X1*45"), None);
     }
 
     /// A coordinate is written to the micron, so a bead a few microns long

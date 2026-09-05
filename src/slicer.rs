@@ -56,7 +56,7 @@ impl Settings {
         Self {
             layer_height: get(&["layer_height"])
                 .and_then(|value| value.parse::<f64>().ok())
-                .filter(|height| height.is_finite() && *height > 0.0),
+                .filter(crate::scan::is_a_height),
             wall_order: get(&["external_perimeters_first", "wall_sequence"])
                 .as_deref()
                 .map(wall_order),
@@ -183,6 +183,9 @@ mod tests {
         assert_eq!(read(&[("SLIC3R_LAYER_HEIGHT", "-0.2")]).layer_height, None);
         assert_eq!(read(&[("SLIC3R_LAYER_HEIGHT", "nan")]).layer_height, None);
         assert_eq!(read(&[("SLIC3R_LAYER_HEIGHT", "auto")]).layer_height, None);
+        // A ceiling too: a settings line reading `layer_height = 1e12` must
+        // not survive to become a commanded height.
+        assert_eq!(read(&[("SLIC3R_LAYER_HEIGHT", "1e12")]).layer_height, None);
     }
 
     #[test]

@@ -109,7 +109,7 @@ Z anti-aliasing has no dials: how wide a tread is worth following is a *slope* o
 
 The gaps are drawn far larger than life — on a 0.2 mm layer they are a few microns across.
 
-**What it touches.** Every wall, and only walls — infill, bridges, gap fill and the surfaces come out exactly as sliced, so it is never a global flow bump. Two walls are enough; three or more interlocks twice as much.
+**What it touches.** Every wall, and only walls — infill, bridges and the surfaces come out exactly as sliced, and gap fill and a thin wall are metered for the column they stand over rather than raised, so it is never a global flow bump. Two walls are enough; three or more interlocks twice as much.
 
 - **The first layer on the bed is left exactly as sliced.** Nothing presses a bead there, so surplus spreads sideways instead of filling anything — on a Benchy it filled in the recessed nameplate, which is exactly one layer deep. A raised column climbs to its half layer over two layers rather than stepping up in one.
 - **The outer wall gets the flow and is then moved inward by half the width it gains**, so the gain feeds the joint behind it and the commanded outer face stays where the slicer drew it. What it gains is `flow - 1` of its *spacing*, not of its nominal width.
@@ -131,7 +131,7 @@ So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle,
 
 **Set it anywhere from 0 to 50.** `0` meters every bead as sliced and moves no wall, leaving only the raise. The top of the range is for sweeping a test print rather than printing with, and there is a ceiling nobody picked: a bead can be widened until its edge reaches the centre of the loop beside it, which is the bead model's own arithmetic rather than a chosen limit.
 
-**What it costs on the whole part is small, because it is paid only on walls.** On a ten-object plate at the default, a flow of 1.025 on the walls added **+0.89%** to the part; on a part that is mostly wall it is a little over 2%. Infill, bridges, gap fill and the surfaces are metered exactly as sliced, so it is never a global flow bump.
+**What it costs on the whole part is small, because it is paid only on walls.** On a ten-object plate at the default, a flow of 1.025 on the walls added **+0.89%** to the part; on a part that is mostly wall it is a little over 2%. Infill, bridges and the surfaces are metered exactly as sliced, and gap fill and a thin wall are metered for the column they stand over, so it is never a global flow bump.
 
 **Where the numbers come from.** The width is read from whichever states it first — the `SLIC3R_*` configuration your slicer exports to a post-processing script, a `.bgcode` container's metadata, or the settings block appended to plain `.gcode` — with a percentage resolved against `nozzle_diameter`. Layer heights are measured from the commanded Z one layer at a time. A file stating no width, as Cura's do, falls back to a reference profile for both the flow and the inward move, and `-v` says so.
 

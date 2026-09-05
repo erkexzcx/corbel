@@ -641,6 +641,35 @@ impl Cells {
         self.keys.iter().copied().map(unkey)
     }
 
+    /// This set grown by `radius` cells in every direction, so asking whether a
+    /// path touches it can be one `has` per path cell instead of a distance per
+    /// support cell. Both axes use the Chebyshev distance: a cell `radius`
+    /// cells out diagonally is still within reach.
+    ///
+    /// Two bead centrelines clip each other once they are a bead width apart —
+    /// the nozzle's underside reaches half a bead beyond the wall it lays and
+    /// the bead it would hit reaches half a bead back — which at [`CELL`] is
+    /// two cells. A wall laid beside support is held flat rather than raised
+    /// over it, because the support is one bead wide and a raise that scrapes
+    /// it knocks it off the plate.
+    pub fn dilated(&self, radius: i32) -> Cells {
+        let mut keys = Vec::with_capacity(self.keys.len() * (radius as usize * 2 + 1).pow(2));
+        for (column, row) in self.iter() {
+            for column_ in column - radius..=column + radius {
+                for row_ in row - radius..=row + radius {
+                    keys.push(key(column_, row_));
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        Cells {
+            grid: self.grid,
+            keys,
+            refused: self.refused,
+        }
+    }
+
     /// The smallest box holding every cell, as `[left, bottom, right, top]` in
     /// grid coordinates and inclusive at both ends. `None` for an empty set.
     ///

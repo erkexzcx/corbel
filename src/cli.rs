@@ -82,28 +82,33 @@ const TRANSFORMS: &str = "transforms";
 const EXTRA_FLOW: RangeInclusive<f64> =
     brick::MIN_EXTRA_FLOW * 100.0..=brick::MAX_EXTRA_FLOW * 100.0;
 
-/// It ends up as extruded plastic, so a value that is not a finite number
-/// inside its range is refused before any work starts rather than written into
-/// the G-code.
-fn within(value: &str, range: RangeInclusive<f64>) -> Result<f64, String> {
+/// It ends up as extruded plastic, so a value that is not a finite number is
+/// refused before any work starts rather than written into the G-code.
+fn extra_flow(value: &str) -> Result<f64, String> {
     let number: f64 = value
         .parse()
         .map_err(|_| format!("`{value}` is not a number"))?;
     if !number.is_finite() {
         return Err(format!("`{value}` is not a finite number"));
     }
-    if !range.contains(&number) {
-        return Err(format!(
-            "{number} is outside {}..={}",
-            range.start(),
-            range.end()
-        ));
-    }
     Ok(number)
 }
 
-fn extra_flow(value: &str) -> Result<f64, String> {
-    within(value, EXTRA_FLOW)
+/// The sentence to refuse a run for, where [`Cli::extra_flow`] sits outside
+/// [`EXTRA_FLOW`] and the transform it belongs to actually runs.
+///
+/// The range is only a promise `--bricks` makes, so it is checked where that
+/// transform runs and not at parse time: a slicer field edited by hand may
+/// leave an out-of-range dial beside a transform that was never named, and
+/// refusing the leftover would fail a print for a word that changes nothing.
+pub fn extra_flow_out_of_range(value: f64) -> Option<String> {
+    (!EXTRA_FLOW.contains(&value)).then(|| {
+        format!(
+            "{value} is outside {}..={}",
+            EXTRA_FLOW.start(),
+            EXTRA_FLOW.end()
+        )
+    })
 }
 
 /// Where `--output` may point.
@@ -209,38 +214,52 @@ mod tests {
 
     /// A dial belonging to a transform that was not asked for is accepted and
     /// ignored: a slicer field is edited by hand, and refusing the leftover
-    /// would fail a print for a word that changes nothing.
+    /// would fail a print for a word that changes nothing — however far
+    /// outside the range the leftover sits.
     #[test]
     fn a_dial_without_its_transform_is_accepted_and_does_nothing() {
         let cli = Cli::parse_from(["corbel", "--zaa", "--extra-flow=12", "part.gcode"]);
         assert!(cli.zaa && !cli.bricks);
         assert_eq!(cli.extra_flow, 12.0);
+
+        let out_of_range = Cli::parse_from(["corbel", "--zaa", "--extra-flow=75", "part.gcode"]);
+        assert!(out_of_range.zaa && !out_of_range.bricks);
+        assert_eq!(out_of_range.extra_flow, 75.0);
+        assert!(extra_flow_out_of_range(out_of_range.extra_flow).is_some());
     }
 
     /// The dial is a percentage a reader can act on — the extra a wall takes
     /// where the layer is as thick as the nozzle — rather than a multiplier
     /// over some number they cannot see. Zero is a real setting: the raise
-    /// with every bead metered as sliced.
+    /// with every bead metered as sliced. Its range is only checked where
+    /// `--bricks` runs, but what is not a number at all is refused at parse.
     #[test]
     fn the_extra_flow_is_held_to_its_range() {
         for accepted in ["0", "2.5", "5", "12", "50"] {
             let cli =
                 Cli::parse_from(["corbel", "--bricks", "--extra-flow", accepted, "part.gcode"]);
             assert_eq!(cli.extra_flow, accepted.parse::<f64>().unwrap());
+            assert!(extra_flow_out_of_range(cli.extra_flow).is_none());
         }
         // A bare `-1` is refused by clap as an unknown flag before the range
         // is ever consulted, so the negatives are spelled with an `=` to prove
         // the range check itself has teeth.
-        for rejected in ["-0.1", "50.1", "-1", "nan", "inf", "more"] {
+        for rejected in ["-0.1", "50.1", "-1"] {
+            assert!(
+                extra_flow_out_of_range(rejected.parse::<f64>().unwrap()).is_some(),
+                "{rejected} should be refused where --bricks runs"
+            );
+        }
+        for unparseable in ["nan", "inf", "more"] {
             assert!(
                 Cli::try_parse_from([
                     "corbel",
                     "--bricks",
-                    &format!("--extra-flow={rejected}"),
+                    &format!("--extra-flow={unparseable}"),
                     "part.gcode"
                 ])
                 .is_err(),
-                "{rejected} should be rejected"
+                "{unparseable} should be rejected"
             );
         }
     }

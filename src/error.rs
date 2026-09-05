@@ -27,6 +27,9 @@ pub enum Error {
          the first. Re-slice, or pass --force if that is what you want"
     )]
     AlreadyProcessed { path: PathBuf, done: &'static str },
+
+    #[error("{0}")]
+    Usage(String),
 }
 
 impl Error {

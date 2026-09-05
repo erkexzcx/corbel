@@ -705,6 +705,41 @@ fn a_section_in_relative_positioning_is_written_back_exactly_as_it_was_found() {
     );
 }
 
+/// The descent a deferred region left behind is owed, not written where it is
+/// found — and least of all inside a `G91`/`G20` section, where a `G1 Z`
+/// names a relative displacement or inches rather than the plane. The debt is
+/// carried across the section and paid at the first plain bead after it.
+#[test]
+fn a_deferred_descent_is_not_written_inside_a_relative_section() {
+    let survey = Survey::of(";LAYER_CHANGE\nG1 Z0.2 F600\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.owed_plane = Some(0.2);
+    pass.nozzle_z = Some(0.4);
+
+    pass.feed("G91", b"G91").unwrap();
+    pass.feed("G1 X1 Y1 E0.5", b"G1 X1 Y1 E0.5").unwrap();
+    assert!(
+        !String::from_utf8(pass.out.clone())
+            .unwrap()
+            .contains("corbel brick reset"),
+        "the descent was written inside the relative section"
+    );
+
+    pass.feed("G90", b"G90").unwrap();
+    pass.feed("G1 X2 Y2 E1.0", b"G1 X2 Y2 E1.0").unwrap();
+    pass.flush().unwrap();
+    pass.write_held().unwrap();
+    drop(pass);
+
+    let whole = String::from_utf8(out).unwrap();
+    assert!(
+        whole.contains("G1 Z0.200"),
+        "the descent was never paid back after the section:\n{whole}"
+    );
+}
+
 #[test]
 fn a_file_that_never_moves_z_alone_still_rides_every_raise() {
     let source = relative(&format!(
@@ -1126,6 +1161,43 @@ fn a_z_hop_opens_no_layer_where_the_file_states_none() {
         beads(&hopped),
         beads(&flat),
         "hopping changed what a bead was metered for:\n{hopped}"
+    );
+}
+
+/// A spiral hop commands a layer's Z on a `G3` rather than a `G1`. The survey
+/// reads the plane off the bead itself, arcs included, so a file with no
+/// markers whose layer change rides an arc must open a layer here too — read
+/// off only `G1` moves, this pass's layer number walks away from the survey's
+/// and every column is metered for the wrong layer.
+#[test]
+fn a_layer_plane_reached_by_an_arc_still_opens_a_layer() {
+    let body = format!(";TYPE:Perimeter\n{}", wall(2, "loop"));
+    let mut source = String::new();
+    for z in [0.2, 0.4, 0.6] {
+        source.push_str(&layer(z));
+        source.push_str(&untagged(&body));
+    }
+    source.push_str(&layer(0.8));
+    source.push_str(&body);
+    source.push_str(&layer(1.0));
+    source.push_str(&untagged(&body));
+    let straight = without_layer_markers(&relative(&source));
+    // The same file with each layer's own `G1 Z` swapped for a full-circle
+    // arc that lifts to the same height, which is a spiral hop.
+    let helical = straight.replace("G1 Z", "G3 I0.5 J0.5 Z");
+
+    let flat = run(&straight, &plain());
+    let arcs = run(&helical, &plain());
+    assert!(
+        flat.contains("Z0.900 ; corbel brick raised"),
+        "the marked layer's raise is missing:\n{flat}"
+    );
+    // The print must not depend on whether a layer's Z rides a move or an
+    // arc: written back as a move, the two runs are the same file.
+    assert_eq!(
+        arcs.replace("G3 I0.5 J0.5 Z", "G1 Z"),
+        flat,
+        "an arc-carrying layer change changed the print:\n{arcs}"
     );
 }
 
@@ -3084,6 +3156,49 @@ fn only_the_bead_that_goes_over_is_slowed() {
     }
 }
 
+/// A region that opens directly on a bead has that bead as the first buffered
+/// line, so its start is the region's entry and not the line before it. The
+/// throttle reads the span from that entry — metered against nothing, a
+/// climb's first bead ran unthrottled however far over the ceiling it was.
+#[test]
+fn the_first_bead_of_a_region_is_metered_against_its_entry() {
+    let survey = Survey::of("; layer_height = 0.2\nM83\nG1 Z0.2\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.entry = (0.0, 0.0);
+    pass.melt_rate = Some(6.0);
+    pass.wanted_feed = Some(9000.0);
+    // One bead 10 mm long, 0.5 mm of filament at F9000: 7.5 mm/s, over the
+    // 6 mm/s ceiling, so it has to slow to 7200.
+    pass.buffer.push(Buffered {
+        start: 0,
+        end: 0,
+        e_span: None,
+        e: Some(0.5),
+        delta: Some(0.5),
+        z: None,
+        f: Some(9000.0),
+        xy: Some((10.0, 0.0)),
+        places: true,
+        at: (10.0, 0.0),
+        arc: None,
+        curved: false,
+        extrudes: true,
+        steers: true,
+        positions: true,
+        carries: false,
+        absolute: true,
+        resets_origin: false,
+        width: None,
+    });
+    assert_eq!(
+        pass.metered_rate(0, 1.0, &[None]),
+        Some(7200.0),
+        "the first bead was not metered against its entry"
+    );
+}
+
 /// A raised loop waits for the end of its layer, and a plate printing two
 /// materials changes tool in the MIDDLE of one — so a loop still waiting is
 /// written after the change and laid in the other filament. Measured on a
@@ -3842,6 +3957,39 @@ fn a_thin_wall_over_a_column_does_not_cap_it() {
     );
 }
 
+/// A layer that is nothing but a thin wall has no wall to buffer the filler
+/// with, so the bead goes straight out — and it still has to be metered for
+/// the column the layer below left standing under it, or it is fed a whole
+/// layer over half a gap.
+#[test]
+fn a_thin_wall_not_buffered_with_a_wall_is_still_metered() {
+    let on = wall_of(2, "on", 0.0, 10.0, 0.5);
+    let body = untagged(&format!(";TYPE:Perimeter\n{on}"));
+    let mut source = String::new();
+    for z in [0.2, 0.4, 0.6, 0.8] {
+        source.push_str(&layer(z));
+        source.push_str(&body);
+    }
+    source.push_str(&layer(1.0));
+    source.push_str(&format!(";TYPE:Perimeter\n{on}"));
+    source.push_str(&layer(1.2));
+    source.push_str(&format!(
+        ";TYPE:Thin wall\n{}",
+        wall_of(1, "thin", 0.0, 10.0, 0.5)
+    ));
+    let out = run(&relative(&source), &plain());
+
+    let flow = out
+        .lines()
+        .find(|line| line.ends_with("; thin1"))
+        .map(|line| Line::parse(line).e.expect("an extrusion"))
+        .unwrap_or_else(|| panic!("the thin wall is missing from:\n{out}"));
+    assert_eq!(
+        flow, 0.25,
+        "the thin wall crosses half a layer, not the whole one it was sliced for: {out}"
+    );
+}
+
 /// Gap fill is material standing on the layer below, exactly as a thin wall
 /// is: a column under it did not end, so capping it as though the part
 /// stopped there throws the stagger away for nothing. And the bead itself
@@ -3987,5 +4135,403 @@ fn a_ring_stopped_short_of_its_seam_is_moved_however_wide_the_offset() {
     assert!(
         (beads[3].0 - 0.089).abs() < 1e-9 && (beads[3].1 - 0.129).abs() < 1e-9,
         "and the seam gap survives the offset: {beads:?}"
+    );
+}
+
+/// The structure a user's tree-support slice threw three defects out of:
+/// a support bead, then a wall whose two loops each arrive over their own
+/// full-circle spiral hop, then a filler region that ends where `tail` says.
+///
+/// Bambu Studio reaches each loop with a `G3` hop that names `Z` and no `X`
+/// or `Y` — a lift that starts and ends on one spot — a travel at the hop's
+/// height, a descent and a prime. The wall's inner loop is raised and so held
+/// to the end of the layer; the filler's last bead decides how far the nozzle
+/// really is from where that held loop is written.
+fn tree_wall(plane: f64, filler_tail: &str) -> String {
+    format!(
+        ";LAYER_CHANGE\nG1 Z{plane} F600\n\
+         ;TYPE:Support\n\
+         G1 X20.0 Y4.9 F9000\n\
+         G1 X20.0 Y5.0 E0.1\n\
+         G1 E-.03 F1800\n\
+         M204 S10000\nG17\n\
+         G3 Z{hop} I-1.201 J-.196 P1 F60000\n\
+         G1 X5.45 Y5.45 Z{hop}\n\
+         G1 Z{plane}\n\
+         G1 E.6 F1800\n\
+         ;TYPE:Internal perimeter\n\
+         G1 F6316\n\
+         G1 X5.45 Y5.45 E0.1\n\
+         G1 X6.55 Y5.45 E0.1\n\
+         G1 X6.55 Y6.55 E0.1\n\
+         G1 X5.45 Y6.55 E0.1\n\
+         G1 X5.45 Y5.45 E0.1\n\
+         M204 S10000\nG17\n\
+         G3 Z{hop} I-1.216 J.05 P1 F60000\n\
+         G1 X5.0 Y5.0 Z{hop}\n\
+         G1 Z{plane}\n\
+         G1 E.6 F1800\n\
+         ;TYPE:External perimeter\n\
+         G1 F6316\n\
+         G1 X5.0 Y5.0 E0.1\n\
+         G1 X7.0 Y5.0 E0.1\n\
+         G1 X7.0 Y7.0 E0.1\n\
+         G1 X5.0 Y7.0 E0.1\n\
+         G1 X5.0 Y5.0 E0.1\n\
+         ;TYPE:Solid infill\n\
+         G1 F6316\n\
+         G1 X5.9 Y5.45 E0.1\n\
+         {filler_tail}",
+        hop = plane + 0.4,
+    )
+}
+
+fn tree_plate(filler_tail: &str) -> String {
+    let mut text = String::from(
+        "; layer_height = 0.2\n\
+         ; filament_max_volumetric_speed = 500\n\
+         ; retraction_length = 0.8\n\
+         ; retraction_minimum_travel = 1\n\
+         M83\n",
+    );
+    for plane in [0.2, 0.4, 0.6, 0.8, 1.0] {
+        text.push_str(&tree_wall(plane, filler_tail));
+    }
+    text
+}
+
+/// The loops are reordered by height, so the outer wall is written first and
+/// its hop runs straight after the head's — two full revolutions over the
+/// spot the slicer lifted off of once. On the user's slice that spot was a
+/// support tree, and the sweep over its top knocked a double tree off the
+/// plate. A hop that ends at a height the nozzle already stands at is dropped
+/// here; its `F` is kept, because the travel behind it names none.
+#[test]
+fn a_reorder_writes_one_spiral_hop_not_two() {
+    let source = tree_plate("G1 X6.2 Y5.45 E0.1\n");
+    let out = run(&source, &Config::default());
+    // The head's hop runs on every layer. The second one only where the
+    // slicer's own order survives — the bed layer and the capped top layer
+    // write the loops in input order, so that hop lifts the nozzle exactly
+    // where the slicer put it. Every other layer reorders and must not
+    // replay it on top of the first.
+    assert_eq!(out.matches("I-1.201 J-.196").count(), 5, "{out}");
+    assert_eq!(out.matches("I-1.216 J.05").count(), 2, "{out}");
+}
+
+/// A held loop's travel was read under the hop's rate and is written after
+/// every other region has overwritten it: measured on a user's slice, a
+/// 121.7 mm travel came out at F14301 against the F60000 the slicer metered
+/// it at. The rate is restored from the region's own head.
+#[test]
+fn a_held_loop_s_travel_runs_at_the_rate_the_hop_set() {
+    let source = tree_plate("G1 X6.2 Y5.45 E0.1\n");
+    let out = run(&source, &Config::default());
+    // One held write per layer that raises: the climb at 0.4 and the settled
+    // 0.6 and 0.8. The bed layer never raises and the top layer caps.
+    assert_eq!(
+        out.matches("G1 F60000 ; corbel brick resume").count(),
+        3,
+        "{out}"
+    );
+    assert!(!out.contains("G1 F6316 ; corbel brick resume"), "{out}");
+}
+
+/// A held loop written beside a region that ends within a millimetre of it
+/// is no journey: the slicer's own minimum travel says a pull is not worth
+/// it, and each pull costs a stop, a gap where the bead restarts and a bite
+/// out of the filament. Measured on a user's slice, 252 of 422 held writes
+/// travelled under 1 mm and pulled for it.
+///
+/// The wall stands alone — no support beside it, so the only travel the
+/// reorder leaves behind is the held loop's own. The internal loop is the
+/// raised one, reached at 0.45, 0.45, so the filler's last bead decides how
+/// far the held write really is from it.
+fn walled_plate(tail: &str) -> String {
+    let mut text = String::from(
+        "; layer_height = 0.2\n\
+         ; retraction_length = 0.8\n\
+         ; retraction_minimum_travel = 1\n\
+         M83\n",
+    );
+    for plane in [0.2, 0.4, 0.6, 0.8, 1.0] {
+        text.push_str(&format!(
+            ";LAYER_CHANGE\nG1 Z{plane} F600\n\
+             ;TYPE:Internal perimeter\n\
+             G1 F6316\n\
+             G1 X0.45 Y0.45 F9000\n\
+             G1 X0.45 Y0.45 E0.1\n\
+             G1 X0.9 Y0.45 E0.1\n\
+             G1 X0.9 Y0.9 E0.1\n\
+             G1 X0.45 Y0.9 E0.1\n\
+             G1 X0.45 Y0.45 E0.1\n\
+             ;TYPE:External perimeter\n\
+             G1 F6316\n\
+             G1 X0.0 Y0.0 F9000\n\
+             G1 X0.0 Y0.0 E0.1\n\
+             G1 X1.0 Y0.0 E0.1\n\
+             G1 X1.0 Y1.0 E0.1\n\
+             G1 X0.0 Y1.0 E0.1\n\
+             G1 X0.0 Y0.0 E0.1\n\
+             ;TYPE:Solid infill\n\
+             G1 F6316\n\
+             G1 X0.9 Y0.45 E0.1\n{tail}",
+        ));
+    }
+    text
+}
+
+#[test]
+fn a_held_loop_reached_within_a_millimetre_is_not_retracted_for() {
+    // The filler ends 0.21 mm from the held inner loop and 0.42 mm from the
+    // outer one, so neither the held travel nor the reordered outer loop's
+    // own travel crosses the file's 1 mm minimum.
+    let source = walled_plate("G1 X0.3 Y0.3 E0.1\n");
+    let out = run(&source, &Config::default());
+    assert!(!out.contains("corbel brick retract"), "{out}");
+}
+
+/// The mirror case: the filler ends across the plate from the held loop, and
+/// that travel is exactly what a pull exists for.
+#[test]
+fn a_held_loop_reached_across_the_plate_is_retracted_for() {
+    let source = walled_plate("G1 X20.0 Y5.0 E0.1\n");
+    let out = run(&source, &Config::default());
+    // Three held writes, and one more for the outer loop's own travel on the
+    // first raised layer — before any held write has put the nozzle at the
+    // wall, so the reorder leaves that travel across the plate too. All four
+    // are pulls the reordering made necessary.
+    assert_eq!(out.matches("corbel brick retract").count(), 4, "{out}");
+}
+
+/// The same plate with no `retraction_minimum_travel` at all. The file names
+/// no threshold, so a pull is never declared worth one — the replay and emit
+/// paths stand down for it, and the held write has to too, or a journey the
+/// slicer said nothing about is paid for with a stop it never planned.
+#[test]
+fn a_held_loop_reached_across_the_plate_is_not_retracted_without_a_stated_minimum() {
+    let source =
+        walled_plate("G1 X20.0 Y5.0 E0.1\n").replace("; retraction_minimum_travel = 1\n", "");
+    let out = run(&source, &Config::default());
+    assert!(!out.contains("corbel brick retract"), "{out}");
+}
+
+/// One wall whose beads all run at a single stated rate, with the raised
+/// loop made of a long edge and short corner beads at the same flow per mm.
+fn cornered_wall(plane: f64) -> String {
+    format!(
+        ";LAYER_CHANGE\nG1 Z{plane} F600\n\
+         ;TYPE:External perimeter\n\
+         G1 F13265\n\
+         G1 X0.45 Y0.45 E0.01\n\
+         G1 X2.05 Y0.45 E0.3\n\
+         G1 X2.05 Y0.75 E0.057\n\
+         G1 X1.75 Y0.75 E0.057\n\
+         G1 X1.75 Y1.05 E0.057\n\
+         G1 X1.45 Y1.05 E0.057\n\
+         G1 X1.45 Y2.05 E0.188\n\
+         G1 X0.45 Y2.05 E0.188\n\
+         G1 X0.45 Y0.45 E0.301\n\
+         ;TYPE:Perimeter\n\
+         G1 X0.9 Y0.9 F13265\n\
+         G1 X0.9 Y0.9 E0.01\n\
+         G1 X1.75 Y0.9 E0.3\n\
+         G1 X1.75 Y1.0 E0.035\n\
+         G1 X1.65 Y1.0 E0.035\n\
+         G1 X1.65 Y1.1 E0.035\n\
+         G1 X1.55 Y1.1 E0.035\n\
+         G1 X1.55 Y1.75 E0.2275\n\
+         G1 X0.9 Y1.75 E0.2275\n\
+         G1 X0.9 Y0.9 E0.2975\n",
+    )
+}
+
+fn cornered_plate() -> String {
+    let mut text = String::from("; layer_height = 0.2\nM83\n");
+    for plane in [0.2, 0.4, 0.6, 0.8, 1.0] {
+        text.push_str(&cornered_wall(plane));
+    }
+    text
+}
+
+/// The melt ceiling is the file's own fastest bead, and a climbing column
+/// asks more than that on EVERY bead of it — a corner segment no less than
+/// the long edge beside it. Skipping short beads for a rounding guard left
+/// them at the stated rate while their neighbours throttled, so the wall
+/// flipped between the two rates at every corner: measured on a user's box,
+/// F10565 on the edge against F13265 on its own corner beads. The short bead
+/// takes the same throttle as the bead it follows.
+#[test]
+fn a_short_corner_bead_is_slowed_like_the_edge_beside_it() {
+    let source = cornered_plate();
+    let out = run(&source, &Config::default());
+    assert_eq!(out.matches("X1.75 Y1.0 E").count(), 5, "{out}");
+    // Both climb layers meter the corner beads for the extra filament, at
+    // the same slowed rate the long edge beside them takes — never restored
+    // to the wall's own rate, which is how the speed used to flip at every
+    // corner of the print.
+    assert_eq!(
+        out.matches("G1 X1.75 Y1.0 E0.04484 F1044").count(),
+        2,
+        "{out}"
+    );
+    assert!(!out.contains("F13265.000"), "{out}");
+    // The long edge is still throttled — the positive control.
+    assert_eq!(out.matches("G1 X1.75 Y0.9 E0.3843").count(), 2, "{out}");
+}
+
+/// A wall whose inner loop runs a fifth of a millimetre from a support bead,
+/// the shape of an object printed beside a tree support.
+fn wall_beside_support(plane: f64) -> String {
+    format!(
+        ";LAYER_CHANGE\nG1 Z{plane} F600\n\
+         ;TYPE:Support\n\
+         G1 X5.3 Y5.3 E0.1\n\
+         ;TYPE:Perimeter\n\
+         G1 X5.45 Y5.45 F9000\n\
+         G1 X5.45 Y5.45 E0.1\n\
+         G1 X6.55 Y5.45 E0.1\n\
+         G1 X6.55 Y6.55 E0.1\n\
+         G1 X5.45 Y6.55 E0.1\n\
+         G1 X5.45 Y5.45 E0.1\n\
+         G1 X5.0 Y5.0 F9000\n\
+         G1 X5.0 Y5.0 E0.1\n\
+         G1 X7.0 Y5.0 E0.1\n\
+         G1 X7.0 Y7.0 E0.1\n\
+         G1 X5.0 Y7.0 E0.1\n\
+         G1 X5.0 Y5.0 E0.1\n",
+    )
+}
+
+fn support_plate() -> String {
+    let mut text = String::from("; layer_height = 0.2\nM83\n");
+    for plane in [0.2, 0.4, 0.6, 0.8, 1.0] {
+        text.push_str(&wall_beside_support(plane));
+    }
+    text
+}
+
+/// Support is one bead wide and printed to be broken off, so a wall raised
+/// beside it scrapes it — measured on a user's tree-support slice, the raised
+/// wall beside a tree tip knocked the tree off the plate at layer 248. The
+/// raise staggers seams between walls, and there is no seam to stagger beside
+/// support, so the wall is held flat there.
+#[test]
+fn a_wall_beside_support_is_never_raised() {
+    let source = support_plate();
+    let out = run(&source, &Config::default());
+    assert!(
+        !out.contains("corbel brick raised"),
+        "a wall beside support was raised:\n{out}"
+    );
+}
+
+/// A wall whose outer loop is reached by a travel that names no `Z`, because
+/// the slicer left the nozzle on the plane between the inner and outer loops
+/// — a Bambu plate writes exactly this. Reordered, the outer loop is written
+/// first from the spiral hop over a support bead, so that travel now runs
+/// from the support bead to the outer loop, and the ride that carries the
+/// descent would drag the nozzle down onto the support at plane height.
+/// Measured on a user's tree-support slice: the outer wall's travel crossed
+/// a tree tip 0.5 mm from its edge at plane height and knocked a double tree
+/// off the plate at layer 248. The travel has to stay at the hop's height and
+/// descend on its own at the destination.
+fn outer_travel_over_support(plane: f64) -> String {
+    let hop = plane + 0.4;
+    format!(
+        ";LAYER_CHANGE\nG1 Z{plane} F600\n\
+         ;TYPE:Support\n\
+         G1 X10.0 Y5.0 F9000\n\
+         G1 X10.4 Y5.0 E0.1\n\
+         G1 E-.03 F1800\n\
+         M204 S10000\nG17\n\
+         G3 Z{hop} I-1.201 J-.196 P1 F60000\n\
+         G1 X5.45 Y5.45 Z{hop}\n\
+         G1 Z{plane}\n\
+         G1 E.6 F1800\n\
+         ;TYPE:Internal perimeter\n\
+         G1 F6316\n\
+         G1 X5.45 Y5.45 E0.1\n\
+         G1 X6.55 Y5.45 E0.1\n\
+         G1 X6.55 Y6.55 E0.1\n\
+         G1 X5.45 Y6.55 E0.1\n\
+         G1 X5.45 Y5.45 E0.1\n\
+         M204 S250\n\
+         G1 X5.0 Y5.0 F60000\n\
+         ;TYPE:External perimeter\n\
+         G1 F6316\n\
+         G1 X5.0 Y5.0 E0.1\n\
+         G1 X7.0 Y5.0 E0.1\n\
+         G1 X7.0 Y7.0 E0.1\n\
+         G1 X5.0 Y7.0 E0.1\n\
+         G1 X5.0 Y5.0 E0.1\n\
+         ;TYPE:Solid infill\n\
+         G1 F6316\n\
+         G1 X5.9 Y5.45 E0.1\n\
+         G1 X5.9 Y5.45 E0.1\n",
+    )
+}
+
+fn outer_travel_over_support_plate() -> String {
+    let mut text = String::from("; layer_height = 0.2\nM83\n");
+    for plane in [0.2, 0.4, 0.6, 0.8, 1.0] {
+        text.push_str(&outer_travel_over_support(plane));
+    }
+    text
+}
+
+/// The travel that reaches the reordered outer loop crosses the support bead,
+/// so its descent must not ride it: the ride would drop the nozzle onto the
+/// support at plane height. It stays at the hop's height and the plane comes
+/// back as a move of its own at the wall.
+#[test]
+fn a_travel_crossing_support_is_not_ridden_down() {
+    let source = outer_travel_over_support_plate();
+    let out = run(&source, &Config::default());
+    // The outer loop's travel never carries a `; corbel brick reset` stamp:
+    // it stays at the hop's height the whole way over the support bead.
+    assert!(
+        !out.contains("X5.000 Y5.000 F60000 Z"),
+        "the descent rode the travel over support:\n{out}"
+    );
+    // The descent still arrives, as a move of its own, on every layer that
+    // raises the inner loop and so reorders the outer one first.
+    for plane in ["0.400", "0.600", "0.800"] {
+        assert_eq!(
+            out.matches(&format!("G1 Z{plane} F600 ; corbel brick reset"))
+                .count(),
+            1,
+            "a descent of its own follows the travel at Z{plane}:\n{out}"
+        );
+    }
+}
+
+/// A reordered loop's travel is a journey, and the acceleration the slicer
+/// put in front of its short hop — `M204 S250`, a tenth of the travel
+/// acceleration — was metered for a fraction of a millimetre. Left there it
+/// crawls the whole journey; measured on a user's tree-support slice, the
+/// outer wall written first ran 37 to 80 mm at it against the F60000 the
+/// slicer metered it at. It is held back and put out again after the travel,
+/// so the journey runs at the file's own acceleration and the bead still
+/// gets the approach the slicer wrote for it.
+#[test]
+fn a_reordered_travel_runs_at_the_file_s_acceleration_not_the_approach_s() {
+    let source = outer_travel_over_support_plate();
+    let out = run(&source, &Config::default());
+    // The approach acceleration follows the travel on every layer that
+    // reorders the outer wall first, so the journey runs at the file's own
+    // acceleration instead of crawling at a tenth of it.
+    assert_eq!(
+        out.matches("G1 X5.000 Y5.000 F60000\nM204 S250").count(),
+        3,
+        "the approach acceleration must follow the journey on the raised layers:\n{out}"
+    );
+    // And it is never dropped: five layers, five M204 S250. The two layers
+    // that keep the slicer's order keep it in front of the travel, where the
+    // slicer put it.
+    assert_eq!(
+        out.matches("M204 S250").count(),
+        5,
+        "the approach acceleration was dropped:\n{out}"
     );
 }
