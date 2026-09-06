@@ -4423,6 +4423,128 @@ fn an_owed_prime_is_given_back_at_the_bead_not_the_wipe() {
     );
 }
 
+/// A tool change parks the old nozzle and primes the new one, so the charge
+/// the old tool left the model in says nothing about the one about to print.
+/// A leftover `withdrawn` reads the new tool as empty when it is full, and
+/// its first displaced travel then runs primed — the stringing the pull
+/// exists to stop. Retraction settings are per slot too, and the change
+/// selects the new tool's.
+#[test]
+fn a_tool_change_rebases_the_nozzle_charge_and_retraction() {
+    let survey = Survey::of(
+        "; layer_height = 0.2\n; retraction_length = 0.4,1.2\n\
+         ; retraction_minimum_travel = 0.5,2\nM83\n",
+    );
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.withdrawn = 0.8;
+    pass.owing = Some(0.4);
+    pass.debt = 0.2;
+    pass.stopped = Some(0.4);
+    pass.feed("T1", b"T1").unwrap();
+
+    assert_eq!(pass.withdrawn, 0.0);
+    assert!(pass.owing.is_none());
+    assert_eq!(pass.debt, 0.0);
+    assert!(pass.stopped.is_none());
+    assert_eq!(pass.tool, 1);
+    assert_eq!(pass.retract_charge, Some(1.2));
+    assert_eq!(pass.hop_travel, Some(2.0));
+}
+
+/// `replay` must give a pull back only at an extrusion, exactly as `emit`
+/// does: a wipe names an `E` and is a move, but it pulls filament back, and
+/// a prime deposited on it is a dot at a point no bead starts from.
+#[test]
+fn replay_gives_an_owed_prime_back_at_the_bead_not_the_wipe() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.owing = Some(0.8);
+    let start = pass.arena.len();
+    pass.arena.extend_from_slice(b"G1 X0.0 Y0.0 E-0.8");
+    let end = pass.arena.len();
+    pass.buffer.push(Buffered {
+        start,
+        end,
+        e_span: None,
+        e: Some(-0.8),
+        delta: Some(-0.8),
+        z: None,
+        f: None,
+        xy: Some((0.0, 0.0)),
+        places: true,
+        at: (0.0, 0.0),
+        arc: None,
+        curved: false,
+        extrudes: false,
+        steers: true,
+        positions: true,
+        carries: false,
+        absolute: false,
+        resets_origin: false,
+        width: None,
+    });
+    pass.replay(0, 1.0, &[None]).unwrap();
+
+    let owing = pass.owing;
+    drop(pass);
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("corbel brick prime"), "{out}");
+    assert!(owing.is_some(), "the pull was repaid into the wipe");
+}
+
+/// A raised bead is written with `delta * factor` of filament, and the
+/// charge model has to book the same figure or it thinks the nozzle is still
+/// empty when the bead has refilled it. A bead that names no `X` or `Y` — a
+/// full-circle arc — skips the dry-bead fill, so the scaled amount is the
+/// only bookkeeping there is.
+#[test]
+fn replay_books_the_filament_it_actually_writes() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.withdrawn = 0.8;
+    let start = pass.arena.len();
+    pass.arena.extend_from_slice(b"G2 I5.0 J0.0 E0.5");
+    let end = pass.arena.len();
+    pass.buffer.push(Buffered {
+        start,
+        end,
+        e_span: None,
+        e: Some(0.5),
+        delta: Some(0.5),
+        z: None,
+        f: None,
+        xy: None,
+        places: false,
+        at: (10.0, 0.0),
+        arc: Some(crate::geometry::Arc {
+            i: 5.0,
+            j: 0.0,
+            clockwise: false,
+        }),
+        curved: true,
+        extrudes: true,
+        steers: false,
+        positions: false,
+        carries: false,
+        absolute: false,
+        resets_origin: false,
+        width: None,
+    });
+    pass.replay(0, 1.5, &[None]).unwrap();
+
+    // 0.5 mm of bead at factor 1.5 refills the nozzle by 0.75 mm, leaving
+    // only 0.05 of the original 0.8 pulled back.
+    assert!((pass.withdrawn - 0.05).abs() < 1e-9, "{}", pass.withdrawn);
+}
+
 /// One wall whose beads all run at a single stated rate, with the raised
 /// loop made of a long edge and short corner beads at the same flow per mm.
 fn cornered_wall(plane: f64) -> String {

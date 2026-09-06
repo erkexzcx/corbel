@@ -984,8 +984,8 @@ impl<'a, W: Write> Pass<'a, W> {
             floor: None,
             nozzle_z: None,
             z_feedrate: survey.z_feedrate.unwrap_or(FALLBACK_Z_FEEDRATE),
-            hop_travel: survey.hop_travel,
-            retract_charge: survey.retract_length,
+            hop_travel: survey.hop_at(0),
+            retract_charge: survey.retract_at(0),
             feedrate: None,
             wanted_feed: None,
             melt_rate: survey.melt_at(0),
@@ -1047,6 +1047,18 @@ impl<'a, W: Write> Pass<'a, W> {
             }
             self.tool = tool;
             self.melt_rate = self.survey.melt_at(tool);
+            self.hop_travel = self.survey.hop_at(tool);
+            self.retract_charge = self.survey.retract_at(tool);
+            // The change parks the old nozzle and primes the new one, so
+            // nothing this pass believes about the old tool's charge describes
+            // the one about to print. A leftover `withdrawn` reads the new
+            // tool as empty when it is full, and the retraction gate then lets
+            // its first displaced travel run primed — the exact stringing the
+            // pull exists to stop.
+            self.withdrawn = 0.0;
+            self.owing = None;
+            self.debt = 0.0;
+            self.stopped = None;
         }
         if is_a_width(line) {
             let raw = line.origin();
@@ -2781,7 +2793,13 @@ impl<'a, W: Write> Pass<'a, W> {
         // to answer. Only ever where the nozzle is in fact full, so a file
         // whose retraction is still where the slicer put it is untouched, and
         // the amount is the prime's own, so the filament balances.
-        if let Some(charge) = self.owing.filter(|_| buffered.delta.is_some()) {
+        // Only ever at an extrusion: a wipe and a retraction also name an
+        // `E`, but a prime deposited on one is a dot at a point no bead
+        // starts from — the same gate `emit` holds.
+        if let Some(charge) = self
+            .owing
+            .filter(|_| buffered.delta.is_some_and(|delta| delta > 0.0))
+        {
             self.owing = None;
             self.unprime(charge)?;
         }
@@ -2845,6 +2863,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // for a path nothing drew. A line naming neither coordinate is the one
         // case `Line::write_moved` refuses.
         let to = moved[index].filter(|_| buffered.places);
+        let ratio = to.map_or(1.0, |moved| moved.ratio);
         // Only a bead melts anything, so only a bead carries a rate of this
         // pass's own: a `G92`, a travel, a wipe and a retraction all keep what
         // the slicer gave them. The rate goes ON the bead's line, whether or
@@ -2853,7 +2872,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // — and only where it differs from what the line would otherwise run
         // at, so a file with melt to spare comes through byte for byte.
         let needed = buffered.delta.filter(|delta| *delta > 0.0).and_then(|_| {
-            self.metered_rate(index, factor * to.map_or(1.0, |moved| moved.ratio), moved)
+            self.metered_rate(index, factor * ratio, moved)
                 .or(buffered.f)
                 .or(self.wanted_feed)
         });
@@ -2871,10 +2890,14 @@ impl<'a, W: Write> Pass<'a, W> {
             // A wipe pulls back along a path, so most of a retraction is
             // named on a line that also names a coordinate. Reading only the
             // bare ones sees 0.15 mm of a 3.00 mm pull and retracts again.
+            // The amount booked is what is actually written — `delta` scaled
+            // by the flow factor and the move's own ratio — so the model does
+            // not think a raised bead left the nozzle empty when it refilled
+            // it, and then skip the pull a reordered travel needs.
             if buffered.places {
-                self.withdrawn = (self.withdrawn - delta).max(0.0);
+                self.withdrawn = (self.withdrawn - delta * factor * ratio).max(0.0);
             } else {
-                self.withdrawn = (self.withdrawn - delta).max(0.0);
+                self.withdrawn = (self.withdrawn - delta * factor * ratio).max(0.0);
                 if delta < 0.0 {
                     self.retract_feed = buffered.f.or(self.retract_feed);
                 }
@@ -2898,7 +2921,7 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(value) = buffered.e.filter(|_| buffered.resets_origin) {
             self.extruder.advance_origin(value);
         }
-        let factor = factor * to.map_or(1.0, |moved| moved.ratio);
+        let factor = factor * ratio;
         if let Some(delta) = buffered.delta.filter(|delta| *delta > 0.0) {
             self.filament += delta * factor;
         }

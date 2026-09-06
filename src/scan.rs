@@ -161,12 +161,16 @@ pub struct Survey {
     pub nozzle: Option<f64>,
     /// Slowest feedrate the file itself uses to move Z alone, in mm/min.
     pub z_feedrate: Option<f64>,
-    /// Shortest travel the slicer says it retracts for, in mm. Reordering can
-    /// turn a hop the slicer left open into a journey, and this is the file's
-    /// own word on how far is far enough to be worth closing.
-    pub hop_travel: Option<f64>,
-    /// How much filament the slicer pulls back for a travel, in mm.
-    pub retract_length: Option<f64>,
+    /// Shortest travel the slicer says it retracts for, in mm, per filament
+    /// slot. Reordering can turn a hop the slicer left open into a journey,
+    /// and this is the file's own word on how far is far enough to be worth
+    /// closing — per slot, because the tool change that selects a filament
+    /// selects its retraction, and a plate printing two materials retracts
+    /// them apart.
+    pub hop_travel: Vec<Option<f64>>,
+    /// How much filament the slicer pulls back for a travel, in mm, per
+    /// filament slot.
+    pub retract_length: Vec<Option<f64>>,
     /// The fastest each filament slot is asked to melt, in mm of filament a
     /// second, indexed by the tool that selects it.
     ///
@@ -330,6 +334,30 @@ impl Survey {
         })
     }
 
+    /// How far `tool`'s travels have to run before the file retracts for
+    /// them, with the same single-slot fallback as [`melt_at`](Self::melt_at).
+    pub fn hop_at(&self, tool: usize) -> Option<f64> {
+        self.hop_travel.get(tool).copied().flatten().or_else(|| {
+            match self.hop_travel.iter().flatten().count() {
+                1 => self.hop_travel.iter().flatten().copied().next(),
+                _ => None,
+            }
+        })
+    }
+
+    /// How much filament `tool` pulls back for a travel, with the same
+    /// single-slot fallback as [`melt_at`](Self::melt_at).
+    pub fn retract_at(&self, tool: usize) -> Option<f64> {
+        self.retract_length
+            .get(tool)
+            .copied()
+            .flatten()
+            .or_else(|| match self.retract_length.iter().flatten().count() {
+                1 => self.retract_length.iter().flatten().copied().next(),
+                _ => None,
+            })
+    }
+
     /// Where `layer`'s walls have nothing above them, or `None` where the file
     /// gave the survey no way to tell.
     pub fn uncovered(&self, layer: usize) -> Option<&Cells> {
@@ -418,8 +446,8 @@ struct Scan {
     /// one can stand in for a layer height the file never states.
     z_steps: Vec<(i64, usize)>,
     z_feedrate: Option<f64>,
-    hop_travel: Option<f64>,
-    retract_length: Option<f64>,
+    hop_travel: Vec<Option<f64>>,
+    retract_length: Vec<Option<f64>>,
     /// The rate every move is read at, since `F` is modal.
     feed: Option<f64>,
     /// Peak melt per tool, and the tool in force, since a file may print more
@@ -595,19 +623,28 @@ impl Scan {
                 } else if is_wall_width(key) {
                     self.wall_width.get_or_insert_with(|| value.to_owned());
                 } else if key.eq_ignore_ascii_case("retraction_minimum_travel") {
-                    if let Ok(far) = value.split(',').next().unwrap_or("").trim().parse::<f64>()
-                        && (0.0..1000.0).contains(&far)
-                    {
-                        self.hop_travel.get_or_insert(far);
+                    // Every slot, in order, like the melt ceiling: the tool
+                    // change that picks a filament picks its retraction too.
+                    if self.hop_travel.is_empty() {
+                        self.hop_travel = value
+                            .split(',')
+                            .map(|piece| match piece.trim().parse::<f64>() {
+                                Ok(far) if (0.0..1000.0).contains(&far) => Some(far),
+                                _ => None,
+                            })
+                            .collect();
                     }
                 } else if key.eq_ignore_ascii_case("retraction_length")
                     || key.eq_ignore_ascii_case("retract_length")
                 {
-                    if let Ok(pull) = value.split(',').next().unwrap_or("").trim().parse::<f64>()
-                        && pull > 0.0
-                        && pull < 20.0
-                    {
-                        self.retract_length.get_or_insert(pull);
+                    if self.retract_length.is_empty() {
+                        self.retract_length = value
+                            .split(',')
+                            .map(|piece| match piece.trim().parse::<f64>() {
+                                Ok(pull) if pull > 0.0 && pull < 20.0 => Some(pull),
+                                _ => None,
+                            })
+                            .collect();
                     }
                 } else if key.eq_ignore_ascii_case("filament_max_volumetric_speed") {
                     // Every slot, in order: the tool selects which one is in
@@ -1144,6 +1181,9 @@ impl Scan {
             .or(measured.filter(is_a_height));
         let layer_heights = self.varying_heights();
         let nozzle = width(self.nozzle.as_deref(), None);
+        // Taken before the moves below: it borrows `self`, and the retraction
+        // vectors are moved out of it field by field.
+        let melt_rate = self.melt_ceiling();
 
         Survey {
             layers: layers.max(1),
@@ -1158,7 +1198,7 @@ impl Scan {
             z_feedrate: self.z_feedrate,
             hop_travel: self.hop_travel,
             retract_length: self.retract_length,
-            melt_rate: self.melt_ceiling(),
+            melt_rate,
             bricked: self.bricked,
             contoured: self.contoured,
             arc_extrusions: self.arc_extrusions,
@@ -1558,19 +1598,19 @@ G1 X2 Y0 E1
     #[test]
     fn a_minimum_travel_that_is_not_a_length_is_ignored() {
         assert_eq!(
-            Survey::of("; retraction_minimum_travel = nan\nG1 Z0.2\n").hop_travel,
+            Survey::of("; retraction_minimum_travel = nan\nG1 Z0.2\n").hop_at(0),
             None
         );
         assert_eq!(
-            Survey::of("; retraction_minimum_travel = -1\nG1 Z0.2\n").hop_travel,
+            Survey::of("; retraction_minimum_travel = -1\nG1 Z0.2\n").hop_at(0),
             None
         );
         assert_eq!(
-            Survey::of("; retraction_minimum_travel = 1e9\nG1 Z0.2\n").hop_travel,
+            Survey::of("; retraction_minimum_travel = 1e9\nG1 Z0.2\n").hop_at(0),
             None
         );
         let survey = Survey::of("; retraction_minimum_travel = 1.5\nG1 Z0.2\n");
-        assert_eq!(survey.hop_travel, Some(1.5));
+        assert_eq!(survey.hop_at(0), Some(1.5));
     }
 
     #[test]
@@ -2121,6 +2161,30 @@ G1 X2 Y0 E1
             "{:?}",
             survey.melt_at(1)
         );
+    }
+
+    /// Retraction settings are per filament slot, like the melt ceiling: a
+    /// plate printing two materials retracts them apart, and a pull sized by
+    /// the first slot leaves the second tool's travels primed.
+    #[test]
+    fn each_tool_carries_its_own_retraction() {
+        let survey = Survey::of(
+            "; retraction_length = 0.4,1.2\n; retraction_minimum_travel = 0.5,2\nG1 Z0.2\n",
+        );
+        assert_eq!(survey.retract_at(0), Some(0.4));
+        assert_eq!(survey.retract_at(1), Some(1.2));
+        assert_eq!(survey.hop_at(0), Some(0.5));
+        assert_eq!(survey.hop_at(1), Some(2.0));
+    }
+
+    /// A single slot stands in for every tool, exactly as the melt ceiling's
+    /// fallback does: a file that states one retraction prints it from every
+    /// tool it selects.
+    #[test]
+    fn a_single_retraction_stands_in_for_every_tool() {
+        let survey = Survey::of("; retraction_length = 0.8\nG1 Z0.2\n");
+        assert_eq!(survey.retract_at(0), Some(0.8));
+        assert_eq!(survey.retract_at(3), Some(0.8));
     }
 
     /// A slicer brackets a tool change with codes of its own — Bambu uses

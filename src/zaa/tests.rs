@@ -208,6 +208,61 @@ fn a_shallow_surface_is_followed_across_its_own_layer() {
     assert_eq!(out.stats.layers, 4, "the bed and the top stay flat");
 }
 
+/// A followed bead is rewritten as fresh `G1 X..Y..Z..E..` moves that name
+/// no rate of their own. The bead's own `F` has to be carried onto the
+/// first of them, or the whole bead runs at whatever the travel before it
+/// left in the stream — a surface laid at the hop's rate is starved exactly
+/// where the transform is meant to fill it.
+#[test]
+fn a_followed_bead_runs_at_its_own_rate_not_the_travel_before_it() {
+    // The same strip as `surface`, but each bead states its own F4500 where
+    // the travel that reaches it runs at F9000.
+    fn surface_at(text: &mut String, half: f64, run: f64, label: &str) {
+        text.push_str(label);
+        let (inner, outer) = (half - run + 0.35, half - 0.3);
+        for step in 0..5 {
+            let x = inner + (outer - inner) * step as f64 / 4.0;
+            let (from, to) = match step % 2 {
+                0 => (-ALONG / 2.0, ALONG / 2.0),
+                _ => (ALONG / 2.0, -ALONG / 2.0),
+            };
+            text.push_str(&format!("G1 X{x:.3} Y{from:.3} F9000\n"));
+            text.push_str(&format!("G1 X{x:.3} Y{to:.3} E{ALONG_E:.5} F4500\n"));
+        }
+        for (step, y) in [(0, -8.0), (1, 8.0)] {
+            let (from, to) = match step % 2 {
+                0 => (outer, inner),
+                _ => (inner, outer),
+            };
+            text.push_str(&format!("G1 X{from:.3} Y{y:.3} F9000\n"));
+            text.push_str(&format!("G1 X{to:.3} Y{y:.3} E0.10000 F4500\n"));
+        }
+    }
+
+    let mut text = String::from("; layer_height = 0.2\nM83\nG1 Z0.200 F600\n");
+    for layer in 0..6 {
+        let half = HALF - RUN * layer as f64;
+        text.push_str(";LAYER_CHANGE\n");
+        text.push_str(&format!("G1 Z{:.3} F600\n", HEIGHT * (layer + 1) as f64));
+        ring(&mut text, half);
+        surface_at(&mut text, half, RUN, ";TYPE:Top surface\n");
+    }
+
+    let out = apply(&text, &config());
+    let first = steps(&out.gcode)
+        .into_iter()
+        .find(|step| {
+            step.layer == 3 && step.feature == Feature::TopSurface && step.raw.contains("surface")
+        })
+        .expect("a followed surface was written");
+    assert_eq!(
+        Line::parse(&first.raw).f,
+        Some(4500.0),
+        "the bead's own rate was dropped:\n{}",
+        first.raw
+    );
+}
+
 /// A followed bead is metered when it is written, which is after the next
 /// bead arrives — and a `T` between the two must not let that one-and-only
 /// throttle read the arriving tool's ceiling. The bead was read under the

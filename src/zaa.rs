@@ -1336,11 +1336,14 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             let value = self.extruder.advance(e);
             // A piece metered for a thicker gap carries more filament over the
             // same ground, so it is given the time to melt it. `F` is modal,
-            // so only a change is written.
-            let slowed = self
-                .slowed(asked, e, spanned)
-                .filter(|rate| self.feedrate != Some(*rate));
-            if let Some(rate) = slowed {
+            // so only a change is written — in either direction: the plan's
+            // freshly written moves name no rate of their own, so the bead's
+            // own rate has to be carried onto the first piece whenever the
+            // stream before it was left at another.
+            let slowed = self.slowed(asked, e, spanned);
+            let carry = slowed.or(asked);
+            let on_the_move = carry.filter(|rate| self.feedrate != Some(*rate));
+            if let Some(rate) = on_the_move {
                 self.feedrate = Some(rate);
             }
             stock += e;
@@ -1360,7 +1363,7 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             write_fixed(out, z, 3)?;
             out.write_all(b" E")?;
             write_fixed(out, value, 5)?;
-            if let Some(rate) = slowed {
+            if let Some(rate) = on_the_move {
                 write!(out, " F{rate}")?;
             }
             if index == 0 {
