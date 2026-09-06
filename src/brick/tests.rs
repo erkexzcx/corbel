@@ -4545,6 +4545,118 @@ fn replay_books_the_filament_it_actually_writes() {
     assert!((pass.withdrawn - 0.05).abs() < 1e-9, "{}", pass.withdrawn);
 }
 
+/// A thin wall tapers with a prime of `E0`: the slicer pulls back for the
+/// travel and then puts back nothing, leaving the nozzle dry on purpose.
+/// `withdrawn` stays where the wipe left it, but the retraction is answered,
+/// so the debt fill must not dump a full prime on the first tapered bead —
+/// measured on a user's plate, two layers of a tapering pair of points
+/// carried 216 such primes.
+#[test]
+fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+
+    let buffer =
+        |pass: &mut Pass<'_, &mut Vec<u8>>, raw: &str, places: bool, delta: f64, at: (f64, f64)| {
+            let start = pass.arena.len();
+            pass.arena.extend_from_slice(raw.as_bytes());
+            let end = pass.arena.len();
+            let index = pass.buffer.len();
+            pass.buffer.push(Buffered {
+                start,
+                end,
+                e_span: None,
+                e: Some(delta),
+                delta: Some(delta),
+                z: None,
+                f: None,
+                xy: places.then_some(at),
+                places,
+                at,
+                arc: None,
+                curved: false,
+                extrudes: places && delta > 0.0,
+                steers: places,
+                positions: places,
+                carries: places,
+                absolute: false,
+                resets_origin: false,
+                width: None,
+            });
+            index
+        };
+
+    // A wipe pulls back, a bare E0 prime answers it with nothing, and the
+    // first tapered bead follows. The bead must not be filled.
+    let wipe = buffer(&mut pass, "G1 X0.0 Y0.0 E-0.8", true, -0.8, (0.0, 0.0));
+    let prime = buffer(&mut pass, "G1 E0.00000", false, 0.0, (0.0, 0.0));
+    let bead = buffer(&mut pass, "G1 X1.0 Y0.0 E0.01", true, 0.01, (1.0, 0.0));
+
+    pass.replay(wipe, 1.0, &[None, None, None]).unwrap();
+    pass.replay(prime, 1.0, &[None, None, None]).unwrap();
+    pass.replay(bead, 1.0, &[None, None, None]).unwrap();
+
+    drop(pass);
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("corbel brick prime"), "{out}");
+}
+
+/// A debt is only settled by a prime when the nozzle is full. If a newer
+/// retraction intervened since the debt was created, the prime belongs to
+/// that retraction and must fire rather than be zeroed into the old debt —
+/// zeroing it would leave the bead after it drawn dry.
+#[test]
+fn a_prime_is_only_settled_when_the_nozzle_is_full() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.debt = 0.8;
+    pass.withdrawn = 0.8;
+
+    let start = pass.arena.len();
+    pass.arena.extend_from_slice(b"G1 E0.8");
+    let end = pass.arena.len();
+    let index = pass.buffer.len();
+    pass.buffer.push(Buffered {
+        start,
+        end,
+        e_span: None,
+        e: Some(0.8),
+        delta: Some(0.8),
+        z: None,
+        f: None,
+        xy: None,
+        places: false,
+        at: (0.0, 0.0),
+        arc: None,
+        curved: false,
+        extrudes: false,
+        steers: false,
+        positions: false,
+        carries: false,
+        absolute: false,
+        resets_origin: false,
+        width: None,
+    });
+    pass.replay(index, 1.0, &[None]).unwrap();
+
+    assert_eq!(
+        pass.debt, 0.8,
+        "the debt was settled into a newer retraction"
+    );
+    assert!(
+        pass.withdrawn.abs() < 1e-9,
+        "the prime refilled the nozzle: {}",
+        pass.withdrawn
+    );
+    assert!(pass.primed, "the prime marked the nozzle primed");
+}
+
 /// One wall whose beads all run at a single stated rate, with the raised
 /// loop made of a long edge and short corner beads at the same flow per mm.
 fn cornered_wall(plane: f64) -> String {
