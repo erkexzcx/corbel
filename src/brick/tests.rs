@@ -4372,6 +4372,57 @@ fn a_held_loop_reached_across_the_plate_is_not_retracted_without_a_stated_minimu
     assert!(!out.contains("corbel brick retract"), "{out}");
 }
 
+/// A travel written straight out — it never reached `replay` — still has to
+/// be pulled for where the reorder left the nozzle. The gate read `draws()`,
+/// which is true for `G0` and `G1` alike, so it could never fire; the travel
+/// is the line that names no `E`.
+#[test]
+fn a_travel_emitted_straight_through_is_retracted_when_the_reorder_grew_it() {
+    let survey = Survey::of(
+        "; layer_height = 0.2\n; retraction_length = 0.8\n; retraction_minimum_travel = 1\nM83\n",
+    );
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    // The reorder left the nozzle at the origin where the input planned to
+    // travel from its own position: the travel ahead, which the slicer metered
+    // as nothing, is now a 20 mm journey with a full nozzle.
+    pass.wrote_at = (0.0, 0.0);
+    pass.at = (20.0, 0.0);
+    pass.was_at = (20.0, 0.0);
+    pass.emit(Line::parse("G1 X20.0 Y0.0 F9000"), 1.0).unwrap();
+
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("corbel brick retract"), "{out}");
+}
+
+/// The prime a travel's pull was owed is given back at the bead after it,
+/// never on the wipe or retraction that precedes it: a wipe names an `E` and
+/// is a move, but it pulls filament back, and a prime deposited on it is a dot
+/// at a point no bead starts from.
+#[test]
+fn an_owed_prime_is_given_back_at_the_bead_not_the_wipe() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    {
+        let mut pass = Pass::new(&mut out, &config, &survey);
+        pass.extruder.set_mode(Code::RelativeE);
+        pass.owing = Some(0.8);
+        pass.emit(Line::parse("G1 X0.0 Y0.0 E-0.8"), 1.0).unwrap();
+        pass.emit(Line::parse("G1 X10.0 Y0.0 E0.5"), 1.0).unwrap();
+    }
+    let out = String::from_utf8(out).unwrap();
+    let wipe = out.find("E-0.8").expect("the wipe is missing");
+    let prime = out
+        .find("corbel brick prime")
+        .expect("the owed prime was never given back");
+    assert!(
+        wipe < prime,
+        "the owed prime was paid into the wipe rather than the bead after it:\n{out}"
+    );
+}
+
 /// One wall whose beads all run at a single stated rate, with the raised
 /// loop made of a long edge and short corner beads at the same flow per mm.
 fn cornered_wall(plane: f64) -> String {

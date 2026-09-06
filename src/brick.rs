@@ -2962,7 +2962,12 @@ impl<'a, W: Write> Pass<'a, W> {
         if line.is_move() && (line.x.is_some() || line.y.is_some()) {
             let grew = (self.at.0 - self.wrote_at.0).hypot(self.at.1 - self.wrote_at.1)
                 - (self.at.0 - self.was_at.0).hypot(self.at.1 - self.was_at.1);
-            if !line.draws()
+            // A travel is the one that names no `E`: a bead, a wipe and a
+            // retraction all do, and a pull taken out of a wipe is a pull the
+            // slicer already made. `is_move` is `G0` and `G1`, so asking
+            // whether the line "draws" says nothing about the travel and left
+            // this gate unable to fire.
+            if line.e.is_none()
                 && self.withdrawn <= 0.0
                 && self.owing.is_none()
                 && self.hop_travel.is_some_and(|far| grew > far)
@@ -2979,8 +2984,13 @@ impl<'a, W: Write> Pass<'a, W> {
             }
         }
         // A pull taken out for a travel is given back here too, for the
-        // lines that never reach `replay`.
-        if let Some(charge) = self.owing.filter(|_| line.e.is_some() && line.draws()) {
+        // lines that never reach `replay` — and only at a bead: a wipe and a
+        // retraction also name an `E`, but a prime deposited on one is a dot
+        // of filament at a point no bead starts from.
+        if let Some(charge) = self
+            .owing
+            .filter(|_| line.draws() && line.e.is_some_and(|e| self.extruder.delta(e) > 0.0))
+        {
             self.owing = None;
             self.unprime(charge)?;
         }

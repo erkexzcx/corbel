@@ -1110,6 +1110,18 @@ impl Extruder {
         }
     }
 
+    /// The filament delta a line's `E` word asks for, without reading it into
+    /// the stream. Used where a pass must decide about a line before observing
+    /// it: repaying a prime on a wipe is a dot of filament at a point no bead
+    /// starts from, and the sign of the delta is what tells the two apart.
+    pub fn delta(&self, value: f64) -> f64 {
+        if self.absolute {
+            value - self.input
+        } else {
+            value
+        }
+    }
+
     /// Reserves `delta` mm of filament and returns the `E` word to emit.
     pub fn advance(&mut self, delta: f64) -> f64 {
         if self.absolute {
