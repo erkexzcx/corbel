@@ -1498,10 +1498,15 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         }
         let index = self.tail.len() - self.tail.iter().rev().position(|h| h.positions)? - 1;
         let carrier = &self.tail[index];
-        // Never ride a move the slicer put above the plane on purpose: pulling
-        // a Z-hop down to printing height would drag the nozzle through what
-        // it was lifted to clear.
-        (carrier.carries && carrier.z.is_none_or(|had| had <= z)).then_some(index)
+        // Never ride a Z-hop the slicer lifted to clear something: pulling it
+        // down to printing height would drag the nozzle through what it was
+        // lifted over. A carrier at or below the plane is the slicer's own
+        // descent to printing height, not a hop, so it can carry a height
+        // below the plane too — the surface there is below the plane by
+        // definition. Refusing it wrote the descent after the slicer's prime
+        // as a `G1 Z` of its own, a dead stop on a primed nozzle.
+        (carrier.carries && carrier.z.is_none_or(|had| had <= z || had <= self.plane()))
+            .then_some(index)
     }
 
     /// Replays a held line with its height set to `z`.

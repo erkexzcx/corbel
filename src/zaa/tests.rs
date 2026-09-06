@@ -567,6 +567,88 @@ fn a_height_change_rides_a_move_rather_than_stopping_the_toolhead() {
     assert!(stops.is_empty(), "{stops:?}");
 }
 
+/// A real slicer retracts, hops, descends back to the plane and primes
+/// before a layer's first bead. Where that bead follows the surface DOWN
+/// below the plane, the descent has to ride the slicer's own descent to
+/// the plane — continuing it lower is still a descent, not a Z-hop dragged
+/// through what it cleared. Writing it after the prime is a dead stop on a
+/// primed nozzle, which is the one thing riding a move exists to avoid.
+#[test]
+fn a_surface_below_the_plane_rides_the_slicers_own_descent() {
+    let mut text = String::from("; layer_height = 0.2\nM83\nG1 Z0.200 F600\n");
+    for layer in 0..6 {
+        let half = HALF - RUN * layer as f64;
+        let z = HEIGHT * (layer + 1) as f64;
+        let inner = half - 0.45;
+        text.push_str(";LAYER_CHANGE\n");
+        text.push_str(&format!("G1 Z{z:.3} F600\n"));
+        // The hidden loop, then the visible wall reached across a retract, a
+        // travel at a hop, a descent back to the plane and a prime — the way
+        // a real slicer's layer change leaves the nozzle. The descent to the
+        // plane is the last thing that moves before the prime and the bead.
+        text.push_str(";TYPE:Perimeter\n");
+        text.push_str(&format!("G1 X{inner:.3} Y{inner:.3} F9000\n"));
+        for (x, y) in [
+            (inner, -inner),
+            (inner, inner),
+            (-inner, inner),
+            (-inner, -inner),
+        ] {
+            text.push_str(&format!("G1 X{x:.3} Y{y:.3} E1.00000\n"));
+        }
+        text.push_str("G1 E-0.04 F1800\n");
+        text.push_str(&format!(
+            "G1 X{:.3} Y{:.3} Z{:.3} F30000\n",
+            -half,
+            -half,
+            z + 0.1
+        ));
+        text.push_str(&format!("G1 Z{z:.3}\n"));
+        text.push_str("G1 E0.8 F1800\n");
+        text.push_str(";TYPE:External perimeter\n");
+        text.push_str(&format!("G1 X{:.3} Y{:.3} E1.00000\n", half, -half));
+        text.push_str(&format!("G1 X{:.3} Y{:.3} E1.00000\n", half, half));
+        text.push_str(&format!("G1 X{:.3} Y{:.3} E1.00000\n", -half, half));
+        text.push_str(&format!("G1 X{:.3} Y{:.3} E1.00000\n", -half, -half));
+        surface(&mut text, half, RUN, ";TYPE:Top surface\n");
+    }
+    let out = apply(&text, &config());
+
+    // The surface still dips below its own plane, so there is a descent to
+    // deliver and the fixture is not quietly doing nothing.
+    let steps = steps(&out.gcode);
+    let plane = plane(3);
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.layer == 3 && step.z < plane - 0.03),
+        "nothing followed the surface down below its plane"
+    );
+
+    // And the descent rides the slicer's own descent to the plane, so it
+    // happens before the prime. A height change written after the prime is
+    // a dead stop on a primed nozzle.
+    let mut primed = false;
+    let mut stopped = Vec::new();
+    for line in out.gcode.lines() {
+        let parsed = Line::parse(line);
+        let move_only_z = parsed.is_move() && parsed.z.is_some() && !parsed.is_xy_move();
+        let bead = parsed.is_move() && parsed.is_xy_move() && parsed.e.is_some();
+        let prime = parsed.is_move() && !parsed.is_xy_move() && parsed.e.is_some();
+        if bead {
+            primed = false;
+        } else if prime {
+            primed = parsed.e.is_some_and(|e| e > 0.0);
+        } else if move_only_z && line.contains(ZAA_STAMP) && primed {
+            stopped.push(line);
+        }
+    }
+    assert!(
+        stopped.is_empty(),
+        "a height change stopped the toolhead on a primed nozzle: {stopped:?}"
+    );
+}
+
 /// Two heights the file cannot tell apart are one height, and levelling
 /// from one to the other buys nothing while costing a dead stop.
 #[test]
