@@ -654,6 +654,7 @@ fn is_filler(feature: Feature) -> bool {
 struct Loop {
     lead: usize,
     body: usize,
+    approach_z: Option<f64>,
     /// One past this loop's last buffered line, known only once the region is
     /// complete.
     end: usize,
@@ -1693,6 +1694,7 @@ impl<'a, W: Write> Pass<'a, W> {
         self.loops.push(Loop {
             lead,
             body,
+            approach_z: None,
             end: 0,
             beads: 0,
             trail: 0,
@@ -1911,8 +1913,14 @@ impl<'a, W: Write> Pass<'a, W> {
         let head = (first.lead..first.body)
             .find(|&at| self.buffer[at].steers)
             .unwrap_or(first.body);
+        let approach_z = self.buffer[first.lead..head]
+            .iter()
+            .rev()
+            .find_map(|line| line.z)
+            .filter(|z| *z > self.plane());
         if let Some(loop_) = self.loops.first_mut() {
             loop_.lead = head;
+            loop_.approach_z = approach_z;
         }
         head
     }
@@ -2119,6 +2127,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // the travel crosses there is nothing to do; otherwise the nozzle goes
         // up first and only comes down once the travel is over.
         let (laid, over_support) = self.clearance(current.lead, current.body, self.at_now);
+        let laid = laid.into_iter().chain(current.approach_z).reduce(f64::max);
         let standing = self.nozzle_z.unwrap_or(target);
         // The ride carries the descent on the travel, so both ends of it have
         // to clear a raised bead — and the loop's own height has to clear
@@ -2138,7 +2147,8 @@ impl<'a, W: Write> Pass<'a, W> {
         // nozzle for it and fill it again on the far side, so the stop cannot
         // ooze and the file's own filament total is untouched.
         if carrier.is_none()
-            && (target - standing).abs() > f64::EPSILON
+            && ((target - standing).abs() > f64::EPSILON
+                || laid.is_some_and(|clear| standing < clear))
             && self.withdrawn <= 0.0
             && self.stopped.is_none()
             && let Some(charge) = self.retract_charge
@@ -2787,6 +2797,9 @@ impl<'a, W: Write> Pass<'a, W> {
         if buffered.f.is_none() {
             self.settle_feed()?;
         }
+        if buffered.places {
+            self.wrote_at = buffered.at;
+        }
         self.nozzle_z = Some(z);
         if let Some(rate) = buffered.f {
             self.feedrate = Some(rate);
@@ -3001,7 +3014,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // a region's own tail crosses to wherever the reorder left the nozzle,
         // and only the growth over the travel the slicer planned is worth a
         // pull.
-        if line.is_move() && (line.x.is_some() || line.y.is_some()) {
+        if line.draws() && (line.x.is_some() || line.y.is_some()) {
             let grew = (self.at.0 - self.wrote_at.0).hypot(self.at.1 - self.wrote_at.1)
                 - (self.at.0 - self.was_at.0).hypot(self.at.1 - self.was_at.1);
             // A travel is the one that names no `E`: a bead, a wipe and a

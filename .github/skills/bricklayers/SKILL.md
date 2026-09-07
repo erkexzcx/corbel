@@ -635,7 +635,7 @@ Each of these cost a wrong answer or a shipped bug.
   13169 → 167, 679 → 0), line conservation exact on every one, audit invariant
   0 everywhere, no bead moved, 0.52 → 0.57 s and 13.9 MiB on a 58 MB file.
 
-### A held loop is written at the layer's end — three things must travel with it
+### A held loop keeps its approach state
 
 Measured on a user's Bambu Studio tree-support slice (`fixme.gcode`, 315
 layers, 291 support regions) that knocked a double tree off the plate:
@@ -677,6 +677,8 @@ layers, 291 support regions) that knocked a double tree off the plate:
   that slice: 170 long travels still pulled, 0 short ones; retracted total
   3815 → 3614 mm, primed travel 1108 → 1352 mm (still under the input's own
   1372).
+
+**Its approach HEIGHT survives the hold too.** A hop hoisted into the region head runs before the flat walls, but the first loop's travel can be deferred until those walls have brought the nozzle down again. Repeating the hop's Z on that travel only produces a diagonal climb; it does not restore clearance at the start. `Loop.approach_z` carries the hoisted lift into `write_loop`, which restores it before travelling and never lowers the nozzle to restore it. Pinned by `a_held_loop_s_travel_starts_at_the_height_the_hop_set`; the neighboring spiral-hop test still requires that a redundant circle is not repeated.
 
 ### Support is one bead wide, and a wall or a travel beside it must not touch it
 
@@ -770,6 +772,8 @@ plate, and both fixed:
 **A layer comment can arrive before the previous bead's wipe.** Flushing deferred walls at that comment moves the nozzle away before the wipe is read. Its destination survives, but its start does not, turning a short retracting wipe into a journey across the part. `Pass::boundary` holds the nonprinting prelude so `finish_boundary` keeps the wipe with its bead before closing the layer; layer metadata stays with its marker. The synthetic `a_wipe_after_a_layer_marker_still_starts_at_the_bead_it_retraces` checks both M82 and M83. The nozzle ledger checks wipe starts, not just endpoints, and assigns a wipe to its preceding bead's layer.
 
 **A height-carrying travel still needs retraction.** `ride` and `replay` share `retract_for`, with the same displacement and slicer minimum-travel gates. The public `no-zhop` fixture catches a journey that bypasses this gate; `a_height_carried_by_a_reordered_travel_still_retracts` isolates it.
+
+**Every positioning move updates the output position.** `ride` must record its destination, and `emit` must count arcs as well as straight moves. Otherwise a full-circle bead naming no X/Y can leave the approach's stale position in force, and a later journey reads as no travel at all. Pinned by `a_ridden_approach_to_a_full_circle_keeps_the_next_travel_retracted` and `an_unbuffered_arc_records_where_the_nozzle_really_stands`.
 
 Reordering separates a wipe from its prime. `Pass.input_withdrawn` measures the input's withdrawal and `Buffered.withdrawn` carries its value before each move through the reorder. Before a bead, both write paths match that state; a prime supplies only what is missing, and a redundant wipe retains its path while pulling less or nothing. `Pass.stopped` reserves a height move's pull until that move finishes. The output tracker must book what was actually written, never hide a second pull by clamping its model.
 

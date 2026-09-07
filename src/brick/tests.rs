@@ -4374,6 +4374,29 @@ fn a_held_loop_s_travel_runs_at_the_rate_the_hop_set() {
     assert!(!out.contains("G1 F6316 ; corbel brick resume"), "{out}");
 }
 
+#[test]
+fn a_held_loop_s_travel_starts_at_the_height_the_hop_set() {
+    let source = tree_plate("G1 X6.2 Y5.45 E0.1\n");
+    let out = run(&source, &Config::default());
+    let mut modal = Modal::new();
+    let mut travels = 0;
+    for raw in out.lines() {
+        let line = Line::parse(raw);
+        let from = modal.position();
+        modal.apply(&line);
+        if raw.starts_with("G1 X5.45 Y5.45 Z") {
+            travels += 1;
+            let clearance = line.z.unwrap();
+            assert!(
+                from.2 >= clearance - 1e-9,
+                "held travel starts at {} below its {clearance} clearance: {raw}",
+                from.2
+            );
+        }
+    }
+    assert_eq!(travels, 5);
+}
+
 /// A held loop written beside a region that ends within a millimetre of it
 /// is no journey: the slicer's own minimum travel says a pull is not worth
 /// it, and each pull costs a stop, a gap where the bead restarts and a bite
@@ -4449,6 +4472,43 @@ fn a_height_carried_by_a_reordered_travel_still_retracts() {
         .expect("the journey needs a pull");
     let travel = out.find("G1 X20 Y0").unwrap();
     assert!(retract < travel, "{out}");
+}
+
+#[test]
+fn a_ridden_approach_to_a_full_circle_keeps_the_next_travel_retracted() {
+    let survey = Survey::of(
+        "; layer_height = 0.2\n; retraction_length = 0.8\n; retraction_minimum_travel = 1\nM83\n",
+    );
+    let config = plain();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.at = (20.0, 0.0);
+    pass.buffer(Line::parse("G1 X20 Y0 F9000"), (0.0, 0.0));
+    pass.buffer(Line::parse("G2 I-5 J0 E1 F600"), (20.0, 0.0));
+    pass.ride(0, 0.3, true, &[None, None]).unwrap();
+    pass.replay(1, 1.0, &[None, None]).unwrap();
+    pass.was_at = (0.0, 0.0);
+    pass.at = (0.0, 0.0);
+    pass.emit(Line::parse("G1 X0 Y0 F9000"), 1.0).unwrap();
+    assert_eq!(pass.withdrawn, 0.8, "the return travel starts 20 mm away");
+    let out = String::from_utf8(out).unwrap();
+    let retract = out
+        .rfind("corbel brick retract")
+        .expect("the return needs a pull");
+    assert!(retract < out.find("G1 X0 Y0 F9000").unwrap(), "{out}");
+}
+
+#[test]
+fn an_unbuffered_arc_records_where_the_nozzle_really_stands() {
+    let survey = Survey::of("; layer_height = 0.2\nM83\n");
+    let config = plain();
+    let mut pass = Pass::new(Vec::new(), &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.at = (20.0, 0.0);
+    pass.emit(Line::parse("G2 X20 Y0 I10 J0 E1 F600"), 1.0)
+        .unwrap();
+    assert_eq!(pass.wrote_at, (20.0, 0.0));
 }
 
 /// The mirror case: the filler ends across the plate from the held loop, and
