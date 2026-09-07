@@ -195,7 +195,7 @@ Against [GeekDetour/BrickLayers](https://github.com/GeekDetour/BrickLayers) and 
 
 - 🐍 **No Python, and no numbers to keep in sync** — no interpreter, no `-layerHeight` to match your profile, no extrusion multiplier to guess.
 - 🔧 **No slicer settings to change first** — arc fitting stays on, wall order is read rather than dictated, and `.bgcode` is read and written natively with thumbnails and config copied byte for byte.
-- 🧵 **No stringing from the raise** — a height change rides a travel the printer was already making, instead of stopping the toolhead over a seam with a primed nozzle.
+- **Fewer seam stops, no double priming**: height changes ride existing travels where possible. Reordered wipes and primes preserve the nozzle's original charge at each bead.
 - 🧩 **Two walls are enough, and the visible wall is in on it** — a region with one internal loop is bricked against the wall you can see; that wall takes the same flow as every other and is drawn back in by half of what it gains.
 
 Against [Theaninova/GCodeZAA](https://github.com/Theaninova/GCodeZAA), the post-processor that Z anti-aliasing started as:

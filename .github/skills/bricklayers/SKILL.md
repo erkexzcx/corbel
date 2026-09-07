@@ -759,21 +759,13 @@ plate, and both fixed:
   that is the plane unless *this same raised column* stands there. Solid infill
   below and nothing below give the same answer.
 
-### Stringing is not a retraction bug — this was checked
+### Retraction follows the input's charge, not a guessed pairing
 
-A user reported stringing and blamed the wall flow multiplier for desyncing
-retraction. Measured on their file and refuted:
+Reordering separates a wipe from its prime. `Pass.input_withdrawn` measures the input's withdrawal and `Buffered.withdrawn` carries its value before each move through the reorder. Before a bead, both write paths match that state; a prime supplies only what is missing, and a redundant wipe retains its path while pulling less or nothing. `Pass.stopped` reserves a height move's pull until that move finishes. The output tracker must book what was actually written, never hide a second pull by clamping its model.
 
-| Claim | Measurement |
-|---|---|
-| retraction is not scaled with the flow | 184 retract/prime cycles, the only imbalance is the start G-code purge and ±0.00002 of slicer rounding |
-| the multiplier over-extrudes somewhere | move-for-move `E` ratio against the input is `{1.0, 1.05, 1.25 ramp, 0.5 cap}`, max 1.2568, zero XY changes |
-| the tool changes travels | it emits none, and rewrites none |
+A small bead does not prove the slicer intended a dry nozzle, and a zero prime in processed output does not prove the slicer wrote it. Inspect the original. On the public `inner-outer-inner` fixture, the old binary produced a 3.0 mm excess prime and a bead missing 2.40 mm of filament while passing the filament-balance check. The measured-charge implementation passes the same fixture with independent pressure assertions enabled.
 
-`replay` applies `delta * factor` to negative `E` too, so a retract and wipe
-inside a raised loop's range are scaled — but the prime that answers them is in
-the same range and gets the same factor, so it cancels (0.84 against 0.84). Do
-not "fix" it.
+Filament totals cannot detect excess primes that cancel starved beads. `tests/nozzle` checks both pressure errors independently and requires wipe paths to survive, including a redundant wipe written with `E0`. `brick::tests::reordered_primes_balance_without_double_priming_or_starving_small_beads` covers relative and absolute extrusion. Retractions are not scaled with wall flow.
 
 ### Variable / adaptive layer height
 

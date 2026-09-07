@@ -689,6 +689,9 @@ pub struct Ledger {
     pub commands: Vec<String>,
     pub extruded: f64,
     pub retracted: f64,
+    pub wipes: Vec<String>,
+    pub excess_prime: f64,
+    pub dry_bead: f64,
     /// The slowest and fastest feedrate in force while laying a bead.
     pub bead_feed: (f64, f64),
     /// The fastest each tool's filament is asked to melt, in mm of it a
@@ -773,6 +776,9 @@ pub fn ledger(gcode: &str) -> Ledger {
         commands: Vec::new(),
         extruded: 0.0,
         retracted: 0.0,
+        wipes: Vec::new(),
+        excess_prime: 0.0,
+        dry_bead: 0.0,
         bead_feed: (f64::INFINITY, 0.0),
         peak_melt: Vec::new(),
         peak_line: Vec::new(),
@@ -855,6 +861,10 @@ pub fn ledger(gcode: &str) -> Ledger {
         }
         let from = modal.position();
         let delta = line.e.filter(|_| line.draws()).map(|e| extruder.observe(e));
+        if line.draws_in_plane() && delta.is_some_and(|value| value <= 0.0) {
+            book.wipes
+                .push(format!("{layer}:{:?}:{:?}:{:?}", line.code, line.x, line.y));
+        }
         // A retraction and its prime name no coordinate; a bead's own
         // filament is not a prime and must not cancel one, but a bead does
         // prove the nozzle is full.
@@ -862,6 +872,13 @@ pub fn ledger(gcode: &str) -> Ledger {
         // named on a line that also names a coordinate. Counting only the bare
         // ones reads a wiped nozzle as a full one.
         if let Some(value) = delta {
+            if layer > 0 && value > 0.0 {
+                if line.draws_in_plane() {
+                    book.dry_bead = book.dry_bead.max(value.min(withdrawn));
+                } else {
+                    book.excess_prime = book.excess_prime.max(value - withdrawn);
+                }
+            }
             withdrawn = (withdrawn - value).max(0.0);
         }
         // A height written as a move of its own stops the toolhead dead.
@@ -1289,6 +1306,27 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
             before.supports.len(),
             after.supports.len().abs_diff(before.supports.len())
         ));
+    }
+    if let Some((path, before, after)) = lost(&before.wipes, &after.wipes) {
+        found.push(format!("{} wipe moves lost from {path}", before - after));
+    }
+    for (name, was, now) in [
+        (
+            "filament primed beyond the withdrawal",
+            before.excess_prime,
+            after.excess_prime,
+        ),
+        (
+            "bead filament consumed refilling a dry nozzle",
+            before.dry_bead,
+            after.dry_bead,
+        ),
+    ] {
+        if now > was + 0.0001 {
+            found.push(format!(
+                "{name}: {now:.5} mm against {was:.5} mm in the input"
+            ));
+        }
     }
     if after.primed_stops > before.primed_stops {
         found.push(format!(

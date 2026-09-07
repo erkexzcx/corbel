@@ -3233,6 +3233,7 @@ fn the_first_bead_of_a_region_is_metered_against_its_entry() {
         e_span: None,
         e: Some(0.5),
         delta: Some(0.5),
+        withdrawn: 0.0,
         z: None,
         f: Some(9000.0),
         xy: Some((10.0, 0.0)),
@@ -4408,14 +4409,17 @@ fn an_owed_prime_is_given_back_at_the_bead_not_the_wipe() {
     {
         let mut pass = Pass::new(&mut out, &config, &survey);
         pass.extruder.set_mode(Code::RelativeE);
-        pass.owing = Some(0.8);
+        pass.unprime(-0.8).unwrap();
         pass.emit(Line::parse("G1 X0.0 Y0.0 E-0.8"), 1.0).unwrap();
+        pass.emit(Line::parse("G1 E0.8"), 1.0).unwrap();
         pass.emit(Line::parse("G1 X10.0 Y0.0 E0.5"), 1.0).unwrap();
     }
     let out = String::from_utf8(out).unwrap();
-    let wipe = out.find("E-0.8").expect("the wipe is missing");
+    let wipe = out
+        .find("G1 X0.0 Y0.0 E0.00000")
+        .expect("the wipe is missing");
     let prime = out
-        .find("corbel brick prime")
+        .find("G1 E0.8")
         .expect("the owed prime was never given back");
     assert!(
         wipe < prime,
@@ -4439,14 +4443,12 @@ fn a_tool_change_rebases_the_nozzle_charge_and_retraction() {
     let mut out = Vec::new();
     let mut pass = Pass::new(&mut out, &config, &survey);
     pass.withdrawn = 0.8;
-    pass.owing = Some(0.4);
-    pass.debt = 0.2;
+    pass.input_withdrawn = 0.4;
     pass.stopped = Some(0.4);
     pass.feed("T1", b"T1").unwrap();
 
     assert_eq!(pass.withdrawn, 0.0);
-    assert!(pass.owing.is_none());
-    assert_eq!(pass.debt, 0.0);
+    assert_eq!(pass.input_withdrawn, 0.0);
     assert!(pass.stopped.is_none());
     assert_eq!(pass.tool, 1);
     assert_eq!(pass.retract_charge, Some(1.2));
@@ -4463,7 +4465,7 @@ fn replay_gives_an_owed_prime_back_at_the_bead_not_the_wipe() {
     let mut out = Vec::new();
     let mut pass = Pass::new(&mut out, &config, &survey);
     pass.extruder.set_mode(Code::RelativeE);
-    pass.owing = Some(0.8);
+    pass.unprime(-0.8).unwrap();
     let start = pass.arena.len();
     pass.arena.extend_from_slice(b"G1 X0.0 Y0.0 E-0.8");
     let end = pass.arena.len();
@@ -4473,6 +4475,7 @@ fn replay_gives_an_owed_prime_back_at_the_bead_not_the_wipe() {
         e_span: None,
         e: Some(-0.8),
         delta: Some(-0.8),
+        withdrawn: 0.0,
         z: None,
         f: None,
         xy: Some((0.0, 0.0)),
@@ -4490,11 +4493,11 @@ fn replay_gives_an_owed_prime_back_at_the_bead_not_the_wipe() {
     });
     pass.replay(0, 1.0, &[None]).unwrap();
 
-    let owing = pass.owing;
+    let withdrawn = pass.withdrawn;
     drop(pass);
     let out = String::from_utf8(out).unwrap();
     assert!(!out.contains("corbel brick prime"), "{out}");
-    assert!(owing.is_some(), "the pull was repaid into the wipe");
+    assert_eq!(withdrawn, 0.8, "the pull was repaid into the wipe");
 }
 
 /// A raised bead is written with `delta * factor` of filament, and the
@@ -4519,6 +4522,7 @@ fn replay_books_the_filament_it_actually_writes() {
         e_span: None,
         e: Some(0.5),
         delta: Some(0.5),
+        withdrawn: 0.8,
         z: None,
         f: None,
         xy: None,
@@ -4545,12 +4549,7 @@ fn replay_books_the_filament_it_actually_writes() {
     assert!((pass.withdrawn - 0.05).abs() < 1e-9, "{}", pass.withdrawn);
 }
 
-/// A thin wall tapers with a prime of `E0`: the slicer pulls back for the
-/// travel and then puts back nothing, leaving the nozzle dry on purpose.
-/// `withdrawn` stays where the wipe left it, but the retraction is answered,
-/// so the debt fill must not dump a full prime on the first tapered bead —
-/// measured on a user's plate, two layers of a tapering pair of points
-/// carried 216 such primes.
+/// An input that really leaves a bead withdrawn must keep that state.
 #[test]
 fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
     let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
@@ -4571,6 +4570,7 @@ fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
                 e_span: None,
                 e: Some(delta),
                 delta: Some(delta),
+                withdrawn: pass.input_withdrawn,
                 z: None,
                 f: None,
                 xy: places.then_some(at),
@@ -4586,6 +4586,7 @@ fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
                 resets_origin: false,
                 width: None,
             });
+            pass.input_withdrawn = (pass.input_withdrawn - delta).max(0.0);
             index
         };
 
@@ -4604,14 +4605,9 @@ fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
     assert!(!out.contains("corbel brick prime"), "{out}");
 }
 
-/// Where the slicer primed NOTHING between the wipe and a bead under a
-/// quarter of the wipe itself, the bead is a taper drawn dry on purpose, and
-/// the debt fill must leave it alone — dumping a full retraction on it is a
-/// blob at the seam and a string down the travel that follows. The withdrawal
-/// stays standing; the slicer's own prime, wherever the reorder put it, still
-/// puts it back.
+/// Segment length cannot decide whether the slicer intended a dry bead.
 #[test]
-fn a_thin_bead_after_a_wipe_with_no_prime_is_not_filled() {
+fn an_intentionally_withdrawn_bead_is_preserved_regardless_of_length() {
     let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
     let config = Config::default();
     let mut out = Vec::new();
@@ -4630,6 +4626,7 @@ fn a_thin_bead_after_a_wipe_with_no_prime_is_not_filled() {
                 e_span: None,
                 e: Some(delta),
                 delta: Some(delta),
+                withdrawn: pass.input_withdrawn,
                 z: None,
                 f: None,
                 xy: places.then_some(at),
@@ -4645,6 +4642,7 @@ fn a_thin_bead_after_a_wipe_with_no_prime_is_not_filled() {
                 resets_origin: false,
                 width: None,
             });
+            pass.input_withdrawn = (pass.input_withdrawn - delta).max(0.0);
             index
         };
 
@@ -4660,8 +4658,6 @@ fn a_thin_bead_after_a_wipe_with_no_prime_is_not_filled() {
     let out = String::from_utf8(out).unwrap();
     assert!(!out.contains("corbel brick prime"), "{out}");
 
-    // But a bead at least a quarter of the wipe is a real wall whose prime
-    // was stranded, and it IS filled.
     let mut out = Vec::new();
     let mut pass = Pass::new(&mut out, &config, &survey);
     pass.extruder.set_mode(Code::RelativeE);
@@ -4671,19 +4667,16 @@ fn a_thin_bead_after_a_wipe_with_no_prime_is_not_filled() {
     pass.replay(bead, 1.0, &[None, None]).unwrap();
     drop(pass);
     let out = String::from_utf8(out).unwrap();
-    assert!(out.contains("corbel brick prime"), "{out}");
+    assert!(!out.contains("corbel brick prime"), "{out}");
 }
-/// retraction intervened since the debt was created, the prime belongs to
-/// that retraction and must fire rather than be zeroed into the old debt —
-/// zeroing it would leave the bead after it drawn dry.
+/// A prime that still has a withdrawal to answer must be written once.
 #[test]
-fn a_prime_is_only_settled_when_the_nozzle_is_full() {
+fn a_prime_answers_the_actual_withdrawal() {
     let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
     let config = Config::default();
     let mut out = Vec::new();
     let mut pass = Pass::new(&mut out, &config, &survey);
     pass.extruder.set_mode(Code::RelativeE);
-    pass.debt = 0.8;
     pass.withdrawn = 0.8;
 
     let start = pass.arena.len();
@@ -4696,6 +4689,7 @@ fn a_prime_is_only_settled_when_the_nozzle_is_full() {
         e_span: None,
         e: Some(0.8),
         delta: Some(0.8),
+        withdrawn: 0.8,
         z: None,
         f: None,
         xy: None,
@@ -4713,37 +4707,121 @@ fn a_prime_is_only_settled_when_the_nozzle_is_full() {
     });
     pass.replay(index, 1.0, &[None]).unwrap();
 
-    assert_eq!(
-        pass.debt, 0.8,
-        "the debt was settled into a newer retraction"
-    );
     assert!(
         pass.withdrawn.abs() < 1e-9,
         "the prime refilled the nozzle: {}",
         pass.withdrawn
     );
-    assert!(pass.primed, "the prime marked the nozzle primed");
+    drop(pass);
+    assert_eq!(String::from_utf8(out).unwrap(), "G1 E0.8\n");
 }
 
-/// A pair of wipes stacked by a reorder is still one retraction: the nozzle
-/// can never look emptier than the file's own retraction length, so a bead
-/// drawn after two of them is filled with one charge, not the sum.
+/// A redundant wipe must be corrected in the output, not hidden in the model.
 #[test]
-fn a_stacked_pair_of_wipes_is_capped_at_one_retraction() {
+fn a_stacked_pair_of_wipes_writes_only_one_retraction() {
     let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
     let config = Config::default();
     let mut out = Vec::new();
     let mut pass = Pass::new(&mut out, &config, &survey);
     pass.extruder.set_mode(Code::RelativeE);
 
-    // One full wipe already on the books, then a second one arrives.
-    pass.withdrawn = 0.8;
-    pass.pulled(pass.withdrawn + 0.8);
+    for raw in ["G1 X1 E-.8", "G1 E.8", "G1 X2 E.1", "G1 X3 E-.8"] {
+        pass.buffer(Line::parse(raw), (0.0, 0.0));
+    }
+    pass.replay(0, 1.0, &[None; 4]).unwrap();
+    pass.replay(3, 1.0, &[None; 4]).unwrap();
 
     assert!(
         (pass.withdrawn - 0.8).abs() < 1e-9,
         "two full wipes must still look like one: {}",
         pass.withdrawn
+    );
+    drop(pass);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "G1 X1 E-.8\nG1 X3 E0.00000\n"
+    );
+}
+
+#[test]
+fn reordered_primes_balance_without_double_priming_or_starving_small_beads() {
+    for absolute in [false, true] {
+        let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\n");
+        let config = Config::default();
+        let mut out = Vec::new();
+        let mut pass = Pass::new(&mut out, &config, &survey);
+        pass.extruder.set_mode(e_mode(absolute));
+        let mut origin = 0.0;
+        for (index, delta) in [0.01, -0.8, 0.8, 0.01, -0.8, 0.8, 0.01]
+            .into_iter()
+            .enumerate()
+        {
+            origin += delta;
+            let value = if absolute { origin } else { delta };
+            let raw = if [2, 5].contains(&index) {
+                format!("G1 E{value:.5}")
+            } else {
+                format!("G1 X{index} E{value:.5}")
+            };
+            pass.buffer(Line::parse(&raw), (0.0, 0.0));
+        }
+        pass.unprime(-0.8).unwrap();
+        for index in [2, 3, 4, 0, 1, 5, 6] {
+            pass.replay(index, 1.0, &[None; 7]).unwrap();
+        }
+        assert!(pass.withdrawn < 1e-9);
+        drop(pass);
+        let out = String::from_utf8(out).unwrap();
+        let mut extruder = Extruder::new();
+        extruder.set_mode(e_mode(absolute));
+        let mut withdrawn = 0.0_f64;
+        let mut total = 0.0;
+        for raw in out.lines() {
+            let line = Line::parse(raw);
+            if let Some(value) = line.e {
+                let delta = extruder.observe(value);
+                if delta > 1e-6 {
+                    if line.draws_in_plane() {
+                        assert!(withdrawn < 1e-6, "starved bead: {raw}\n{out}");
+                    } else {
+                        assert!(delta <= withdrawn + 1e-6, "excess prime: {raw}\n{out}");
+                    }
+                }
+                withdrawn = (withdrawn - delta).max(0.0);
+                assert!(withdrawn <= 0.8 + 1e-6, "stacked withdrawal: {out}");
+                total += delta;
+            }
+        }
+        assert!(
+            (total - 0.03).abs() < 1e-6,
+            "filament imbalance: {total}\n{out}"
+        );
+    }
+}
+
+#[test]
+fn a_height_stop_keeps_its_pull_until_after_the_slicers_prime() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.input_withdrawn = 0.8;
+    pass.buffer(Line::parse("G1 E.8"), (0.0, 0.0));
+    pass.unprime(-0.8).unwrap();
+    pass.stopped = Some(0.8);
+    pass.replay(0, 1.0, &[None]).unwrap();
+    assert_eq!(pass.withdrawn, 0.8);
+    pass.move_z(0.3, true).unwrap();
+    let charge = pass.stopped.take().unwrap();
+    pass.unprime(charge).unwrap();
+    assert_eq!(pass.withdrawn, 0.0);
+    drop(pass);
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(out.matches("corbel brick prime").count(), 1, "{out}");
+    assert!(
+        out.find("G1 Z").unwrap() < out.find("corbel brick prime").unwrap(),
+        "{out}"
     );
 }
 

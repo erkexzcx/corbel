@@ -216,18 +216,6 @@ fn assert_sound(
         ));
     }
 
-    // A wall's wipe belongs to the loop it retraces, so reordering loops has
-    // to carry it along; drop one and the nozzle travels primed, which
-    // strings, and the prime that answered it is left unbalanced.
-    if report.retractions < started.retractions {
-        faults.push(format!(
-            "{} retractions, against {} in the input — {} were dropped",
-            report.retractions,
-            started.retractions,
-            started.retractions - report.retractions
-        ));
-    }
-
     // The same path drawn on every layer, the same commands in the same
     // order, beads at the speeds the slicer chose, an extruder that never
     // winds backwards, and the filament the run says it added actually added.
@@ -247,6 +235,36 @@ fn assert_sound(
 
 /// A hair under a micron, which is finer than any slicer writes.
 const EPSILON: f64 = 1e-9;
+
+#[test]
+fn a_redundant_wipe_may_pull_nothing_but_its_path_must_survive() {
+    let source = "M83\nG1 X0 Y0\nG1 X10 Y0 E1 F600\nG1 X9 Y0 E-.8\nG1 E.8\n";
+    let kept = source.replace("G1 X9 Y0 E-.8", "G1 E-.8\nG1 X9 Y0 E0");
+    let lost = source.replace("G1 X9 Y0 E-.8", "G1 E-.8");
+    let before = nozzle::ledger(source);
+    assert!(nozzle::faults(&before, &nozzle::ledger(&kept), None).is_empty());
+    assert!(
+        nozzle::faults(&before, &nozzle::ledger(&lost), None)
+            .iter()
+            .any(|fault| fault.contains("wipe moves lost"))
+    );
+}
+
+#[test]
+fn balanced_filament_cannot_hide_an_excess_prime_and_a_starved_bead() {
+    let source = "M83\n;LAYER_CHANGE\nG1 Z0.2 F600\nG1 X0 Y0\nG1 E-.8\nG1 E.8\nG1 X10 Y0 E1\nG1 E-.8\nG1 E.8\nG1 X20 Y0 E1\n";
+    let broken = source
+        .replacen("G1 E.8\n", "G1 E1.6\n", 1)
+        .replacen("G1 E.8\n", "", 1);
+    let before = nozzle::ledger(source);
+    let after = nozzle::ledger(&broken);
+    assert!(
+        ((before.extruded - before.retracted) - (after.extruded - after.retracted)).abs() < 1e-9
+    );
+    let faults = nozzle::faults(&before, &after, None);
+    assert!(faults.iter().any(|fault| fault.contains("primed beyond")));
+    assert!(faults.iter().any(|fault| fault.contains("dry nozzle")));
+}
 
 fn bricked(tag: &str) {
     let source = plate(tag);

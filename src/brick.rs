@@ -441,6 +441,8 @@ struct Buffered {
     /// has to be written again.
     e: Option<f64>,
     delta: Option<f64>,
+    /// The input's withdrawal before this move, retained through reordering.
+    withdrawn: f64,
     z: Option<f64>,
     f: Option<f64>,
     /// Where the move names both of its coordinates, which is what a travel
@@ -789,12 +791,8 @@ struct Pass<'a, W: Write> {
     /// Filament pulled back and not yet put in, as the OUTPUT has it. Only a
     /// nozzle at zero oozes, and only what was actually written counts.
     withdrawn: f64,
-    /// True once the slicer has written its own prime line since the last
-    /// retraction. A thin wall tapers with a prime of `E0`, which puts back
-    /// nothing and leaves `withdrawn` where the wipe set it — but the
-    /// retraction is answered, and filling the bead below would dump a full
-    /// prime on a bead the slicer meant to draw dry.
-    primed: bool,
+    /// The same measurement in input order, before any loops are moved.
+    input_withdrawn: f64,
     /// How much the slicer pulls back for a travel, from its own settings.
     /// Measuring it from the moves instead reads the start-up purge as a
     /// 50 mm retraction.
@@ -806,9 +804,6 @@ struct Pass<'a, W: Write> {
     /// Where the INPUT stood before the line being read, so the travel the
     /// slicer planned can be told from the one the reorder produced.
     was_at: (f64, f64),
-    /// Filament put in ahead of a bead the reordering left dry, waiting for
-    /// the prime it was owed to.
-    debt: f64,
     /// A plane a deferred region carried the descent away from, owed until
     /// something is actually drawn.
     ///
@@ -819,13 +814,9 @@ struct Pass<'a, W: Write> {
     /// comes down on arrival, and so does this.
     owed_plane: Option<f64>,
     /// A pull taken out for a height move of this pass's own, given back once
-    /// that move has been written. Kept apart from `owing` so replaying the
-    /// loop's lead cannot hand it back early and leave the stop primed.
+    /// that move has been written. Replaying the loop's prime reserves this
+    /// amount so it cannot fill the nozzle before the height move.
     stopped: Option<f64>,
-    /// A pull taken out for a travel that is to be given back the moment the
-    /// travel ends, so the nozzle is empty for the journey and the file's own
-    /// filament total is untouched.
-    owing: Option<f64>,
     /// The feedrate the slicer retracts at, taken from its own retractions.
     retract_feed: Option<f64>,
     /// Cells of the loop being settled, kept between calls so the walk that
@@ -962,12 +953,10 @@ impl<'a, W: Write> Pass<'a, W> {
             wrote_marker: 0,
             ambient: 0,
             withdrawn: 0.0,
-            primed: false,
-            owing: None,
+            input_withdrawn: 0.0,
             owed_plane: None,
             wrote_at: (0.0, 0.0),
             was_at: (0.0, 0.0),
-            debt: 0.0,
             stopped: None,
             retract_feed: None,
             path: Vec::new(),
@@ -1063,9 +1052,7 @@ impl<'a, W: Write> Pass<'a, W> {
             // its first displaced travel run primed — the exact stringing the
             // pull exists to stop.
             self.withdrawn = 0.0;
-            self.primed = false;
-            self.owing = None;
-            self.debt = 0.0;
+            self.input_withdrawn = 0.0;
             self.stopped = None;
         }
         if is_a_width(line) {
@@ -1510,6 +1497,10 @@ impl<'a, W: Write> Pass<'a, W> {
             .e
             .filter(|_| line.draws())
             .map(|e| self.extruder.observe(e));
+        let withdrawn = self.input_withdrawn;
+        if let Some(delta) = delta {
+            self.input_withdrawn = (withdrawn - delta).max(0.0);
+        }
         let xy = line.xy();
         // A bead that runs along one axis names one word, and an arc fitted to
         // a whole circle names neither. Asking for both read such a bead as a
@@ -1536,6 +1527,7 @@ impl<'a, W: Write> Pass<'a, W> {
             e_span: line.e_span(),
             e: line.e,
             delta,
+            withdrawn,
             // Where the move leaves the nozzle, not the number on the line:
             // every height this pass compares against is an absolute one.
             //
@@ -1926,16 +1918,12 @@ impl<'a, W: Write> Pass<'a, W> {
             // of the filament. Measured on a user's tree-support slice, 252
             // of 422 held writes travelled under 1 mm and pulled for it.
             if self.withdrawn <= 0.0
-                && self.owing.is_none()
                 && self
                     .hop_travel
                     .is_some_and(|far| self.hop(current.lead, self.wrote_at) > far)
                 && let Some(charge) = self.retract_charge
             {
                 wrote = self.unprime(-charge);
-                if wrote.is_ok() {
-                    self.owing = Some(charge);
-                }
             }
             if wrote.is_ok() {
                 wrote = self.write_loop(current, plane, &moved);
@@ -2742,17 +2730,6 @@ impl<'a, W: Write> Pass<'a, W> {
         out.write_all(b"\n")
     }
 
-    /// Replays a buffered line, its flow scaled by `factor` and, where the
-    /// visible wall is being taken sideways, its `X` and `Y` moved to `to`.
-    /// The ratio beside the target is what the loop's length changed by, so
-    /// flow per mm is what the slicer metered times the factor.
-    /// The prime a travel starting at `from` is going to end with, if any.
-    ///
-    /// A bare `G1 E3` says the nozzle was emptied before the travel in front of
-    /// it — no slicer primes what it did not pull. Reordering can carry that
-    /// pull away with the loop it belonged to and leave the prime behind, and
-    /// then the travel is made with a full nozzle. Nothing is scanned past the
-    /// first bead, because a travel that reaches one needed no prime at all.
     /// How far the travel starting at `from` runs before it draws again,
     /// measured from `start`.
     fn hop(&self, from: usize, start: (f64, f64)) -> f64 {
@@ -2784,82 +2761,12 @@ impl<'a, W: Write> Pass<'a, W> {
         }
     }
 
-    fn answering(&self, from: usize) -> Option<f64> {
-        for line in &self.buffer[from + 1..] {
-            match line.delta {
-                Some(delta) if delta > 0.0 && !line.places => return Some(delta),
-                Some(delta) if delta > 0.0 => return None,
-                _ => {}
-            }
-        }
-        None
-    }
-
     fn replay(&mut self, index: usize, factor: f64, moved: &[Option<Moved>]) -> io::Result<()> {
         let buffered = self.buffer[index];
-        // Put back the pull that the prime at the end of this travel is going
-        // to answer. Only ever where the nozzle is in fact full, so a file
-        // whose retraction is still where the slicer put it is untouched, and
-        // the amount is the prime's own, so the filament balances.
-        // Only ever at an extrusion: a wipe and a retraction also name an
-        // `E`, but a prime deposited on one is a dot at a point no bead
-        // starts from — the same gate `emit` holds.
-        if let Some(charge) = self
-            .owing
-            .filter(|_| buffered.delta.is_some_and(|delta| delta > 0.0))
-        {
-            self.owing = None;
-            self.unprime(charge)?;
-        }
-        // A loop whose wipe left with it lands in front of a lead that
-        // primes nothing, and its first bead is then drawn on an empty nozzle.
-        // Filling it here is what makes the travel that follows correct too:
-        // the prime the slicer left stranded is now unanswered, so the rule
-        // below pulls for it and the filament comes back to where it was.
-        if buffered.places && buffered.delta.is_some_and(|delta| delta > 0.0) {
+        if buffered.extrudes {
             self.settle_plane()?;
+            self.unprime(self.withdrawn - buffered.withdrawn)?;
         }
-        // Never where the slicer DID prime: a thin wall tapers with a prime
-        // of `E0`, which puts back nothing and leaves `withdrawn` where the
-        // wipe set it, but the retraction is answered and the bead is meant
-        // to be drawn dry. Dumping a full prime on it is a blob at the point
-        // of every taper — measured on a user's plate, 216 primes on two
-        // layers of a tapering pair of points. The same is true where the
-        // slicer primed NOTHING: a taper bead under a quarter of the wipe it
-        // follows is drawn dry on purpose, and filling it dumps a whole
-        // retraction on a seam the slicer metered for a dry nozzle. The
-        // withdrawal is left standing; the slicer's own prime, wherever the
-        // reorder put it, still puts it back.
-        if self.withdrawn > 0.0
-            && !self.primed
-            && buffered.places
-            && buffered.delta.is_some_and(|delta| delta > 0.0)
-        {
-            let thin = self
-                .retract_charge
-                .is_some_and(|charge| buffered.delta.unwrap_or(0.0) < charge / 4.0);
-            if !thin {
-                self.debt += self.withdrawn;
-                self.unprime(self.withdrawn)?;
-            }
-        }
-        // And the prime that pull was owed to arrives later, at a nozzle that
-        // is already full. Replaying it at nothing settles the debt: no line
-        // is dropped, no filament is invented, and the pair the slicer wrote
-        // ends up either side of the travel it was for.
-        let factor = match buffered.delta {
-            Some(delta)
-                if self.debt > 0.0
-                    && self.withdrawn <= 0.0
-                    && !buffered.places
-                    && delta > 0.0
-                    && delta <= self.debt =>
-            {
-                self.debt -= delta;
-                0.0
-            }
-            _ => factor,
-        };
         // A height move of the slicer's own, reached with a full nozzle
         // because the pull that used to precede it went elsewhere. It is a
         // dead stop over the seam either way, so empty the nozzle for it.
@@ -2873,18 +2780,13 @@ impl<'a, W: Write> Pass<'a, W> {
         let worth_it = self
             .hop_travel
             .is_some_and(|far| self.displaced(index) > far)
-            && self.withdrawn <= 0.0
-            && self.owing.is_none();
-        if worth_it && buffered.z.is_some() && !buffered.steers && buffered.delta.is_none() {
-            if let Some(charge) = self.retract_charge {
-                self.unprime(-charge)?;
-                self.owing = Some(charge);
-            }
-        } else if worth_it && buffered.steers && buffered.delta.is_none() {
-            if let Some(charge) = self.answering(index).or(self.retract_charge) {
-                self.unprime(-charge)?;
-                self.owing = Some(charge);
-            }
+            && self.withdrawn <= 0.0;
+        if worth_it
+            && buffered.positions
+            && buffered.delta.is_none()
+            && let Some(charge) = self.retract_charge
+        {
+            self.unprime(-charge)?;
         }
         // The length a bead is metered against is the one it is written at, so
         // the move and the ratio it changed the path by are decided together:
@@ -2893,6 +2795,14 @@ impl<'a, W: Write> Pass<'a, W> {
         // case `Line::write_moved` refuses.
         let to = moved[index].filter(|_| buffered.places);
         let ratio = to.map_or(1.0, |moved| moved.ratio);
+        let written_delta = buffered.delta.map(|delta| {
+            let scaled = delta * factor * ratio;
+            if buffered.extrudes {
+                scaled
+            } else {
+                self.matching_charge(scaled, buffered.withdrawn)
+            }
+        });
         // Only a bead melts anything, so only a bead carries a rate of this
         // pass's own: a `G92`, a travel, a wipe and a retraction all keep what
         // the slicer gave them. The rate goes ON the bead's line, whether or
@@ -2915,39 +2825,11 @@ impl<'a, W: Write> Pass<'a, W> {
         {
             self.settle_feed()?;
         }
-        if let Some(delta) = buffered.delta {
-            // A wipe pulls back along a path, so most of a retraction is
-            // named on a line that also names a coordinate. Reading only the
-            // bare ones sees 0.15 mm of a 3.00 mm pull and retracts again.
-            // The amount booked is what is actually written — `delta` scaled
-            // by the flow factor and the move's own ratio — so the model does
-            // not think a raised bead left the nozzle empty when it refilled
-            // it, and then skip the pull a reordered travel needs.
-            if buffered.places {
-                self.pulled(self.withdrawn - delta * factor * ratio);
-                if delta < 0.0 {
-                    self.primed = false;
-                }
-            } else {
-                if delta < 0.0 {
-                    self.retract_feed = buffered.f.or(self.retract_feed);
-                    self.pulled(self.withdrawn - delta * factor * ratio);
-                    self.primed = false;
-                } else if !buffered.extrudes {
-                    // A bare `G1 E` that names no axis is the slicer's own
-                    // prime — even where it puts back nothing, as a thin wall
-                    // tapers. Whatever it restores, the retraction it
-                    // answered is over, so the nozzle is back at its resting
-                    // state: the bead after it is never filled again, and the
-                    // pull cannot keep accumulating layer on layer.
-                    self.withdrawn = 0.0;
-                    self.primed = true;
-                } else {
-                    // A bead that names no axis — a full-circle arc — refills
-                    // the nozzle by the filament it actually writes.
-                    self.withdrawn = (self.withdrawn - delta * factor * ratio).max(0.0);
-                }
+        if let Some(delta) = written_delta {
+            if delta < 0.0 && !buffered.places {
+                self.retract_feed = buffered.f.or(self.retract_feed);
             }
+            self.pulled(self.withdrawn - delta);
         }
         if buffered.places {
             self.wrote_at = buffered.at;
@@ -2967,9 +2849,8 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(value) = buffered.e.filter(|_| buffered.resets_origin) {
             self.extruder.advance_origin(value);
         }
-        let factor = factor * ratio;
-        if let Some(delta) = buffered.delta.filter(|delta| *delta > 0.0) {
-            self.filament += delta * factor;
+        if let Some(delta) = written_delta.filter(|delta| *delta > 0.0) {
+            self.filament += delta;
         }
         // The convention this line's own words were read in, which a `M82` or
         // `M83` still buffered behind it has not changed yet. The extruder's
@@ -2985,7 +2866,7 @@ impl<'a, W: Write> Pass<'a, W> {
             ..
         } = self;
         let raw = &arena[buffered.start..buffered.end];
-        let value = buffered.delta.map(|delta| extruder.advance(delta * factor));
+        let value = written_delta.map(|delta| extruder.advance(delta));
         extruder.set_mode(e_mode(reading));
 
         if let Some(moved) = to {
@@ -3018,6 +2899,14 @@ impl<'a, W: Write> Pass<'a, W> {
     }
 
     fn emit(&mut self, line: Line<'_>, factor: f64) -> io::Result<()> {
+        let delta = line
+            .e
+            .filter(|_| line.draws())
+            .map(|e| self.extruder.observe(e));
+        let withdrawn = self.input_withdrawn;
+        if let Some(delta) = delta {
+            self.input_withdrawn = (withdrawn - delta).max(0.0);
+        }
         // Every line that goes straight out states the rate the file wants in
         // force, not just the ones a region held on to.
         if let Some(rate) = line.f {
@@ -3038,12 +2927,10 @@ impl<'a, W: Write> Pass<'a, W> {
             // this gate unable to fire.
             if line.e.is_none()
                 && self.withdrawn <= 0.0
-                && self.owing.is_none()
                 && self.hop_travel.is_some_and(|far| grew > far)
                 && let Some(charge) = self.retract_charge
             {
                 self.unprime(-charge)?;
-                self.owing = Some(charge);
             }
             self.wrote_at = self.at;
         }
@@ -3052,23 +2939,10 @@ impl<'a, W: Write> Pass<'a, W> {
                 self.extruder.advance_origin(value);
             }
         }
-        // A pull taken out for a travel is given back here too, for the
-        // lines that never reach `replay` — and only at a bead: a wipe and a
-        // retraction also name an `E`, but a prime deposited on one is a dot
-        // of filament at a point no bead starts from.
-        if let Some(charge) = self
-            .owing
-            .filter(|_| line.draws() && line.e.is_some_and(|e| self.extruder.delta(e) > 0.0))
-        {
-            self.owing = None;
-            self.unprime(charge)?;
-        }
-        if line.draws_in_plane()
-            && line
-                .e
-                .is_some_and(|e| e > 0.0 || !self.extruder.is_absolute())
-        {
+        let bead = line.draws_in_plane() && delta.is_some_and(|delta| delta > 0.0);
+        if bead {
             self.settle_plane()?;
+            self.unprime(self.withdrawn - withdrawn)?;
         }
         // After `settle_plane`, which inserts a height move of its own. An
         // arc counts: a slicer that fits them writes whole regions as `G2`.
@@ -3078,24 +2952,17 @@ impl<'a, W: Write> Pass<'a, W> {
         let Some(e) = line.e.filter(|_| line.draws()) else {
             return self.push(line.origin());
         };
-        let delta = self.extruder.observe(e);
-        // Lines written straight through count too, or the nozzle's charge
-        // goes stale the moment anything is emitted outside a buffered region.
-        if delta < 0.0 {
-            self.pulled(self.withdrawn - delta * factor);
-            self.primed = false;
-        } else if line.is_move() && line.x.is_none() && line.y.is_none() {
-            // The slicer's own prime, which ends its retraction whatever it
-            // restored — a thin wall tapers with `E0`.
-            self.withdrawn = 0.0;
-            self.primed = true;
+        let delta = delta.unwrap_or(0.0) * factor;
+        let delta = if bead {
+            delta
         } else {
-            self.withdrawn = (self.withdrawn - delta * factor).max(0.0);
-        }
+            self.matching_charge(delta, withdrawn)
+        };
+        self.pulled(self.withdrawn - delta);
         if delta > 0.0 {
-            self.filament += delta * factor;
+            self.filament += delta;
         }
-        let value = self.extruder.advance(delta * factor);
+        let value = self.extruder.advance(delta);
         if value == e {
             return self.push(line.origin());
         }
@@ -3556,28 +3423,26 @@ impl<'a, W: Write> Pass<'a, W> {
         self.multiplier_filament += stock * (factor - geometry);
     }
 
-    /// Books a pull back, never beyond the slicer's own retraction length.
-    ///
-    /// A reorder can stack two of the slicer's wipes in a row — one at the end
-    /// of a region and one at the next layer's start — and the model would
-    /// read the nozzle as 1.6 mm empty where the slicer's own retraction is
-    /// 0.8 mm. Capping keeps a dry bead's fill at one retraction instead of
-    /// dumping the whole stack as a blob at the seam.
+    /// Books only the filament actually written. Any redundant withdrawal
+    /// must be removed from the command, not hidden by clamping this value.
     fn pulled(&mut self, amount: f64) {
-        self.withdrawn = amount
-            .max(0.0)
-            .min(self.retract_charge.unwrap_or(f64::INFINITY));
+        self.withdrawn = amount.max(0.0);
     }
 
-    /// Takes `charge` mm of filament back out of the nozzle.
-    ///
-    /// A slicer leaves the hop between two loops of one wall unretracted,
-    /// because a few millimetres with a full nozzle cost nothing. This pass
-    /// moves one of those loops to the end of the layer, so the same hop
-    /// becomes a journey across the plate and every millimetre of it strings.
-    /// The loop's own lead already primes at the far end; what is missing is
-    /// the pull that answers it, so the amount taken out here is exactly the
-    /// amount that lead will put back and the filament still balances.
+    /// Restores the input's charge after a prime or wipe without reversing
+    /// its purpose: a wipe may pull less, but must never become an extrusion.
+    fn matching_charge(&self, delta: f64, wanted: f64) -> f64 {
+        let difference = self.withdrawn - wanted - self.stopped.unwrap_or(0.0);
+        let adjusted = delta + difference;
+        if delta < 0.0 {
+            adjusted.min(0.0)
+        } else {
+            adjusted.max(0.0)
+        }
+    }
+
+    /// Changes the output's charge for an added travel or to match the
+    /// input's measured withdrawal at a bead. Negative pulls, positive fills.
     fn unprime(&mut self, charge: f64) -> io::Result<()> {
         // Nothing to move is nothing to write: a bead that emptied the nozzle
         // exactly leaves a prime of zero, which is a line the printer reads
