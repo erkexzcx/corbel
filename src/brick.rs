@@ -19,6 +19,9 @@
 
 use std::io::{self, BufRead, Write};
 
+mod ground;
+use ground::Ground;
+
 use crate::gcode::feature::{Feature, is_layer_marker};
 use crate::gcode::{Code, Extruder, Line, Lines, MAX_LINE, Modal, repaired, write_e, write_fixed};
 use crate::geometry::Edge;
@@ -746,6 +749,8 @@ struct Pass<'a, W: Write> {
     /// metered for the gap it really crosses rather than for the one its own
     /// parity implies.
     standing: Cells,
+    ground: Ground,
+    next_ground: Ground,
     /// The part of `standing` a column had only climbed half way to. A raise
     /// reaches its offset over [`RAMP`] layers, so what is under a bead is one
     /// of exactly two heights, and which one it is has to be measured for the
@@ -804,6 +809,7 @@ struct Pass<'a, W: Write> {
     /// written in the order they were read, so how far a travel runs is only
     /// knowable from the output.
     wrote_at: (f64, f64),
+    output_at: Option<(f64, f64)>,
     /// Where the INPUT stood before the line being read, so the travel the
     /// slicer planned can be told from the one the reorder produced.
     was_at: (f64, f64),
@@ -940,6 +946,8 @@ impl<'a, W: Write> Pass<'a, W> {
             unsupported: &survey.unsupported,
             support: &survey.support,
             standing: Cells::on(footprint::Grid::default()),
+            ground: Ground::default(),
+            next_ground: Ground::default(),
             climbed: Cells::on(footprint::Grid::default()),
             rising: Cells::on(footprint::Grid::default()),
             climbing: Cells::on(footprint::Grid::default()),
@@ -960,6 +968,7 @@ impl<'a, W: Write> Pass<'a, W> {
             input_withdrawn: 0.0,
             owed_plane: None,
             wrote_at: (0.0, 0.0),
+            output_at: None,
             was_at: (0.0, 0.0),
             stopped: None,
             retract_feed: None,
@@ -1579,6 +1588,30 @@ impl<'a, W: Write> Pass<'a, W> {
         // below left standing under it, and is metered for that gap here as a
         // buffered filler is in [`extrusion_factor`](Self::extrusion_factor).
         let factor = self.filler_factor(from, self.at, line.arc_between(from, self.at));
+        if factor != 1.0
+            && line.draws_in_plane()
+            && line.e.is_some()
+            && line.z.is_none()
+            && self.modal.is_plain()
+        {
+            self.entry = from;
+            self.buffer(line, from);
+            if self.buffer[0].extrudes {
+                let mut current = self.loops[0];
+                current.filler = true;
+                self.next_ground.add(from, self.at, self.buffer[0].arc, 0.0);
+                if !self.split_bead(current, 0, &[None])? {
+                    self.replay(0, factor, &[None])?;
+                }
+            } else {
+                self.replay(0, 1.0, &[None])?;
+            }
+            self.loops.clear();
+            self.buffer.clear();
+            self.arena.clear();
+            self.travelled = false;
+            return Ok(());
+        }
         self.emit(line, factor)
     }
 
@@ -1719,6 +1752,8 @@ impl<'a, W: Write> Pass<'a, W> {
     /// Hands the footprint this layer left standing proud to the next one,
     /// reusing both buffers rather than allocating a set per layer.
     fn close_layer(&mut self) {
+        std::mem::swap(&mut self.ground, &mut self.next_ground);
+        self.next_ground.clear();
         self.rising.settle();
         self.climbing.settle();
         std::mem::swap(&mut self.standing, &mut self.rising);
@@ -2085,12 +2120,13 @@ impl<'a, W: Write> Pass<'a, W> {
             // very first bead.
             None => self.entry,
         });
+        let from = self.output_at.map(written).unwrap_or(from);
         let arc = buffered
             .arc
             .map(|arc| match moved[index].and_then(|to| to.centre) {
                 Some(centre) => Arc {
-                    i: centre.0,
-                    j: centre.1,
+                    i: written(centre).0,
+                    j: written(centre).1,
                     ..arc
                 },
                 None => arc,
@@ -2236,6 +2272,9 @@ impl<'a, W: Write> Pass<'a, W> {
             });
         }
         for at in current.body..current.end {
+            if self.buffer[at].extrudes && self.split_bead(current, at, moved)? {
+                continue;
+            }
             // Past the last bead the flow no longer applies: what is left is
             // the retraction and the wipe, and scaling those pulls back a
             // length the priming move will not put back.
@@ -2799,6 +2838,7 @@ impl<'a, W: Write> Pass<'a, W> {
         }
         if buffered.places {
             self.wrote_at = buffered.at;
+            self.output_at = Some(moved[index].map_or(buffered.at, |point| point.to));
         }
         self.nozzle_z = Some(z);
         if let Some(rate) = buffered.f {
@@ -2930,6 +2970,7 @@ impl<'a, W: Write> Pass<'a, W> {
         }
         if buffered.places {
             self.wrote_at = buffered.at;
+            self.output_at = Some(to.map_or(buffered.at, |point| point.to));
         }
         if let Some(width) = buffered.width {
             self.wrote_width = width;
@@ -3030,6 +3071,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 self.unprime(-charge)?;
             }
             self.wrote_at = self.at;
+            self.output_at = Some(self.at);
         }
         if line.code == Code::SetPosition {
             if let Some(value) = line.e {
@@ -3038,6 +3080,12 @@ impl<'a, W: Write> Pass<'a, W> {
         }
         let bead = line.draws_in_plane() && delta.is_some_and(|delta| delta > 0.0);
         if bead {
+            self.next_ground.add(
+                self.was_at,
+                self.at,
+                line.arc_between(self.was_at, self.at),
+                0.0,
+            );
             self.settle_plane()?;
             self.unprime(self.withdrawn - withdrawn)?;
         }
@@ -3139,7 +3187,14 @@ impl<'a, W: Write> Pass<'a, W> {
     /// to be metered for what that column left standing or it is fed a whole
     /// layer over half a gap.
     fn filler_factor(&self, from: (f64, f64), to: (f64, f64), arc: Option<Arc>) -> f64 {
-        if !is_filler(self.feature) {
+        if !matches!(
+            self.feature,
+            Feature::GapFill
+                | Feature::ThinWall
+                | Feature::SparseInfill
+                | Feature::SolidInfill
+                | Feature::TopSurface
+        ) {
             return 1.0;
         }
         let height = self.height();
@@ -3147,9 +3202,6 @@ impl<'a, W: Write> Pass<'a, W> {
     }
 
     fn bead_geometry(&self, current: Loop, index: usize) -> f64 {
-        if current.on_a_raise == 0.0 {
-            return self.geometry(current);
-        }
         let from = index
             .checked_sub(1)
             .map_or(self.entry, |previous| self.buffer[previous].at);
@@ -3163,58 +3215,169 @@ impl<'a, W: Write> Pass<'a, W> {
         ((height + offset - below) / height).max(0.0)
     }
 
-    fn ground(&self, from: (f64, f64), to: (f64, f64), arc: Option<Arc>) -> f64 {
-        let Some(below) = self.layer.checked_sub(1) else {
-            return 0.0;
-        };
-        if self.standing.is_empty() && self.climbed.is_empty() {
-            return 0.0;
-        }
-        let standing = &self.standing;
-        let climbing = &self.climbed;
-        let mut points = 0usize;
-        let mut on = 0usize;
-        let mut part = 0usize;
-        let walked = footprint::cells(footprint::Grid::default(), from, to, arc, |cell| {
-            points += 1;
-            on += usize::from(standing.has(cell));
-            part += usize::from(climbing.has(cell));
+    fn split_bead(
+        &mut self,
+        current: Loop,
+        index: usize,
+        moved: &[Option<Moved>],
+    ) -> io::Result<bool> {
+        let buffered = self.buffer[index];
+        let from = index.checked_sub(1).map_or(self.entry, |previous| {
+            moved[previous].map_or(self.buffer[previous].at, |point| point.to)
         });
-        if walked == Trace::Refused || points == 0 || on == 0 {
-            return 0.0;
+        let from = self.output_at.map(written).unwrap_or(from);
+        let to = moved[index].map_or(buffered.at, |point| point.to);
+        let arc = buffered
+            .arc
+            .map(|arc| match moved[index].and_then(|point| point.centre) {
+                Some(centre) => Arc {
+                    i: centre.0,
+                    j: centre.1,
+                    ..arc
+                },
+                None => arc,
+            });
+        let spans = self.ground.profile(
+            from,
+            to,
+            arc,
+            bead_spacing(self.height(), self.wall_width.unwrap_or(REFERENCE_WIDTH)) / 2.0,
+        );
+        if spans.len() < 2 || buffered.z.is_some() {
+            return Ok(false);
         }
-        ((on - part) as f64 * self.rise_at(RAMP, below) + part as f64 * self.rise_at(1, below))
-            / points as f64
+        let Some(delta) = buffered.delta else {
+            return Ok(false);
+        };
+        let curve = arc.and_then(|arc| footprint::turn(from, to, arc));
+        let point_at = |share: f64| {
+            written(if share == 1.0 {
+                to
+            } else if let Some((centre, radius, opening, sweep)) = curve {
+                let angle = opening + sweep * share;
+                (
+                    centre.0 + radius * angle.cos(),
+                    centre.1 + radius * angle.sin(),
+                )
+            } else {
+                (
+                    from.0 + (to.0 - from.0) * share,
+                    from.1 + (to.1 - from.1) * share,
+                )
+            })
+        };
+        let length = footprint::along(from, to, arc);
+        let mut combined = Vec::new();
+        let mut begin = 0.0;
+        let mut last = 0.0;
+        let mut integral = 0.0;
+        for (share, below) in spans {
+            integral += (share - last) * below;
+            last = share;
+            if share < 1.0
+                && ((share - begin) * length < 0.002
+                    || (1.0 - share) * length < 0.002
+                    || point_at(share) == point_at(begin)
+                    || (point_at(share) == point_at(1.0) && (1.0 - share) * length < 0.002))
+            {
+                continue;
+            }
+            combined.push((share, integral / (share - begin)));
+            begin = share;
+            integral = 0.0;
+        }
+        if combined.len() < 2 {
+            return Ok(false);
+        }
+        let ratio = moved[index].map_or(1.0, |point| point.ratio);
+        let bytes = self.arena[buffered.start..buffered.end].to_vec();
+        self.settle_plane()?;
+        self.unprime(self.withdrawn - buffered.withdrawn)?;
+        let asked = buffered.f.or(self.wanted_feed);
+        self.wanted_feed = asked;
+        let mut previous = written(from);
+        let mut start = 0.0;
+        for (share, below) in combined {
+            let destination = point_at(share);
+            let piece_arc = arc.map(|arc| Arc {
+                i: from.0 + arc.i - previous.0,
+                j: from.1 + arc.j - previous.1,
+                ..arc
+            });
+            let height = self.height();
+            let geometry = ((height + self.rise_of(current) - below) / height).max(0.0);
+            let factor = self.extrusion_factor(current, geometry);
+            let stock = delta * ratio * (share - start) * factor;
+            self.meter(
+                index,
+                index + 1,
+                factor * (share - start),
+                geometry * (share - start),
+                self.rise_of(current) > 0.0,
+            );
+            let reading = self.extruder.is_absolute();
+            self.extruder.set_mode(e_mode(buffered.absolute));
+            let before = self.extruder.advance(0.0);
+            let value = self.extruder.advance(stock);
+            self.extruder.set_mode(e_mode(reading));
+            let rounded = ((value * 100_000.0).round() - (before * 100_000.0).round()) / 100_000.0;
+            let along = footprint::along(
+                previous,
+                destination,
+                piece_arc.map(|arc| Arc {
+                    i: (arc.i * 1000.0).round() / 1000.0,
+                    j: (arc.j * 1000.0).round() / 1000.0,
+                    ..arc
+                }),
+            );
+            let needed = asked.map(|rate| {
+                match self
+                    .melt_rate
+                    .filter(|_| length >= MELT_GAUGE && along > 0.0 && rounded > 0.0)
+                {
+                    Some(ceiling) => rate.min(ceiling * along * 60.0 / rounded),
+                    None => rate,
+                }
+            });
+            let rate = needed.filter(|rate| Some(*rate) != self.feedrate || buffered.f.is_some());
+            let raw = if share == 1.0 {
+                bytes.as_slice()
+            } else {
+                &bytes[..bytes
+                    .iter()
+                    .position(|byte| *byte == b';')
+                    .unwrap_or(bytes.len())]
+            };
+            let text = repaired(raw);
+            Line::parse_bytes(&text, raw).write_segment_at(
+                &mut self.out,
+                previous,
+                destination,
+                piece_arc,
+                value,
+                rate,
+            )?;
+            self.out.write_all(b"\n")?;
+            self.pulled(self.withdrawn - stock);
+            self.filament += stock;
+            if let Some(rate) = needed {
+                self.feedrate = Some(rate);
+            }
+            previous = destination;
+            start = share;
+        }
+        self.wrote_at = buffered.at;
+        self.output_at = Some(to);
+        Ok(true)
     }
 
-    /// How far the bead reaches, as a multiple of its own layer's height,
-    /// before the multiplier.
-    ///
-    /// It starts on top of whatever the layer below left under it and ends at
-    /// the nozzle, so the span is this layer's height plus the ground its own
-    /// rise gains over that. Where the two match it spans exactly one layer
-    /// and the arithmetic is skipped rather than trusted: `(h + x) - x` is not
-    /// `h` in binary.
-    ///
-    /// Both ends are read off what actually happened rather than off the
-    /// parity, because the two part company: a wall that gains or loses a loop
-    /// renumbers, and a stretch the slicer calls an overhang is held flat
-    /// whatever its column did. A bead metered for a parity it no longer has
-    /// crosses **half** the gap it was fed for, which is the one direction
-    /// that blobs.
-    fn geometry(&self, current: Loop) -> f64 {
-        let offset = self.rise_of(current);
-        let below = self.rise_below(current);
-        if offset == below {
-            return 1.0;
-        }
-        let height = self.height();
-        // Floored at nothing rather than allowed to go negative. The ground
-        // can stand above the nozzle where a layer is under half the one
-        // beneath it, and a negative factor is not a thin bead but a
-        // retraction written mid-wall, which unprimes the nozzle and leaves
-        // the extruder measuring from a position it never reached.
-        ((height + offset - below) / height).max(0.0)
+    fn ground(&self, from: (f64, f64), to: (f64, f64), arc: Option<Arc>) -> f64 {
+        self.ground.mean(
+            from,
+            to,
+            arc,
+            bead_spacing(self.height(), self.wall_width.unwrap_or(REFERENCE_WIDTH)) / 2.0,
+        )
     }
 
     /// How far above its layer's plane this loop is printed.
@@ -3292,31 +3455,6 @@ impl<'a, W: Write> Pass<'a, W> {
         } else {
             self.rise_at(steps, self.layer)
         }
-    }
-
-    /// The offset the material under this loop was left standing at, measured
-    /// from the layer below's height rather than this one's.
-    ///
-    /// Zero wherever that layer left nothing proud here, however this loop's
-    /// own parity fell. Where it did leave something, how tall it stood is
-    /// read off the footprint too: a column reaches its offset over [`RAMP`]
-    /// layers, so what is under a bead is either the full rise or the one
-    /// intermediate step of the climb.
-    ///
-    /// It used to be worked out from this loop's own `steps`, which is three
-    /// valued — nought, one, or the object's whole age. A column opening at
-    /// layer M is supported from M+2 on, so from there its loops read as old
-    /// as the object and the layer below was taken for a settled raise when it
-    /// was really the middle of the climb: the span came out 1.0 where the
-    /// truth is 1.25, feeding the bead four fifths of the gap it crosses. That
-    /// is the roof of every bridged hole and the underside of every shelf, two
-    /// layers above the column's first bead.
-    fn rise_below(&self, current: Loop) -> f64 {
-        let share = current.on_a_raise;
-        let Some(below) = self.layer.checked_sub(1).filter(|_| share > 0.0) else {
-            return 0.0;
-        };
-        share * self.rise_at(if current.on_a_climb { 1 } else { RAMP }, below)
     }
 
     /// Layers printed since this object's first. A file that completes objects
@@ -3432,6 +3570,12 @@ impl<'a, W: Write> Pass<'a, W> {
             // gap cannot hold.
             self.loops[index].on_a_climb = share[4] * 2 > share[3];
             let current = self.loops[index];
+            let mut next_ground = std::mem::take(&mut self.next_ground);
+            let rise = self.rise_of(current);
+            self.trace(current, |from, to, arc| {
+                next_ground.add(from, to, arc, rise)
+            });
+            self.next_ground = next_ground;
             if self.rise_of(current) > 0.0 {
                 rising.absorb(&path);
                 let start = self.raised_cells.len();

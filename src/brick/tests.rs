@@ -2056,15 +2056,25 @@ fn the_dial_means_the_same_thing_whatever_the_nozzle() {
 /// profile that lays wider beads pays less for the same layer.
 #[test]
 fn the_width_the_file_states_sets_the_flow() {
-    let walls = format!(";TYPE:Perimeter\n{}", wall_of(2, "loop", 0.0, 10.0, 1.0));
+    let walls = |width| {
+        let spacing = bead_spacing(0.2, width);
+        format!(
+            ";TYPE:Perimeter\n{}{}",
+            wall_of(1, "loop", spacing, 10.0 - 2.0 * spacing, 1.0),
+            wall_of(1, "outer", 0.0, 10.0, 1.0)
+        )
+    };
     let narrow = run(
-        &format!("; inner_wall_line_width = 0.35\n{}", middle_layer(&walls)),
+        &format!(
+            "; inner_wall_line_width = 0.35\n{}",
+            middle_layer(&walls(0.35))
+        ),
         &Config::default(),
     );
     let wide = run(
         &format!(
             "; perimeter_extrusion_width = 0.65\n{}",
-            middle_layer(&walls)
+            middle_layer(&walls(0.65))
         ),
         &Config::default(),
     );
@@ -2371,16 +2381,22 @@ fn a_wall_whose_approach_cannot_be_moved_is_left_exactly_where_it_was() {
     let beads: Vec<(f64, f64)> = out
         .lines()
         .skip_while(|line| !line.ends_with("; skin1"))
-        .take(sliced.len())
-        .map(|line| {
+        .take_while(|line| !line.starts_with("G1 X0.60 Y0.60 F9000"))
+        .filter_map(|line| {
             let parsed = Line::parse(line);
-            (parsed.x.expect("an X"), parsed.y.expect("a Y"))
+            parsed.e.filter(|value| *value > 0.0).and(parsed.xy())
         })
         .collect();
-    assert_eq!(beads.len(), sliced.len(), "the visible wall:\n{out}");
-    for (bead, corner) in beads.iter().zip(sliced) {
+    assert!(
+        sliced.iter().all(|corner| beads.contains(corner)),
+        "the original corners survive: {out}"
+    );
+    for bead in &beads {
         assert!(
-            (bead.0 - corner.0).abs() < 5e-4 && (bead.1 - corner.1).abs() < 5e-4,
+            (bead.0 - 9.85).abs() < 5e-4
+                || (bead.0 - 0.15).abs() < 5e-4
+                || (bead.1 - 9.40).abs() < 5e-4
+                || (bead.1 - 0.60).abs() < 5e-4,
             "the wall was drawn in to {bead:?} with nothing in its lead able \
              to take the nozzle there, so it is laid from the corner the \
              slicer chose:\n{out}"
@@ -3045,18 +3061,239 @@ fn a_bead_over_mixed_ground_weights_both_heights() {
     pass.layer = 3;
     let from = (0.05, 0.05);
     let to = (0.35, 0.05);
-    let mut cells = Vec::new();
-    footprint::cells(footprint::Grid::default(), from, to, None, |cell| {
-        cells.push(cell);
-    });
-    assert_eq!(cells.len(), 2);
-    pass.standing.absorb(&cells);
-    pass.standing.settle();
-    pass.climbed.absorb(&cells[..1]);
-    pass.climbed.settle();
+    pass.ground.add(from, (0.2, 0.05), None, 0.05);
+    pass.ground.add((0.2, 0.05), to, None, 0.1);
     assert!((pass.ground(from, to, None) - 0.075).abs() < 1e-12);
     pass.feature = Feature::ThinWall;
     assert!((pass.filler_factor(from, to, None) - 0.625).abs() < 1e-12);
+}
+
+#[test]
+fn a_surface_over_a_raise_is_metered_for_the_remaining_gap() {
+    for (feature, expected) in [
+        (Feature::TopSurface, 0.5),
+        (Feature::from_comment("; FEATURE: Support").unwrap(), 1.0),
+    ] {
+        let survey = Survey::of("; layer_height = 0.2\nM83\n");
+        let config = plain();
+        let mut pass = Pass::new(Vec::new(), &config, &survey);
+        pass.layer = 3;
+        pass.layer_z = 0.8;
+        pass.nozzle_z = Some(0.8);
+        pass.extruder.set_mode(Code::RelativeE);
+        pass.feature = feature;
+        pass.ground.add((0.0, 0.0), (10.0, 0.0), None, 0.1);
+        pass.at = (10.0, 0.0);
+        pass.keep(Line::parse("G1 X10 Y0 E1"), (0.0, 0.0)).unwrap();
+        let out = String::from_utf8(pass.out).unwrap();
+        let stock: f64 = out.lines().filter_map(|raw| Line::parse(raw).e).sum();
+        assert!((stock - expected).abs() < 1e-5, "{feature:?}: {out}");
+    }
+}
+
+#[test]
+fn a_surface_stroke_is_split_where_the_gap_changes() {
+    let survey = Survey::of("; layer_height = 0.2\nM83\n");
+    let config = plain();
+    let mut pass = Pass::new(Vec::new(), &config, &survey);
+    pass.layer = 3;
+    pass.layer_z = 0.8;
+    pass.nozzle_z = Some(0.8);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.feature = Feature::TopSurface;
+    pass.ground.add((0.0, 0.0), (5.0, 0.0), None, 0.1);
+    pass.at = (10.0, 0.0);
+    pass.keep(Line::parse("G1 X10 Y0 E1 ; surface"), (0.0, 0.0))
+        .unwrap();
+    let out = String::from_utf8(pass.out).unwrap();
+    let mut previous = 0.0;
+    let mut checked = [false; 2];
+    for raw in out.lines() {
+        let line = Line::parse(raw);
+        if let (Some(to), Some(stock)) = (line.x, line.e) {
+            if to - previous > 1.0 {
+                let region = usize::from(previous > 5.0);
+                let expected = if region == 0 { 0.05 } else { 0.1 };
+                assert!((stock / (to - previous) - expected).abs() < 1e-4, "{out}");
+                checked[region] = true;
+            }
+            previous = to;
+        }
+    }
+    assert_eq!(checked, [true, true], "{out}");
+    assert_eq!(out.matches("; surface").count(), 1);
+}
+
+#[test]
+fn a_wall_crossing_a_grid_boundary_still_sits_on_its_raise() {
+    let mut source = String::from("; layer_height = 0.2\nM83\n");
+    for layer_index in 0..7 {
+        source.push_str(&layer(0.2 * f64::from(layer_index + 1)));
+        source.push_str(";TYPE:Perimeter\n");
+        let origin = if layer_index < 4 { 0.29 } else { 0.31 };
+        for loop_index in 1..=2 {
+            let inset = 0.45 * f64::from(2 - loop_index);
+            let near = origin + inset;
+            let far = origin + 10.0 - inset;
+            source.push_str(&format!("G1 X{near:.3} Y{near:.3} F9000\n"));
+            for (side, (x, y)) in [(far, near), (far, far), (near, far), (near, near)]
+                .into_iter()
+                .enumerate()
+            {
+                source.push_str(&format!(
+                    "G1 X{x:.3} Y{y:.3} E1 ; drift{layer_index}loop{loop_index}side{side}\n"
+                ));
+            }
+        }
+    }
+    let out = run(&source, &plain());
+    let extrusion = |tag: &str| {
+        out.lines()
+            .find(|line| line.ends_with(tag))
+            .and_then(|line| Line::parse(line).e)
+            .unwrap()
+    };
+    assert!(
+        (extrusion("drift4loop2side3") - 1.0).abs() < 0.01,
+        "a two-hundredth-millimetre shift cannot open half a layer of gap:\n{out}"
+    );
+    assert!(
+        (extrusion("drift4loop1side3") - 1.0).abs() < 0.01,
+        "the neighboring flat column is not standing on the raise:\n{out}"
+    );
+}
+
+#[test]
+fn a_long_bead_is_metered_where_its_gap_changes() {
+    let survey = Survey::of("; layer_height = 0.2\nM83\n");
+    let config = plain();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.layer = 3;
+    pass.layer_z = 0.8;
+    pass.nozzle_z = Some(0.8);
+    pass.extruder.set_mode(Code::RelativeE);
+    pass.feature = Feature::InternalPerimeter;
+    pass.ground.add((0.0, 0.0), (5.0, 0.0), None, 0.1);
+    pass.buffer(Line::parse("G1 X0 Y0 F600"), (0.0, 0.0));
+    pass.at = (10.0, 0.0);
+    pass.buffer(Line::parse("G1 X10 Y0 E1 ; mixed gap"), (0.0, 0.0));
+    pass.assign_contours();
+    let current = pass.loops[0];
+    pass.write_loop(current, 0.8, &[None, None]).unwrap();
+    drop(pass);
+    let out = String::from_utf8(out).unwrap();
+    let mut previous = 0.0;
+    let mut stock = [0.0; 2];
+    let mut length = [0.0; 2];
+    for raw in out.lines() {
+        let line = Line::parse(raw);
+        if let Some(x) = line.x {
+            if let Some(delta) = line.e.filter(|value| *value > 0.0) {
+                let region = usize::from(x > 5.5);
+                if x - previous > 1.0 {
+                    stock[region] += delta;
+                    length[region] += x - previous;
+                } else {
+                    let rate = delta / (x - previous);
+                    assert!(
+                        (0.049..=0.101).contains(&rate),
+                        "transition rate {rate}: {out}"
+                    );
+                }
+            }
+            previous = x;
+        }
+    }
+    assert!(
+        length[0] > 4.5 && length[1] > 4.5,
+        "both stretches must be metered separately: {out}"
+    );
+    assert!(
+        (stock[0] / length[0] - 0.05).abs() < 1e-4,
+        "half a gap: {out}"
+    );
+    assert!(
+        (stock[1] / length[1] - 0.1).abs() < 1e-4,
+        "a full gap: {out}"
+    );
+}
+
+#[test]
+fn a_split_full_circle_keeps_its_curve_and_absolute_or_relative_extrusion() {
+    for mode in [Code::AbsoluteE, Code::RelativeE] {
+        let survey = Survey::of("; layer_height = 0.2\nM83\n");
+        let config = plain();
+        let mut out = Vec::new();
+        let mut pass = Pass::new(&mut out, &config, &survey);
+        pass.layer = 3;
+        pass.layer_z = 0.8;
+        pass.nozzle_z = Some(0.8);
+        pass.extruder.set_mode(mode);
+        pass.feature = Feature::InternalPerimeter;
+        pass.ground.add(
+            (2.0, 0.0),
+            (-2.0, 0.0),
+            Some(Arc {
+                i: -2.0,
+                j: 0.0,
+                clockwise: false,
+            }),
+            0.1,
+        );
+        pass.ground.add(
+            (-2.0, 0.0),
+            (2.0, 0.0),
+            Some(Arc {
+                i: 2.0,
+                j: 0.0,
+                clockwise: false,
+            }),
+            0.0,
+        );
+        pass.at = (2.0, 0.0);
+        pass.buffer(Line::parse("G1 X2 Y0 F600"), (0.0, 0.0));
+        pass.buffer(Line::parse("G3 I-2 J0 E1 ; full circle"), (2.0, 0.0));
+        pass.assign_contours();
+        pass.write_loop(pass.loops[0], 0.8, &[None, None]).unwrap();
+        drop(pass);
+        let out = String::from_utf8(out).unwrap();
+        let mut extruder = Extruder::new();
+        extruder.set_mode(mode);
+        let mut modal = Modal::new();
+        let mut stock = 0.0;
+        let mut length = 0.0;
+        let mut pieces = 0;
+        for raw in out.lines() {
+            let line = Line::parse(raw);
+            let from = modal.position();
+            modal.apply(&line);
+            if let Some(value) = line.e {
+                let delta = extruder.observe(value);
+                assert!(delta >= 0.0, "a segment cannot retract: {raw}");
+                assert_eq!(line.code, Code::Arc, "{raw}");
+                let to = modal.position();
+                let arc = line.arc_between((from.0, from.1), (to.0, to.1)).unwrap();
+                assert!(
+                    (from.0 + arc.i).abs() < 0.002 && (from.1 + arc.j).abs() < 0.002,
+                    "the circle's centre moved: {raw}"
+                );
+                length += footprint::along((from.0, from.1), (to.0, to.1), Some(arc));
+                stock += delta;
+                pieces += 1;
+            }
+        }
+        assert!(pieces >= 2, "{out}");
+        assert!(
+            (length - std::f64::consts::TAU * 2.0).abs() < 0.01,
+            "extra revolution: {out}"
+        );
+        assert!(
+            (stock - 0.75).abs() < 0.01,
+            "one half filled at half flow: {out}"
+        );
+        assert_eq!(out.matches("; full circle").count(), 1);
+    }
 }
 
 /// The region buffer and the loop list are reused between regions, so a
@@ -3488,7 +3725,10 @@ fn absolute_extrusion_stays_continuous() {
     assert_eq!(delta("; loop1"), 2.0, "the loop on the plane is doubled");
     assert_eq!(delta("; loop2"), 2.0, "and so is the raised one");
     assert!(
-        out.contains("G1 X30 Y0 E"),
+        out.lines().any(|raw| {
+            let line = Line::parse(raw);
+            line.xy() == Some((30.0, 0.0)) && line.e.is_some()
+        }),
         "the infill after it is kept: {out}"
     );
 }
@@ -3767,9 +4007,16 @@ fn gap_fill_inside_a_wall_does_not_split_it() {
         "the wall is numbered from its visible loop straight through the gap \
          fill, which takes no place of its own in the alternation: {out}"
     );
+    let delta = out
+        .lines()
+        .find(|line| line.ends_with("; gap1"))
+        .and_then(|line| Line::parse(line).e)
+        .unwrap();
+    let spacing = bead_spacing(0.2, REFERENCE_WIDTH);
+    let share = (spacing / 2.0 - (0.68 - 0.45) / 2.0) / spacing;
     assert!(
-        out.contains("G1 X5.00 Y0.68 E0.2 ; gap1"),
-        "and the gap fill itself is left exactly as it was sliced: {out}"
+        (delta - 0.2 * (1.0 - share / 2.0)).abs() < 0.001,
+        "gap fill meters its partial overlap without added wall flow: {out}"
     );
 }
 
@@ -4224,11 +4471,16 @@ fn a_thin_wall_inside_a_wall_does_not_split_it() {
         "the wall is numbered from its visible loop straight through the \
          thin wall, which takes no place of its own in the alternation: {out}"
     );
-    // It stands on the plane here and nothing below it is raised, so its own
-    // bead is metered for exactly the layer it crosses.
+    let delta = out
+        .lines()
+        .find(|line| line.ends_with("; thin1"))
+        .and_then(|line| Line::parse(line).e)
+        .unwrap();
+    let spacing = bead_spacing(0.2, REFERENCE_WIDTH);
+    let share = (spacing / 2.0 - (0.68 - 0.45) / 2.0) / spacing;
     assert!(
-        out.contains("G1 X5.00 Y0.68 E0.2 ; thin1"),
-        "and the thin wall itself is left as it was sliced: {out}"
+        (delta - 0.2 * (1.0 - share / 2.0)).abs() < 0.001,
+        "the thin wall meters its partial overlap without added wall flow: {out}"
     );
 }
 
@@ -5094,19 +5346,58 @@ fn cornered_plate() -> String {
 fn a_short_corner_bead_is_slowed_like_the_edge_beside_it() {
     let source = cornered_plate();
     let out = run(&source, &Config::default());
-    assert_eq!(out.matches("X1.75 Y1.0 E").count(), 5, "{out}");
     // Both climb layers meter the corner beads for the extra filament, at
     // the same slowed rate the long edge beside them takes — never restored
     // to the wall's own rate, which is how the speed used to flip at every
     // corner of the print.
-    assert_eq!(
-        out.matches("G1 X1.75 Y1.0 E0.04484 F1044").count(),
-        2,
-        "{out}"
-    );
-    assert!(!out.contains("F13265.000"), "{out}");
-    // The long edge is still throttled — the positive control.
-    assert_eq!(out.matches("G1 X1.75 Y0.9 E0.3843").count(), 2, "{out}");
+    let ceiling = Survey::of(&source).melt_at(0).unwrap();
+    let mut layer = 0;
+    let mut feed = 0.0;
+    let mut modal = Modal::new();
+    let mut corners = 0.0;
+    let mut feature = Feature::Other;
+    let mut endpoints = 0;
+    for raw in out.lines() {
+        let line = Line::parse(raw);
+        if let Some(found) = line.marker().and_then(Feature::from_marker) {
+            feature = found;
+        }
+        if feature == Feature::InternalPerimeter && line.xy() == Some((1.75, 1.0)) {
+            endpoints += 1;
+        }
+        if line.marker().is_some_and(is_layer_marker) {
+            layer += 1;
+        }
+        if let Some(rate) = line.f {
+            feed = rate;
+        }
+        let from = modal.position();
+        modal.apply(&line);
+        let to = modal.position();
+        if feature == Feature::InternalPerimeter
+            && (2..=3).contains(&layer)
+            && from.0 == 1.75
+            && to.0 == 1.75
+            && from.1 >= 0.9
+            && to.1 <= 1.0
+            && to.1 > from.1
+            && let Some(delta) = line.e
+        {
+            let along = to.1 - from.1;
+            corners += along;
+            assert!(
+                delta / along >= 0.35 * 1.2 && feed < 13265.0 * 0.85,
+                "climbing corner must be slowed: {raw}"
+            );
+            assert!(
+                delta / along * feed / 60.0 <= ceiling * 1.001,
+                "corner exceeds the melt limit: {raw}"
+            );
+        }
+    }
+    assert!((corners - 0.2).abs() < 1e-9);
+    assert_eq!(endpoints, 5, "{out}");
+    assert!(out.contains("G1 X1.75 Y0.9 E0.3843"), "{out}");
 }
 
 /// A wall whose inner loop runs a fifth of a millimetre from a support bead,

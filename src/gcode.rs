@@ -672,8 +672,40 @@ impl<'a> Line<'a> {
         Ok(true)
     }
 
-    /// Writes the line with its `E` word replaced. The rest of it, including
-    /// any comment, is copied byte for byte.
+    pub fn write_segment_at<W: Write>(
+        &self,
+        out: &mut W,
+        from: (f64, f64),
+        to: (f64, f64),
+        arc: Option<crate::geometry::Arc>,
+        e: f64,
+        f: Option<f64>,
+    ) -> io::Result<()> {
+        let mut append = Vec::new();
+        if self.x_span.is_none() {
+            append.push((b'X', to.0));
+        }
+        if self.y_span.is_none() {
+            append.push((b'Y', to.1));
+        }
+        let mut bytes = Vec::new();
+        rewrite(&mut bytes, self.origin, &[], &append)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut line = Line::parse_bytes(&text, &bytes);
+        if line.r.is_some()
+            && let Some((_, radius, _, sweep)) =
+                arc.and_then(|arc| crate::geometry::turn(from, to, arc))
+        {
+            line.r = Some(if sweep.abs() > std::f64::consts::PI {
+                -radius
+            } else {
+                radius
+            });
+        }
+        line.write_moved_at(out, to, arc.map(|arc| (arc.i, arc.j)), Some(e), None, f)?;
+        Ok(())
+    }
+
     pub fn write_e<W: Write>(&self, out: &mut W, value: f64) -> io::Result<()> {
         write_e(out, self.origin, self.e_span, value)
     }
@@ -1658,6 +1690,31 @@ mod tests {
             with_e(&line, 0.075),
             "G1 X1 Y1 E0.07500 F1800 ; keep E0.05 here"
         );
+    }
+
+    #[test]
+    fn a_short_piece_of_a_major_radius_arc_is_not_an_extra_revolution() {
+        let line = Line::parse("G3 X0 Y-7 R-7 E1 ; keep");
+        let mut out = Vec::new();
+        let to = (7.0 / 2.0_f64.sqrt(), 7.0 / 2.0_f64.sqrt());
+        let arc = crate::geometry::Arc {
+            i: -7.0,
+            j: 0.0,
+            clockwise: false,
+        };
+        line.write_segment_at(&mut out, (7.0, 0.0), to, Some(arc), 0.2, None)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let piece = Line::parse(&text);
+        assert!(piece.r.unwrap() > 0.0, "{text}");
+        let arc = piece.arc_between((7.0, 0.0), piece.xy().unwrap()).unwrap();
+        let length = crate::geometry::along((7.0, 0.0), piece.xy().unwrap(), Some(arc));
+        assert!(
+            (length - 7.0 * std::f64::consts::FRAC_PI_4).abs() < 0.002,
+            "{text}"
+        );
+        assert_eq!(piece.e, Some(0.2));
+        assert_eq!(piece.comment(), Some(" keep"));
     }
 
     #[test]

@@ -109,7 +109,7 @@ Z anti-aliasing has no dials: how wide a tread is worth following is a *slope* o
 
 The gaps are drawn far larger than life — on a 0.2 mm layer they are a few microns across.
 
-**What it touches.** Every wall, and only walls — infill, bridges and the surfaces come out exactly as sliced, and gap fill and a thin wall are metered for the column they stand over rather than raised, so it is never a global flow bump. Two walls are enough; three or more interlocks twice as much.
+**What it touches.** Walls interlock; infill, bridges, surfaces and thin fillers stay at their sliced heights but receive less filament wherever a raised bead below leaves a smaller gap. Moves crossing different gaps are metered in pieces, including arcs. Support and ironing are unchanged. Two walls are enough; three or more interlocks twice as much.
 
 **Each bead is metered for its own gap.** A loop can sit over a raised column along one edge and flat material along another. Giving both edges the loop's average flow overfills one and starves the other, even when the filament total looks right. Compensation follows the material under each bead, including columns still climbing to their offset.
 
@@ -133,7 +133,7 @@ So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle,
 
 **Set it anywhere from 0 to 50.** `0` adds no extra wall flow and moves no wall inward; the raise and per-bead gap compensation remain. The top of the range is for sweeping a test print rather than printing with, and there is a ceiling nobody picked: a bead can be widened until its edge reaches the centre of the loop beside it, which is the bead model's own arithmetic rather than a chosen limit.
 
-**What it costs on the whole part is small, because it is paid only on walls.** On a ten-object plate at the default, a flow of 1.025 on the walls added **+0.89%** to the part; on a part that is mostly wall it is a little over 2%. Infill, bridges and the surfaces are metered exactly as sliced, and gap fill and a thin wall are metered for the column they stand over, so it is never a global flow bump.
+**Extra flow is paid only on walls.** On a ten-object plate at the default, a flow of 1.025 on the walls added **+0.89%** to the part; on a part that is mostly wall it is a little over 2%. Other part regions receive only the filament their remaining gap needs, never the wall's extra-flow multiplier.
 
 **Where the numbers come from.** The width is read from whichever states it first — the `SLIC3R_*` configuration your slicer exports to a post-processing script, a `.bgcode` container's metadata, or the settings block appended to plain `.gcode` — with a percentage resolved against `nozzle_diameter`. Layer heights are measured from the commanded Z one layer at a time. A file stating no width, as Cura's do, falls back to a reference profile for both the flow and the inward move, and `-v` says so.
 

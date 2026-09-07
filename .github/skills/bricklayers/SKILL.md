@@ -91,15 +91,7 @@ Four consequences that are easy to get backwards:
    percentage is resolved against `nozzle_diameter`**, which the same three
    sources state. Both real Prusa bgcode fixtures carry both keys.
 
-   The layer on the plate is excluded, for the reason in point 3 — nothing
-   presses a bead there. Nothing outside a perimeter region is re-metered:
-   only those regions are buffered for flow, and only a buffered line is ever
-   rescaled. Verified on a 40-layer three-wall part with a hole: infill and
-   solid surface `E` words byte-identical to the input (240 occurrences
-   unchanged), internal wall `E` words rewritten everywhere but the bed layer
-   (320 → 8, 1280 → 32). Cost on that part at `1.02`: 1.53% of its mass, where
-   the same figure on a slicer's global flow ratio would add 2%. `--verbose`
-   prints the exact figure per file.
+  The layer on the plate is excluded. The extra-flow multiplier belongs only to perimeter regions. Other part regions are compensated for the smaller gap wherever they cross a raise below, without receiving extra flow. Where their ground remains flat they retain the slicer's extrusion. `--verbose` reports the multiplier's cost separately from gap compensation.
 
    **The joint against the visible wall is fed from one side only** unless the
    visible wall is scaled too, and scaling it alone would grow the part: a
@@ -321,9 +313,11 @@ Four consequences that are easy to get backwards:
 
 ### Meter each bead, not the loop's average
 
-The loop-wide share described above is only a fast rejection when no bead sits on a raise. `Pass::bead_geometry` meters each bead against `Pass::ground`, which measures that bead's own path through `standing` and `climbed`. A loop can cross a raised column along one edge and flat material along another: using its average overfills one and starves the other while leaving the filament total almost unchanged. A mix of climbing and settled ground takes the weighted height of both, never a majority vote. Unbuffered fillers use the same measurement.
+`brick::ground::Ground` measures distance to deposited straight and arc paths across the bead's width; grid cells only find nearby paths. Cell equality is not contact: shifting a synthetic wall 0.02 mm across a cell boundary must not add half a layer of filament. A mix of flat, climbing and settled material takes its measured height, never a majority vote. `Pass::split_bead` meters each stretch of a move separately. Unbuffered infill and surfaces use the same writer, without the wall's extra-flow multiplier; support and ironing are excluded.
 
 Pinned by `each_bead_is_metered_for_its_own_part_of_a_loop` and `a_bead_over_mixed_ground_weights_both_heights`. The former moves one edge of a synthetic rectangle outward and checks the unchanged edge, the moved edge, and their caps independently. Keep private reproductions outside the repository; these tests contain no customer geometry.
+
+Profile searches include both endpoints and preserve intermediate heights when several transitions fall in one interval. Merge sub-resolution pieces before writing: three-decimal coordinates can turn a tiny arc into a near-full circle, reproduced by the public cone fixture. Every generated piece of a melt-limited bead remains limited, even below `MELT_GAUGE`. Tests cover endpoint transitions, neighboring transitions, split circles in M82/M83, mixed-gap surfaces, support preservation and split corner throughput.
 
 ## Contour grouping — the hard part
 
@@ -877,6 +871,10 @@ Filament totals cannot detect excess primes that cancel starved beads. `tests/no
 - **Leading-dot floats** (`G1 Z.6`, `E.41252`) are normal.
 
 ### Analysis scripts
+
+The reusable extrusion inspector lives at [scripts/extrusion.rs](scripts/extrusion.rs), built as the `audit-extrusion` Cargo example. Run `cargo test --example audit-extrusion` to check its controls. Run `cargo run --release --example audit-extrusion -- <mode> <input.gcode> <output.gcode>` with `gap`, `paths`, `settings`, `travels`, `geometry` or `nozzle`. Both files are read-only; private inputs and reports stay outside the repository and must not be uploaded or previewed.
+
+`gap` screens matched pieces at least 0.5 mm long against the previous layer's deposited paths, separately by region and by straight/arc motion. It uses exact distance to each curve, midpoint sampling along the bead and 11 samples across its width. Counts include excessive flow, missing flow and path without nearby ground. Compare input against itself to distinguish existing bridges from introduced unsupported extrusion. This is a geometric screen, not a physical print guarantee; its controls deliberately overfill and underfill a gap. `paths` and `settings` accept pieces of original moves; `geometry` instead requires identical bead geometry and order. `nozzle` checks excess primes, dry beads, displaced wipes and the other nozzle-ledger assertions. A matching filament total alone cannot establish any of these. The gap screen assumes the default `--bricks` extra flow.
 
 - **Split regions on `;LAYER_CHANGE` as well as `;TYPE:`.** Not doing so merged
   a layer's opening segment into the previous layer's region and produced a
