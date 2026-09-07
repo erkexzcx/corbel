@@ -4657,6 +4657,28 @@ fn a_prime_is_only_settled_when_the_nozzle_is_full() {
     assert!(pass.primed, "the prime marked the nozzle primed");
 }
 
+/// A pair of wipes stacked by a reorder is still one retraction: the nozzle
+/// can never look emptier than the file's own retraction length, so a bead
+/// drawn after two of them is filled with one charge, not the sum.
+#[test]
+fn a_stacked_pair_of_wipes_is_capped_at_one_retraction() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+
+    // One full wipe already on the books, then a second one arrives.
+    pass.withdrawn = 0.8;
+    pass.pulled(pass.withdrawn + 0.8);
+
+    assert!(
+        (pass.withdrawn - 0.8).abs() < 1e-9,
+        "two full wipes must still look like one: {}",
+        pass.withdrawn
+    );
+}
+
 /// One wall whose beads all run at a single stated rate, with the raised
 /// loop made of a long edge and short corner beads at the same flow per mm.
 fn cornered_wall(plane: f64) -> String {

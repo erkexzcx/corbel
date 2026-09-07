@@ -2914,14 +2914,14 @@ impl<'a, W: Write> Pass<'a, W> {
             // not think a raised bead left the nozzle empty when it refilled
             // it, and then skip the pull a reordered travel needs.
             if buffered.places {
-                self.withdrawn = (self.withdrawn - delta * factor * ratio).max(0.0);
+                self.pulled(self.withdrawn - delta * factor * ratio);
                 if delta < 0.0 {
                     self.primed = false;
                 }
             } else {
                 if delta < 0.0 {
                     self.retract_feed = buffered.f.or(self.retract_feed);
-                    self.withdrawn = (self.withdrawn - delta * factor * ratio).max(0.0);
+                    self.pulled(self.withdrawn - delta * factor * ratio);
                     self.primed = false;
                 } else if !buffered.extrudes {
                     // A bare `G1 E` that names no axis is the slicer's own
@@ -3072,7 +3072,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // Lines written straight through count too, or the nozzle's charge
         // goes stale the moment anything is emitted outside a buffered region.
         if delta < 0.0 {
-            self.withdrawn = (self.withdrawn - delta * factor).max(0.0);
+            self.pulled(self.withdrawn - delta * factor);
             self.primed = false;
         } else if line.is_move() && line.x.is_none() && line.y.is_none() {
             // The slicer's own prime, which ends its retraction whatever it
@@ -3546,6 +3546,19 @@ impl<'a, W: Write> Pass<'a, W> {
         self.multiplier_filament += stock * (factor - geometry);
     }
 
+    /// Books a pull back, never beyond the slicer's own retraction length.
+    ///
+    /// A reorder can stack two of the slicer's wipes in a row — one at the end
+    /// of a region and one at the next layer's start — and the model would
+    /// read the nozzle as 1.6 mm empty where the slicer's own retraction is
+    /// 0.8 mm. Capping keeps a dry bead's fill at one retraction instead of
+    /// dumping the whole stack as a blob at the seam.
+    fn pulled(&mut self, amount: f64) {
+        self.withdrawn = amount
+            .max(0.0)
+            .min(self.retract_charge.unwrap_or(f64::INFINITY));
+    }
+
     /// Takes `charge` mm of filament back out of the nozzle.
     ///
     /// A slicer leaves the hop between two loops of one wall unretracted,
@@ -3574,7 +3587,7 @@ impl<'a, W: Write> Pass<'a, W> {
         line.extend_from_slice(if charge < 0.0 { b"retract" } else { b"prime" });
         write_line(&mut self.out, &line)?;
         self.feedrate = Some(rate);
-        self.withdrawn = (self.withdrawn - charge).max(0.0);
+        self.pulled(self.withdrawn - charge);
         Ok(())
     }
 
