@@ -266,6 +266,24 @@ fn balanced_filament_cannot_hide_an_excess_prime_and_a_starved_bead() {
     assert!(faults.iter().any(|fault| fault.contains("dry nozzle")));
 }
 
+#[test]
+fn a_wipe_keeps_its_start_even_when_its_layer_marker_moves() {
+    let source =
+        "M83\n;LAYER_CHANGE\nG1 X0 Y0\nG1 X10 Y0 E1 F600\n;LAYER_CHANGE\nG1 X9 Y0 E-.8\nG1 E.8\n";
+    let kept = source.replace(
+        ";LAYER_CHANGE\nG1 X9 Y0 E-.8\n",
+        "G1 X9 Y0 E-.8\n;LAYER_CHANGE\n",
+    );
+    let broken = kept.replace("G1 X9 Y0 E-.8", "G1 X50 Y50\nG1 X9 Y0 E-.8");
+    let before = nozzle::ledger(source);
+    assert!(nozzle::faults(&before, &nozzle::ledger(&kept), None).is_empty());
+    assert!(
+        nozzle::faults(&before, &nozzle::ledger(&broken), None)
+            .iter()
+            .any(|fault| fault.contains("wipe starts"))
+    );
+}
+
 fn bricked(tag: &str) {
     let source = plate(tag);
     let (gcode, said) = processed(tag, &source, &["--bricks"]);

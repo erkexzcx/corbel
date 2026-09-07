@@ -690,6 +690,8 @@ pub struct Ledger {
     pub extruded: f64,
     pub retracted: f64,
     pub wipes: Vec<String>,
+    wipe_starts: HashMap<String, Vec<(f64, f64)>>,
+    wipe_reach: f64,
     pub excess_prime: f64,
     pub dry_bead: f64,
     /// The slowest and fastest feedrate in force while laying a bead.
@@ -777,6 +779,8 @@ pub fn ledger(gcode: &str) -> Ledger {
         extruded: 0.0,
         retracted: 0.0,
         wipes: Vec::new(),
+        wipe_starts: HashMap::new(),
+        wipe_reach: Nozzle::read(gcode).bead / 2.0,
         excess_prime: 0.0,
         dry_bead: 0.0,
         bead_feed: (f64::INFINITY, 0.0),
@@ -802,6 +806,7 @@ pub fn ledger(gcode: &str) -> Ledger {
     let mut region = String::new();
     let mut width = String::new();
     let mut layer = 0usize;
+    let mut bead_layer = 0usize;
     let mut feed = 0.0_f64;
     let mut tool = 0usize;
 
@@ -861,9 +866,16 @@ pub fn ledger(gcode: &str) -> Ledger {
         }
         let from = modal.position();
         let delta = line.e.filter(|_| line.draws()).map(|e| extruder.observe(e));
+        if line.draws_in_plane() && delta.is_some_and(|value| value > 0.0) {
+            bead_layer = layer;
+        }
         if line.draws_in_plane() && delta.is_some_and(|value| value <= 0.0) {
-            book.wipes
-                .push(format!("{layer}:{:?}:{:?}:{:?}", line.code, line.x, line.y));
+            let key = format!("{bead_layer}:{:?}:{:?}:{:?}", line.code, line.x, line.y);
+            book.wipes.push(key.clone());
+            book.wipe_starts
+                .entry(key)
+                .or_default()
+                .push((from.0, from.1));
         }
         // A retraction and its prime name no coordinate; a bead's own
         // filament is not a prime and must not cancel one, but a bead does
@@ -1110,6 +1122,30 @@ fn stated_melt(gcode: &str) -> Vec<f64> {
 
 pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String> {
     let mut found = Vec::new();
+
+    for (key, starts) in &before.wipe_starts {
+        let Some(wrote) = after.wipe_starts.get(key) else {
+            continue;
+        };
+        let mut remaining = wrote.clone();
+        for start in starts {
+            let nearest = remaining
+                .iter()
+                .enumerate()
+                .map(|(index, at)| (index, (at.0 - start.0).hypot(at.1 - start.1)))
+                .min_by(|left, right| left.1.total_cmp(&right.1));
+            let Some((index, distance)) = nearest else {
+                break;
+            };
+            remaining.swap_remove(index);
+            if distance > before.wipe_reach {
+                found.push(format!(
+                    "wipe starts {distance:.3} mm away from its bead: {key}"
+                ));
+                break;
+            }
+        }
+    }
 
     for (layer, &was) in before.drawn.iter().enumerate() {
         let now = after.drawn.get(layer).copied().unwrap_or(0.0);

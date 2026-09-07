@@ -319,6 +319,12 @@ Four consequences that are easy to get backwards:
    layer thins, its column below already fills part of it, so the bead is
    metered for the gap that is left — a 0.1 layer over a 0.2 one takes **0.5×**.
 
+### Meter each bead, not the loop's average
+
+The loop-wide share described above is only a fast rejection when no bead sits on a raise. `Pass::bead_geometry` meters each bead against `Pass::ground`, which measures that bead's own path through `standing` and `climbed`. A loop can cross a raised column along one edge and flat material along another: using its average overfills one and starves the other while leaving the filament total almost unchanged. A mix of climbing and settled ground takes the weighted height of both, never a majority vote. Unbuffered fillers use the same measurement.
+
+Pinned by `each_bead_is_metered_for_its_own_part_of_a_loop` and `a_bead_over_mixed_ground_weights_both_heights`. The former moves one edge of a synthetic rectangle outward and checks the unchanged edge, the moved edge, and their caps independently. Keep private reproductions outside the repository; these tests contain no customer geometry.
+
 ## Contour grouping — the hard part
 
 One `;TYPE:` region holds far more than one wall: an island's loops, the walls
@@ -760,6 +766,10 @@ plate, and both fixed:
   below and nothing below give the same answer.
 
 ### Retraction follows the input's charge, not a guessed pairing
+
+**A layer comment can arrive before the previous bead's wipe.** Flushing deferred walls at that comment moves the nozzle away before the wipe is read. Its destination survives, but its start does not, turning a short retracting wipe into a journey across the part. `Pass::boundary` holds the nonprinting prelude so `finish_boundary` keeps the wipe with its bead before closing the layer; layer metadata stays with its marker. The synthetic `a_wipe_after_a_layer_marker_still_starts_at_the_bead_it_retraces` checks both M82 and M83. The nozzle ledger checks wipe starts, not just endpoints, and assigns a wipe to its preceding bead's layer.
+
+**A height-carrying travel still needs retraction.** `ride` and `replay` share `retract_for`, with the same displacement and slicer minimum-travel gates. The public `no-zhop` fixture catches a journey that bypasses this gate; `a_height_carried_by_a_reordered_travel_still_retracts` isolates it.
 
 Reordering separates a wipe from its prime. `Pass.input_withdrawn` measures the input's withdrawal and `Buffered.withdrawn` carries its value before each move through the reorder. Before a bead, both write paths match that state; a prime supplies only what is missing, and a redundant wipe retains its path while pulling less or nothing. `Pass.stopped` reserves a height move's pull until that move finishes. The output tracker must book what was actually written, never hide a second pull by clamping its model.
 

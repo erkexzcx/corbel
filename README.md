@@ -111,11 +111,13 @@ The gaps are drawn far larger than life — on a 0.2 mm layer they are a few mic
 
 **What it touches.** Every wall, and only walls — infill, bridges and the surfaces come out exactly as sliced, and gap fill and a thin wall are metered for the column they stand over rather than raised, so it is never a global flow bump. Two walls are enough; three or more interlocks twice as much.
 
+**Each bead is metered for its own gap.** A loop can sit over a raised column along one edge and flat material along another. Giving both edges the loop's average flow overfills one and starves the other, even when the filament total looks right. Compensation follows the material under each bead, including columns still climbing to their offset.
+
 - **The first layer on the bed is left exactly as sliced.** Nothing presses a bead there, so surplus spreads sideways instead of filling anything — on a Benchy it filled in the recessed nameplate, which is exactly one layer deep. A raised column climbs to its half layer over two layers rather than stepping up in one.
 - **The outer wall gets the flow and is then moved inward by half the width it gains**, so the gain feeds the joint behind it and the commanded outer face stays where the slicer drew it. What it gains is `flow - 1` of its *spacing*, not of its nominal width.
 - **A `G2`/`G3` arc moves with it**, keeping its centre and changing radius by the offset, with `I`/`J` restated. A loop whose arcs cannot be moved without distorting their circle is left as sliced, which on a real slice is a handful of beads in twenty thousand.
 
-The compensation is exact on the toolpath, but plastic is looser than a coordinate — the walls behind the visible one keep their gain, and a raised bead is out of reach of the nozzle's underside, so a bricked part can come out slightly over nominal in XY. If yours does, `--extra-flow 0` leaves only the raise, every bead metered as sliced and no wall moved; beyond that, your slicer's XY size compensation trims a measured offset.
+The compensation is exact on the toolpath, but plastic is looser than a coordinate — the walls behind the visible one keep their gain, and a raised bead is out of reach of the nozzle's underside, so a bricked part can come out slightly over nominal in XY. If yours does, `--extra-flow 0` disables extra wall flow and the inward move; each bead still receives compensation for its gap. Beyond that, your slicer's XY size compensation trims a measured offset.
 
 ---
 
@@ -129,7 +131,7 @@ So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle,
 
 **Why those two numbers.** A bead is a rectangle with a half-round bulge on each side, and two side by side leave a corner empty where the bulges meet, which the nozzle's flat underside normally squashes shut. Bricklayering lifts every other wall half a layer, putting that corner out of reach, so the extra flow fills it instead — and its size depends on the **layer height** and the **line width**, both stated in your file.
 
-**Set it anywhere from 0 to 50.** `0` meters every bead as sliced and moves no wall, leaving only the raise. The top of the range is for sweeping a test print rather than printing with, and there is a ceiling nobody picked: a bead can be widened until its edge reaches the centre of the loop beside it, which is the bead model's own arithmetic rather than a chosen limit.
+**Set it anywhere from 0 to 50.** `0` adds no extra wall flow and moves no wall inward; the raise and per-bead gap compensation remain. The top of the range is for sweeping a test print rather than printing with, and there is a ceiling nobody picked: a bead can be widened until its edge reaches the centre of the loop beside it, which is the bead model's own arithmetic rather than a chosen limit.
 
 **What it costs on the whole part is small, because it is paid only on walls.** On a ten-object plate at the default, a flow of 1.025 on the walls added **+0.89%** to the part; on a part that is mostly wall it is a little over 2%. Infill, bridges and the surfaces are metered exactly as sliced, and gap fill and a thin wall are metered for the column they stand over, so it is never a global flow bump.
 

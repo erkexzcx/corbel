@@ -2794,8 +2794,8 @@ fn a_visible_wall_drawn_with_an_arc_moves_with_its_centre() {
     );
     // Start (10.000, -0.054) plus J puts the centre back at (10, 5).
     assert!(
-        out.contains("G1 X10.000 Y-0.054 E1.27029 ; arcskin"),
-        "{out}"
+        out.contains("G1 X10.000 Y-0.054 E1.29311 ; arcskin"),
+        "the straight bead is not over the raised square: {out}"
     );
 }
 
@@ -2977,6 +2977,86 @@ fn a_bead_is_metered_for_the_gap_its_own_column_left() {
     // The column below stands 0.1 above the 0.6 plane and the nozzle is at
     // 0.75, so the bead spans 0.05 of a layer metered for 0.1.
     assert_eq!(raised, 0.25, "half the flow of a 0.5 bead:\n{out}");
+}
+
+#[test]
+fn each_bead_is_metered_for_its_own_part_of_a_loop() {
+    let mut source = String::from("; layer_height = 0.2\nM83\n");
+    for layer_index in 0..7 {
+        source.push_str(&layer(0.2 * f64::from(layer_index + 1)));
+        source.push_str(";TYPE:Perimeter\n");
+        for loop_index in 1..=2 {
+            let inset = 0.45 * f64::from(2 - loop_index);
+            let top = if layer_index < 4 { 10.0 } else { 12.0 };
+            let corners = [
+                (inset, inset),
+                (10.0 - inset, inset),
+                (10.0 - inset, top - inset),
+                (inset, top - inset),
+                (inset, inset),
+            ];
+            source.push_str(&format!("G1 X{inset:.3} Y{inset:.3} F9000\n"));
+            for (side, pair) in corners.windows(2).enumerate() {
+                for segment in 1..=10 {
+                    let share = f64::from(segment) / 10.0;
+                    let x = pair[0].0 + share * (pair[1].0 - pair[0].0);
+                    let y = pair[0].1 + share * (pair[1].1 - pair[0].1);
+                    source.push_str(&format!(
+                        "G1 X{x:.3} Y{y:.3} E1 ; L{layer_index}loop{loop_index}side{side}part{segment}\n"
+                    ));
+                }
+            }
+        }
+    }
+    let out = run(&source, &plain());
+    let flow = |tag: &str| {
+        out.lines()
+            .find(|line| line.ends_with(tag))
+            .and_then(|line| Line::parse(line).e)
+            .unwrap_or_else(|| panic!("missing {tag}"))
+    };
+    assert_eq!(
+        flow("L4loop2side0part5"),
+        1.0,
+        "still over its raised column"
+    );
+    assert_eq!(
+        flow("L4loop2side2part5"),
+        1.5,
+        "the moved edge has no raise below"
+    );
+    assert_eq!(
+        flow("L6loop2side0part5"),
+        0.5,
+        "the cap fills only the remaining gap"
+    );
+    assert_eq!(
+        flow("L6loop2side2part5"),
+        0.5,
+        "both edges have settled by the cap"
+    );
+}
+
+#[test]
+fn a_bead_over_mixed_ground_weights_both_heights() {
+    let survey = Survey::of("; layer_height = 0.2\nM83\n");
+    let config = plain();
+    let mut pass = Pass::new(Vec::new(), &config, &survey);
+    pass.layer = 3;
+    let from = (0.05, 0.05);
+    let to = (0.35, 0.05);
+    let mut cells = Vec::new();
+    footprint::cells(footprint::Grid::default(), from, to, None, |cell| {
+        cells.push(cell);
+    });
+    assert_eq!(cells.len(), 2);
+    pass.standing.absorb(&cells);
+    pass.standing.settle();
+    pass.climbed.absorb(&cells[..1]);
+    pass.climbed.settle();
+    assert!((pass.ground(from, to, None) - 0.075).abs() < 1e-12);
+    pass.feature = Feature::ThinWall;
+    assert!((pass.filler_factor(from, to, None) - 0.625).abs() < 1e-12);
 }
 
 /// The region buffer and the loop list are reused between regions, so a
@@ -3953,8 +4033,8 @@ fn a_visible_wall_drawn_with_a_radius_moves_with_the_centre_that_radius_names() 
         "the arc must keep the circle it was drawn on: {out}"
     );
     assert!(
-        out.contains("G1 X10.000 Y-0.054 E1.27029 ; arcskin"),
-        "{out}"
+        out.contains("G1 X10.000 Y-0.054 E1.29311 ; arcskin"),
+        "the straight bead is not over the raised square: {out}"
     );
 }
 
@@ -4348,6 +4428,29 @@ fn a_held_loop_reached_within_a_millimetre_is_not_retracted_for() {
     assert!(!out.contains("corbel brick retract"), "{out}");
 }
 
+#[test]
+fn a_height_carried_by_a_reordered_travel_still_retracts() {
+    let survey = Survey::of(
+        "; layer_height = 0.2\n; retraction_length = 0.8\n; retraction_minimum_travel = 1\nM83\n",
+    );
+    let config = plain();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.at = (19.8, 0.0);
+    pass.buffer(Line::parse("; approach"), pass.at);
+    pass.at = (20.0, 0.0);
+    pass.buffer(Line::parse("G1 X20 Y0 F9000"), (19.8, 0.0));
+    pass.wrote_at = (0.0, 0.0);
+    pass.ride(1, 0.4, false, &[None, None]).unwrap();
+    assert_eq!(pass.withdrawn, 0.8);
+    let out = String::from_utf8(out).unwrap();
+    let retract = out
+        .find("corbel brick retract")
+        .expect("the journey needs a pull");
+    let travel = out.find("G1 X20 Y0").unwrap();
+    assert!(retract < travel, "{out}");
+}
+
 /// The mirror case: the filler ends across the plate from the held loop, and
 /// that travel is exactly what a pull exists for.
 #[test]
@@ -4359,6 +4462,63 @@ fn a_held_loop_reached_across_the_plate_is_retracted_for() {
     // wall, so the reorder leaves that travel across the plate too. All four
     // are pulls the reordering made necessary.
     assert_eq!(out.matches("corbel brick retract").count(), 4, "{out}");
+}
+
+#[test]
+fn a_wipe_after_a_layer_marker_still_starts_at_the_bead_it_retraces() {
+    let source = walled_plate("G1 X20.0 Y5.0 E0.1\n");
+    let (head, body) = source.split_once(";LAYER_CHANGE\n").unwrap();
+    let source = format!(
+        "{head};LAYER_CHANGE\n{}",
+        body.replace(
+            ";LAYER_CHANGE\n",
+            ";LAYER_CHANGE\n;WIPE_START\nG1 F3000\n\
+             G1 X19.8 Y5 E-0.76 ; layer-end wipe\n\
+             ;WIPE_END\nG1 E-0.04 F1800\n"
+        )
+    );
+    let mut absolute = Vec::new();
+    let mut position = 0.0;
+    for raw in source.lines() {
+        let line = Line::parse(raw);
+        if line.code == Code::RelativeE {
+            absolute.extend_from_slice(b"M82\n");
+            continue;
+        }
+        if let Some(delta) = line.e.filter(|_| line.draws()) {
+            position += delta;
+            line.write_e(&mut absolute, position).unwrap();
+        } else {
+            absolute.extend_from_slice(raw.as_bytes());
+        }
+        absolute.push(b'\n');
+    }
+    for source in [source, String::from_utf8(absolute).unwrap()] {
+        let out = run(&source, &plain());
+        assert!(out.contains("corbel brick raised"), "{out}");
+        let mut modal = Modal::new();
+        let mut wipes = 0;
+        for raw in out.lines() {
+            let line = Line::parse(raw);
+            let from = modal.position();
+            modal.apply(&line);
+            if raw.ends_with("; layer-end wipe") {
+                wipes += 1;
+                assert_eq!((from.0, from.1), (20.0, 5.0), "{raw} starts at {from:?}");
+                assert_eq!(modal.position(), (19.8, 5.0, from.2));
+            }
+        }
+        assert_eq!(wipes, 4);
+    }
+}
+
+#[test]
+fn a_layer_marker_without_walls_to_finish_stays_where_the_slicer_put_it() {
+    let source = "; layer_height = 0.2\nM83\n;LAYER_CHANGE\nG1 Z0.2\n\
+                  ;TYPE:Solid infill\nG1 X0 Y0\nG1 X20 Y0 E1\n\
+                  ;LAYER_CHANGE\n;WIPE_START\nG1 X19 Y0 E-.8\n;WIPE_END\n\
+                  G1 X0 Y0 Z0.4\nG1 E.8\nG1 X20 Y0 E1\n";
+    assert_eq!(run(source, &plain()), source);
 }
 
 /// The same plate with no `retraction_minimum_travel` at all. The file names

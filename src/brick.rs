@@ -394,6 +394,7 @@ pub fn stream<R: BufRead, W: Write>(
         pass.feed(&repaired(&held), &held)?;
     }
     pass.rejoin()?;
+    pass.finish_boundary()?;
     pass.flush()?;
     pass.write_held()?;
     pass.out.flush()?;
@@ -773,6 +774,7 @@ struct Pass<'a, W: Write> {
     /// This layer's raised loops, waiting for everything laid against them to
     /// be written first. See [`Held`].
     held: Vec<Held>,
+    boundary: Vec<Vec<u8>>,
     /// Every distinct `; LINE_WIDTH:` line the file has stated, the one in
     /// force now, and the one the output last carried.
     widths: Vec<Vec<u8>>,
@@ -945,6 +947,7 @@ impl<'a, W: Write> Pass<'a, W> {
             raised_cells: Vec::new(),
             at_now: (0.0, 0.0),
             held: Vec::new(),
+            boundary: Vec::new(),
             widths: vec![Vec::new()],
             width: 0,
             wrote_width: 0,
@@ -1020,6 +1023,94 @@ impl<'a, W: Write> Pass<'a, W> {
     }
 
     fn feed(&mut self, raw: &str, bytes: &[u8]) -> io::Result<()> {
+        let line = Line::parse_bytes(raw, bytes);
+        if !self.boundary.is_empty() {
+            let mut ahead = self.extruder;
+            for bytes in &self.boundary[1..] {
+                let text = repaired(bytes);
+                let held = Line::parse(&text);
+                if let Some(value) = held.e.filter(|_| held.draws()) {
+                    ahead.observe(value);
+                }
+            }
+            let retracts = line.draws()
+                && line.z.is_none()
+                && line.e.is_some_and(|value| ahead.observe(value) <= 0.0);
+            let stays = match line.marker() {
+                Some(marker) => !is_layer_marker(marker) && Feature::from_marker(marker).is_none(),
+                None => {
+                    retracts
+                        || (line.draws()
+                            && !line.is_xy_move()
+                            && line.z.is_none()
+                            && line.e.is_none())
+                        || (line.code == Code::Other && crate::scan::tool_change(raw).is_none())
+                }
+            };
+            if stays && self.boundary.len() < TAIL {
+                self.boundary.push(bytes.to_vec());
+                return Ok(());
+            }
+            self.finish_boundary()?;
+        }
+        if self.started
+            && self.modal.is_plain()
+            && (!self.loops.is_empty() || !self.held.is_empty())
+            && line.marker().is_some_and(is_layer_marker)
+        {
+            self.boundary.push(bytes.to_vec());
+            return Ok(());
+        }
+        self.feed_line(raw, bytes)
+    }
+
+    fn finish_boundary(&mut self) -> io::Result<()> {
+        let boundary = std::mem::take(&mut self.boundary);
+        if boundary.is_empty() {
+            return Ok(());
+        }
+        let retract_end = boundary.iter().rposition(|bytes| {
+            let text = repaired(bytes);
+            let line = Line::parse(&text);
+            line.draws() && line.e.is_some()
+        });
+        let (start, end) = match retract_end {
+            Some(last) => {
+                let start = (1..=last)
+                    .find(|&index| {
+                        let text = repaired(&boundary[index]);
+                        let line = Line::parse(&text);
+                        line.marker()
+                            .is_none_or(|marker| marker.trim() == "WIPE_START")
+                    })
+                    .unwrap_or(last);
+                let mut end = last + 1;
+                while end < boundary.len() {
+                    let text = repaired(&boundary[end]);
+                    if Line::parse(&text)
+                        .marker()
+                        .is_none_or(|marker| marker.trim() != "WIPE_END")
+                    {
+                        break;
+                    }
+                    end += 1;
+                }
+                (start, end)
+            }
+            None => (0, 0),
+        };
+        for bytes in &boundary[start..end] {
+            self.feed_line(&repaired(bytes), bytes)?;
+        }
+        for (index, bytes) in boundary.iter().enumerate() {
+            if !(start..end).contains(&index) {
+                self.feed_line(&repaired(bytes), bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn feed_line(&mut self, raw: &str, bytes: &[u8]) -> io::Result<()> {
         let line = Line::parse_bytes(raw, bytes);
         if let Some(tool) = crate::scan::tool_change(raw) {
             // Everything held goes out FIRST. A raised loop waits for the end
@@ -2127,19 +2218,12 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(charge) = self.stopped.take() {
             self.unprime(charge)?;
         }
-        let factor = self.extrusion_factor(current);
         if raise {
             let half = self.height() / 2.0;
             self.raise = Some(match self.raise {
                 Some((low, high)) => (low.min(half), high.max(half)),
                 None => (half, half),
             });
-        }
-        // A loop metered exactly as sliced has nothing to book, and summing
-        // its stock is the one cost here worth avoiding.
-        if raise || factor != 1.0 {
-            let geometry = self.geometry(current);
-            self.meter(current.body, current.beads, factor, geometry, raise);
         }
         for at in current.body..current.end {
             // Past the last bead the flow no longer applies: what is left is
@@ -2154,7 +2238,16 @@ impl<'a, W: Write> Pass<'a, W> {
             // retraction was dropped: measured on a real plate, 44951 of
             // 52498 gone and the part 12.46% heavier, with the nozzle
             // travelling primed the whole way.
-            let factor = if at < current.beads { factor } else { 1.0 };
+            let factor = if self.buffer[at].extrudes && at < current.beads {
+                let geometry = self.bead_geometry(current, at);
+                let factor = self.extrusion_factor(current, geometry);
+                if raise || factor != 1.0 {
+                    self.meter(at, at + 1, factor, geometry, raise);
+                }
+                factor
+            } else {
+                1.0
+            };
             // A wipe retraces the bead it follows, so a loop that was raised
             // carries its wipe up with it. The slicer's own descent to the
             // plane sits inside that block and would drop the nozzle onto the
@@ -2690,6 +2783,7 @@ impl<'a, W: Write> Pass<'a, W> {
         moved: &[Option<Moved>],
     ) -> io::Result<()> {
         let buffered = self.buffer[index];
+        self.retract_for(index)?;
         if buffered.f.is_none() {
             self.settle_feed()?;
         }
@@ -2777,17 +2871,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // Measured on a user's 17 MB tree-support print, ungated: 8902 pulls
         // added to a file with 13234, 6437 of them for a travel under 3 mm and
         // 4195 for one under 1 mm.
-        let worth_it = self
-            .hop_travel
-            .is_some_and(|far| self.displaced(index) > far)
-            && self.withdrawn <= 0.0;
-        if worth_it
-            && buffered.positions
-            && buffered.delta.is_none()
-            && let Some(charge) = self.retract_charge
-        {
-            self.unprime(-charge)?;
-        }
+        self.retract_for(index)?;
         // The length a bead is metered against is the one it is written at, so
         // the move and the ratio it changed the path by are decided together:
         // taking the ratio off a write that then does not happen meters a bead
@@ -2985,6 +3069,7 @@ impl<'a, W: Write> Pass<'a, W> {
     /// the transform rather than through it, so it must not overtake beads the
     /// slicer wrote before it.
     fn spill(&mut self, piece: &[u8]) -> io::Result<()> {
+        self.finish_boundary()?;
         self.flush()?;
         self.out.write_all(piece)?;
         self.spilling = true;
@@ -3022,11 +3107,11 @@ impl<'a, W: Write> Pass<'a, W> {
     /// [`covers_a_raise`](crate::scan). The two go together: a region that
     /// stops a column being capped has to be metered against the column it
     /// stopped.
-    fn extrusion_factor(&self, current: Loop) -> f64 {
+    fn extrusion_factor(&self, current: Loop, geometry: f64) -> f64 {
         if current.filler {
-            return self.geometry(current);
+            return geometry;
         }
-        self.geometry(current) * self.multiplier()
+        geometry * self.multiplier()
     }
 
     /// The flow a filler bead takes where it is not buffered with a wall.
@@ -3044,11 +3129,33 @@ impl<'a, W: Write> Pass<'a, W> {
         if !is_filler(self.feature) {
             return 1.0;
         }
-        let Some(below) = self.layer.checked_sub(1) else {
+        let height = self.height();
+        ((height - self.ground(from, to, arc)) / height).max(0.0)
+    }
+
+    fn bead_geometry(&self, current: Loop, index: usize) -> f64 {
+        if current.on_a_raise == 0.0 {
+            return self.geometry(current);
+        }
+        let from = index
+            .checked_sub(1)
+            .map_or(self.entry, |previous| self.buffer[previous].at);
+        let buffered = self.buffer[index];
+        let below = self.ground(from, buffered.at, buffered.arc);
+        let offset = self.rise_of(current);
+        if offset == below {
             return 1.0;
+        }
+        let height = self.height();
+        ((height + offset - below) / height).max(0.0)
+    }
+
+    fn ground(&self, from: (f64, f64), to: (f64, f64), arc: Option<Arc>) -> f64 {
+        let Some(below) = self.layer.checked_sub(1) else {
+            return 0.0;
         };
         if self.standing.is_empty() && self.climbed.is_empty() {
-            return 1.0;
+            return 0.0;
         }
         let standing = &self.standing;
         let climbing = &self.climbed;
@@ -3061,15 +3168,10 @@ impl<'a, W: Write> Pass<'a, W> {
             part += usize::from(climbing.has(cell));
         });
         if walked == Trace::Refused || points == 0 || on == 0 {
-            return 1.0;
+            return 0.0;
         }
-        // The same share and the same taller-of-the-two rule the loops use in
-        // [`mark_columns`](Self::mark_columns): a bead over a mix of settled
-        // and climbing ground is metered against the settled height.
-        let share = on as f64 / points as f64;
-        let steps = if part * 2 > on { 1 } else { RAMP };
-        let height = self.height();
-        ((height - share * self.rise_at(steps, below)) / height).max(0.0)
+        ((on - part) as f64 * self.rise_at(RAMP, below) + part as f64 * self.rise_at(1, below))
+            / points as f64
     }
 
     /// How far the bead reaches, as a multiple of its own layer's height,
@@ -3427,6 +3529,21 @@ impl<'a, W: Write> Pass<'a, W> {
     /// must be removed from the command, not hidden by clamping this value.
     fn pulled(&mut self, amount: f64) {
         self.withdrawn = amount.max(0.0);
+    }
+
+    fn retract_for(&mut self, index: usize) -> io::Result<()> {
+        let buffered = self.buffer[index];
+        if buffered.positions
+            && buffered.delta.is_none()
+            && self.withdrawn <= 0.0
+            && self
+                .hop_travel
+                .is_some_and(|far| self.displaced(index) > far)
+            && let Some(charge) = self.retract_charge
+        {
+            self.unprime(-charge)?;
+        }
+        Ok(())
     }
 
     /// Restores the input's charge after a prime or wipe without reversing
