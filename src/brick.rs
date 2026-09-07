@@ -2824,14 +2824,24 @@ impl<'a, W: Write> Pass<'a, W> {
         // wipe set it, but the retraction is answered and the bead is meant
         // to be drawn dry. Dumping a full prime on it is a blob at the point
         // of every taper — measured on a user's plate, 216 primes on two
-        // layers of a tapering pair of points.
+        // layers of a tapering pair of points. The same is true where the
+        // slicer primed NOTHING: a taper bead under a quarter of the wipe it
+        // follows is drawn dry on purpose, and filling it dumps a whole
+        // retraction on a seam the slicer metered for a dry nozzle. The
+        // withdrawal is left standing; the slicer's own prime, wherever the
+        // reorder put it, still puts it back.
         if self.withdrawn > 0.0
             && !self.primed
             && buffered.places
             && buffered.delta.is_some_and(|delta| delta > 0.0)
         {
-            self.debt += self.withdrawn;
-            self.unprime(self.withdrawn)?;
+            let thin = self
+                .retract_charge
+                .is_some_and(|charge| buffered.delta.unwrap_or(0.0) < charge / 4.0);
+            if !thin {
+                self.debt += self.withdrawn;
+                self.unprime(self.withdrawn)?;
+            }
         }
         // And the prime that pull was owed to arrives later, at a nozzle that
         // is already full. Replaying it at nothing settles the debt: no line

@@ -4604,7 +4604,75 @@ fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
     assert!(!out.contains("corbel brick prime"), "{out}");
 }
 
-/// A debt is only settled by a prime when the nozzle is full. If a newer
+/// Where the slicer primed NOTHING between the wipe and a bead under a
+/// quarter of the wipe itself, the bead is a taper drawn dry on purpose, and
+/// the debt fill must leave it alone — dumping a full retraction on it is a
+/// blob at the seam and a string down the travel that follows. The withdrawal
+/// stays standing; the slicer's own prime, wherever the reorder put it, still
+/// puts it back.
+#[test]
+fn a_thin_bead_after_a_wipe_with_no_prime_is_not_filled() {
+    let survey = Survey::of("; layer_height = 0.2\n; retraction_length = 0.8\nM83\n");
+    let config = Config::default();
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+
+    let buffer =
+        |pass: &mut Pass<'_, &mut Vec<u8>>, raw: &str, places: bool, delta: f64, at: (f64, f64)| {
+            let start = pass.arena.len();
+            pass.arena.extend_from_slice(raw.as_bytes());
+            let end = pass.arena.len();
+            let index = pass.buffer.len();
+            pass.buffer.push(Buffered {
+                start,
+                end,
+                e_span: None,
+                e: Some(delta),
+                delta: Some(delta),
+                z: None,
+                f: None,
+                xy: places.then_some(at),
+                places,
+                at,
+                arc: None,
+                curved: false,
+                extrudes: places && delta > 0.0,
+                steers: places,
+                positions: places,
+                carries: places,
+                absolute: false,
+                resets_origin: false,
+                width: None,
+            });
+            index
+        };
+
+    // A wipe pulls back, no prime follows, and the first tapered bead is a
+    // twentieth of the wipe. It must not be filled.
+    let wipe = buffer(&mut pass, "G1 X0.0 Y0.0 E-0.8", true, -0.8, (0.0, 0.0));
+    let bead = buffer(&mut pass, "G1 X1.0 Y0.0 E0.01", true, 0.01, (1.0, 0.0));
+
+    pass.replay(wipe, 1.0, &[None, None]).unwrap();
+    pass.replay(bead, 1.0, &[None, None]).unwrap();
+
+    drop(pass);
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("corbel brick prime"), "{out}");
+
+    // But a bead at least a quarter of the wipe is a real wall whose prime
+    // was stranded, and it IS filled.
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, &config, &survey);
+    pass.extruder.set_mode(Code::RelativeE);
+    let wipe = buffer(&mut pass, "G1 X0.0 Y0.0 E-0.8", true, -0.8, (0.0, 0.0));
+    let bead = buffer(&mut pass, "G1 X1.0 Y0.0 E0.3", true, 0.3, (1.0, 0.0));
+    pass.replay(wipe, 1.0, &[None, None]).unwrap();
+    pass.replay(bead, 1.0, &[None, None]).unwrap();
+    drop(pass);
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("corbel brick prime"), "{out}");
+}
 /// retraction intervened since the debt was created, the prime belongs to
 /// that retraction and must fire rather than be zeroed into the old debt —
 /// zeroing it would leave the bead after it drawn dry.
