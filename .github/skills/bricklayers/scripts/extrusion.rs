@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 #[path = "../../../../tests/nozzle/mod.rs"]
 mod nozzle;
 
+mod junctions;
+
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
 enum Mode {
     Gap,
@@ -15,6 +17,11 @@ enum Mode {
     Travels,
     Geometry,
     Nozzle,
+    Contact,
+    Throughput,
+    Extrusion,
+    Layers,
+    Junctions,
 }
 
 #[derive(Parser)]
@@ -24,11 +31,14 @@ struct Arguments {
     mode: Mode,
     input: String,
     output: String,
+    #[arg(long)]
+    layer: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
 struct Bead {
     layer: usize,
+    run: usize,
     from: (f64, f64),
     to: (f64, f64),
     z: f64,
@@ -38,6 +48,7 @@ struct Bead {
     feature: Feature,
     line: usize,
     settings: BTreeMap<String, String>,
+    feed: f64,
 }
 
 impl Bead {
@@ -175,8 +186,14 @@ fn beads_in(text: &str) -> Vec<Bead> {
     let mut started = false;
     let mut beads = Vec::new();
     let mut settings = BTreeMap::new();
+    let mut feed = 0.0;
+    let mut run = 0;
+    let mut interrupted = true;
     for (index, raw) in text.lines().enumerate() {
         let line = Line::parse(raw);
+        if let Some(rate) = line.f {
+            feed = rate;
+        }
         let command = raw.split(';').next().unwrap_or_default();
         let words = command.split_ascii_whitespace().collect::<Vec<_>>();
         if let Some(&code) = words.first() {
@@ -201,6 +218,7 @@ fn beads_in(text: &str) -> Vec<Bead> {
         if let Some(marker) = line.marker() {
             if is_layer_marker(marker) {
                 layer += usize::from(std::mem::replace(&mut started, true));
+                interrupted = true;
             } else if let Some(found) = Feature::from_marker(marker) {
                 feature = found;
             }
@@ -217,11 +235,17 @@ fn beads_in(text: &str) -> Vec<Bead> {
             _ => {}
         }
         let Some(value) = line.e.filter(|_| line.draws()) else {
+            interrupted |= line.draws_in_plane();
             continue;
         };
         let delta = extruder.observe(value);
         if !started || delta <= 0.0 || !line.draws_in_plane() {
+            interrupted |= line.draws_in_plane();
             continue;
+        }
+        if interrupted {
+            run += 1;
+            interrupted = false;
         }
         let destination = modal.position();
         let from = (origin.0, origin.1);
@@ -233,6 +257,7 @@ fn beads_in(text: &str) -> Vec<Bead> {
         );
         beads.push(Bead {
             layer,
+            run,
             from,
             to,
             z: destination.2,
@@ -242,6 +267,7 @@ fn beads_in(text: &str) -> Vec<Bead> {
             feature,
             line: index + 1,
             settings: settings.clone(),
+            feed,
         });
     }
     beads
@@ -494,8 +520,172 @@ fn travels_in(text: &str) -> Vec<Travel> {
     moves
 }
 
+fn contacts(beads: &[Bead], layer: Option<usize>, reach: f64) -> Vec<(usize, usize, f64)> {
+    let mut cells = HashMap::<(i64, i64), Vec<&Bead>>::new();
+    let mut hits = Vec::new();
+    for bead in beads {
+        let points = samples(bead, 0.1);
+        if layer.is_none_or(|layer| bead.layer + 1 == layer) {
+            let mut highest = bead.z + 0.001;
+            let mut hit = None;
+            for &point in &points {
+                let cell = (
+                    (point.0 / reach).floor() as i64,
+                    (point.1 / reach).floor() as i64,
+                );
+                for horizontal in -2..=2 {
+                    for vertical in -2..=2 {
+                        if let Some(paths) = cells.get(&(cell.0 + horizontal, cell.1 + vertical)) {
+                            for path in paths {
+                                if path.z > highest && path.distance(point) < reach {
+                                    highest = path.z;
+                                    hit = Some((bead.line, path.line, path.z - bead.z));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(hit) = hit {
+                hits.push(hit);
+            }
+        }
+        for point in points {
+            let paths = cells
+                .entry((
+                    (point.0 / reach).floor() as i64,
+                    (point.1 / reach).floor() as i64,
+                ))
+                .or_default();
+            if paths.last().is_none_or(|path| path.line != bead.line) {
+                paths.push(bead);
+            }
+        }
+    }
+    hits
+}
+
+fn exceeds_throughput(original: &Bead, piece: &Bead) -> bool {
+    if original.span <= 0.0 || piece.span <= 0.0 || original.delta <= 0.0 {
+        return false;
+    }
+    let maximum = (original.delta / original.span * original.feed) / (piece.delta / piece.span);
+    piece.feed > maximum.min(original.feed) + 0.00051
+}
+
+fn layer_planes(text: &str) -> BTreeMap<usize, (f64, f64, usize)> {
+    let mut layers = BTreeMap::new();
+    for bead in beads_in(text) {
+        let row = layers.entry(bead.layer).or_insert((bead.z, bead.z, 0));
+        row.0 = row.0.min(bead.z);
+        row.1 = row.1.max(bead.z);
+        row.2 += 1;
+    }
+    layers
+}
+
+fn layer_stamps(text: &str) -> Vec<usize> {
+    text.lines()
+        .filter_map(|raw| {
+            let mut words = raw.split(';').next()?.split_ascii_whitespace();
+            if words.next()? != "M73" {
+                return None;
+            }
+            words.find_map(|word| word.strip_prefix('L')?.parse().ok())
+        })
+        .collect()
+}
+
+fn layer_faults(input: &str, output: &str) -> Vec<String> {
+    let before = layer_planes(input);
+    let after = layer_planes(output);
+    let mut faults = Vec::new();
+    let markers = |text: &str| {
+        text.lines()
+            .filter(|raw| Line::parse(raw).marker().is_some_and(is_layer_marker))
+            .count()
+    };
+    if markers(input) != markers(output) {
+        faults.push("layer marker count changed".to_owned());
+    }
+    if layer_stamps(input) != layer_stamps(output) {
+        faults.push("slicer's M73 layer sequence changed".to_owned());
+    }
+    if before.keys().ne(after.keys()) {
+        faults.push("printed layer set changed".to_owned());
+    }
+    for (layer, &(plane, _, _)) in &before {
+        if let Some(&(lowest, _, _)) = after.get(layer) {
+            if lowest < plane - 0.001 {
+                faults.push(format!(
+                    "layer {} prints at Z{lowest:.6} below its input plane Z{plane:.6}",
+                    layer + 1
+                ));
+            }
+        } else {
+            faults.push(format!("layer {} has no printed paths", layer + 1));
+        }
+    }
+    faults
+}
+
 fn main() -> std::io::Result<()> {
     let args = Arguments::parse();
+    if args.mode == Mode::Layers {
+        let input = std::fs::read(&args.input)?;
+        let output = std::fs::read(&args.output)?;
+        let input = String::from_utf8_lossy(&input);
+        let output = String::from_utf8_lossy(&output);
+        let mut faults = layer_faults(&input, &output);
+        let before = layer_planes(&input);
+        let after = layer_planes(&output);
+        let survey = corbel::scan::Survey::of(&input);
+        let markers = input
+            .lines()
+            .filter(|raw| Line::parse(raw).marker().is_some_and(is_layer_marker))
+            .count();
+        println!(
+            "Input markers={markers}; survey layers={}; printed layers input={} output={}; M73 layer stamps input={} output={}",
+            survey.layers,
+            before.len(),
+            after.len(),
+            layer_stamps(&input).len(),
+            layer_stamps(&output).len()
+        );
+        if markers != survey.layers {
+            faults.push("survey layer count disagrees with input markers".to_owned());
+        }
+        for (&layer, &(plane, _, count)) in &before {
+            let previous = before
+                .get(&layer.saturating_sub(1))
+                .filter(|_| layer > 0)
+                .map_or(0.0, |row| row.0);
+            let measured = plane - previous;
+            let surveyed = survey.layer_heights.get(layer).copied().unwrap_or(0.0);
+            if measured > 0.0 && (measured - surveyed).abs() > 0.002 {
+                faults.push(format!(
+                    "layer {} height input={measured:.6}, survey={surveyed:.6}",
+                    layer + 1
+                ));
+            }
+            if args.layer.is_none_or(|wanted| layer + 1 == wanted) {
+                println!(
+                    "layer={} plane={plane:.6} height={measured:.6} survey_height={surveyed:.6} input_beads={count} output={:?}",
+                    layer + 1,
+                    after.get(&layer)
+                );
+            }
+        }
+        println!("Layer faults: {}", faults.len());
+        for fault in &faults {
+            println!("{fault}");
+        }
+        return if faults.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("layer audit failed"))
+        };
+    }
     if args.mode == Mode::Nozzle {
         let original = std::fs::read(&args.input)?;
         let processed = std::fs::read(&args.output)?;
@@ -591,13 +781,60 @@ fn main() -> std::io::Result<()> {
     }
     let input = beads(&args.input)?;
     let output = beads(&args.output)?;
+    if args.mode == Mode::Junctions {
+        junctions::audit(&input, &output, args.layer);
+        return Ok(());
+    }
+    if args.mode == Mode::Contact {
+        let source = std::fs::read(&args.input)?;
+        let nozzle = nozzle::Nozzle::read(&String::from_utf8_lossy(&source));
+        let originals = Originals::new(&input);
+        for (label, beads) in [("input", &input), ("output", &output)] {
+            let hits = contacts(beads, args.layer, nozzle.reach());
+            println!(
+                "{label}: {} printing moves overlap previously deposited material above their nozzle plane",
+                hits.len()
+            );
+            for hit in hits.iter().take(20) {
+                println!(
+                    "contact line={} material_line={} penetration={:.6} mm",
+                    hit.0, hit.1, hit.2
+                );
+            }
+            let mut loads: Vec<_> = beads
+                .iter()
+                .filter(|bead| {
+                    args.layer.is_none_or(|layer| bead.layer + 1 == layer) && bead.span > 0.0
+                })
+                .collect();
+            loads.sort_by(|left, right| {
+                (right.delta * right.feed / right.span)
+                    .total_cmp(&(left.delta * left.feed / left.span))
+            });
+            for bead in loads.iter().take(12) {
+                let ratio = originals
+                    .find(bead)
+                    .map(|original| (bead.delta / bead.span) / (original.delta / original.span));
+                println!(
+                    "{label} load line={} layer={} span={:.6} filament={:.5} feed={:.3} filament_per_second={:.6} relative_density={ratio:?}",
+                    bead.line,
+                    bead.layer + 1,
+                    bead.span,
+                    bead.delta,
+                    bead.feed,
+                    bead.delta * bead.feed / (60.0 * bead.span)
+                );
+            }
+        }
+        return Ok(());
+    }
     if args.mode == Mode::Gap {
         let source = std::fs::read(&args.input)?;
         let width = nozzle::Nozzle::read(&String::from_utf8_lossy(&source)).bead;
         audit_gap(&input, &output, width);
         return Ok(());
     }
-    if matches!(args.mode, Mode::Paths | Mode::Settings) {
+    if matches!(args.mode, Mode::Paths | Mode::Settings | Mode::Throughput) {
         let check_settings = args.mode == Mode::Settings;
         let originals = Originals::new(&input);
         let mut changed = Vec::new();
@@ -605,6 +842,8 @@ fn main() -> std::io::Result<()> {
             let best = originals.find(bead);
             if best.is_none()
                 || (check_settings && best.is_some_and(|before| before.settings != bead.settings))
+                || (args.mode == Mode::Throughput
+                    && best.is_some_and(|before| exceeds_throughput(before, bead)))
             {
                 changed.push((bead, best));
             }
@@ -613,6 +852,8 @@ fn main() -> std::io::Result<()> {
             "{} mismatches: {} of {}",
             if check_settings {
                 "Settings"
+            } else if args.mode == Mode::Throughput {
+                "Throughput"
             } else {
                 "Printing path"
             },
@@ -625,10 +866,12 @@ fn main() -> std::io::Result<()> {
         return if changed.is_empty() {
             Ok(())
         } else {
-            Err(std::io::Error::other("path/settings audit failed"))
+            Err(std::io::Error::other(
+                "path/settings/throughput audit failed",
+            ))
         };
     }
-    if args.mode == Mode::Geometry {
+    if matches!(args.mode, Mode::Geometry | Mode::Extrusion) {
         let geometry = |beads: &[Bead]| {
             beads
                 .iter()
@@ -640,13 +883,15 @@ fn main() -> std::io::Result<()> {
                         bead.z,
                         format!("{:?}", bead.arc),
                         bead.feature,
+                        (args.mode == Mode::Extrusion).then_some(bead.delta),
                     )
                 })
                 .collect::<Vec<_>>()
         };
         assert_eq!(geometry(&input), geometry(&output));
         println!(
-            "Identical bead geometry and ordering: {} beads",
+            "Identical bead geometry and ordering (extrusion checked: {}): {} beads",
+            args.mode == Mode::Extrusion,
             input.len()
         );
         return Ok(());
@@ -657,6 +902,41 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_skipped_layer_or_missing_z_advance_fails_the_layer_audit() {
+        let first = "M83\n; CHANGE_LAYER\nM73 L1\nG1 X0 Y0 Z0.2\nG1 X10 Y0 E1\n";
+        let second = "; CHANGE_LAYER\nM73 L2\nG1 X0 Y0 Z0.4\nG1 X10 Y0 E1\n";
+        let source = format!("{first}{second}");
+        assert!(layer_faults(&source, &source).is_empty());
+        assert!(!layer_faults(&source, first).is_empty());
+        assert!(!layer_faults(&source, &source.replace("Z0.4", "Z0.2")).is_empty());
+        assert!(!layer_faults(&source, &source.replace("M73 L2", "M73 L3")).is_empty());
+        assert!(layer_faults(&source, &source.replace("Z0.4", "Z0.5")).is_empty());
+        assert_eq!(layer_stamps("M73 P79 ; L99\nM73 L14\n"), vec![14]);
+    }
+
+    #[test]
+    fn throughput_checks_the_original_move_instead_of_a_global_peak() {
+        let original = beads_in("M83\n;LAYER_CHANGE\nG1 X0 Y0 F600\nG1 X10 Y0 E1\n");
+        let fast = beads_in("M83\n;LAYER_CHANGE\nG1 X0 Y0 F600\nG1 X5 Y0 E0.75\n");
+        let slow = beads_in("M83\n;LAYER_CHANGE\nG1 X0 Y0 F400\nG1 X5 Y0 E0.75\n");
+        assert!(exceeds_throughput(&original[0], &fast[0]));
+        assert!(!exceeds_throughput(&original[0], &slow[0]));
+        assert_eq!(fast[0].delta, slow[0].delta);
+    }
+
+    #[test]
+    fn contact_screen_detects_printing_into_prior_material() {
+        let source = "M83\n;LAYER_CHANGE\nG1 X0 Y0 Z0.3 F1200\nG1 X10 Y0 E1\nG1 X10 Y0.2 Z0.2\nG1 X0 Y0.2 E1\n";
+        let beads = beads_in(source);
+        let hits = contacts(&beads, Some(1), 0.425);
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].2 - 0.1).abs() < 1e-9);
+        assert!(contacts(&beads, Some(2), 0.425).is_empty());
+        assert!(contacts(&beads_in(&source.replace("Z0.2", "Z0.3")), Some(1), 0.425).is_empty());
+        assert_eq!(beads[1].feed, 1200.0);
+    }
 
     #[test]
     fn the_gap_screen_detects_excess_and_missing_filament() {
