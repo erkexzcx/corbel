@@ -402,6 +402,13 @@ impl Sink {
     }
 
     /// Writes `data` with the input's own line endings put back.
+    ///
+    /// The readers here strip each line's `\r` and the transforms write a bare
+    /// `\n`, so a `\r` is re-added in front of it. A caller that streams the
+    /// file's own bytes through unchanged (`rewrite`'s `io::copy` example, a
+    /// spill that carries a long line out raw) hands the `\r` back too, so the
+    /// readd has to drop one that is already there — or every line of a CRLF
+    /// file comes out doubled.
     fn restore(&mut self, mut data: &[u8]) -> io::Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -419,7 +426,14 @@ impl Sink {
             return self.writer().write_all(data);
         }
         while let Some(at) = data.iter().position(|byte| *byte == b'\n') {
-            self.writer().write_all(&data[..at])?;
+            // The byte before the newline is the input's own `\r` when the
+            // data arrived verbatim; the newline we write carries its own.
+            let end = if at > 0 && data[at - 1] == b'\r' {
+                at - 1
+            } else {
+                at
+            };
+            self.writer().write_all(&data[..end])?;
             self.newline()?;
             data = &data[at + 1..];
         }
@@ -1050,6 +1064,33 @@ mod tests {
                 writeln!(sink, "{line}").expect("write");
             }
             sink.commit().expect("commit");
+
+            assert_eq!(
+                fs::read_to_string(&input).expect("read back"),
+                original,
+                "{label}"
+            );
+        }
+    }
+
+    /// `rewrite`'s own `io::copy` example streams the file's bytes through
+    /// unchanged, `\r` and all, so a CRLF file must not come back with every
+    /// line doubled. A transform would strip the `\r` first; a verbatim copy
+    /// proves `restore` is safe against a writer that does not.
+    #[test]
+    fn a_verbatim_copy_of_a_crlf_file_is_not_doubled() {
+        for (label, original) in [
+            ("crlf", "G1 X1\r\nG1 X2\r\n"),
+            ("crlf-open", "G1 X1\r\nG1 X2"),
+        ] {
+            let input = scratch(label).join("in.gcode");
+            fs::write(&input, original).expect("seed the input");
+
+            let source = Source::open(&input).expect("open");
+            let sink = source.sink(&input).expect("sink");
+            source
+                .rewrite(sink, |mut reader, writer| io::copy(&mut reader, writer))
+                .expect("rewrite");
 
             assert_eq!(
                 fs::read_to_string(&input).expect("read back"),
