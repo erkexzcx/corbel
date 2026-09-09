@@ -569,12 +569,27 @@ impl Compression {
 /// `stored` as well, which only makes the bound safer.
 const DEFLATE_EXPANSION: usize = 1032;
 
+/// What one deflate block may honestly claim, whatever its stored bytes say.
+///
+/// The codec ceiling is relative to the stored bytes and deflate reaches
+/// ~1000×, so a file that can name its own `expected` can justify a
+/// multi-gigabyte claim with a few megabytes of stored zeros — the input
+/// naming its own allocation. Real blocks are tens of kilobytes (libbgcode
+/// caps a block at 64 KiB, and thumbnails and settings are small), so an
+/// absolute cap far above any of them is what actually bounds memory.
+const DEFLATE_BLOCK: usize = 16 << 20;
+
 fn decompress(data: &[u8], packing: Compression, expected: usize) -> Result<Vec<u8>, String> {
     let stored = data.len();
     let ceiling = packing.ceiling(stored);
     if expected > ceiling {
         return Err(format!(
             "block promises {expected} bytes from {stored} stored, more than {packing:?} can reach"
+        ));
+    }
+    if matches!(packing, Compression::Deflate) && expected > DEFLATE_BLOCK {
+        return Err(format!(
+            "block promises {expected} bytes, more than the {DEFLATE_BLOCK}-byte ceiling for one deflate block"
         ));
     }
 
@@ -1208,6 +1223,24 @@ mod tests {
         let error = decompress(&bomb, Compression::Deflate, 12)
             .expect_err("a stream that outruns its header should not decode");
         assert!(error.contains("expands past"), "{error}");
+    }
+
+    /// The codec ceiling grows with the stored bytes, so enough stored zeros
+    /// can justify an `expected` no absolute limit will allow. A block may not
+    /// name its own allocation: real blocks are tens of kilobytes, and one
+    /// that claims more than [`DEFLATE_BLOCK`] is refused before a byte of it
+    /// is decoded.
+    #[test]
+    fn a_deflate_block_cannot_claim_more_than_the_absolute_ceiling() {
+        // ~32 MiB of zeros deflates to a few dozen kilobytes of stored bytes,
+        // so the codec ceiling alone would allow the ~24 MiB claim below.
+        let bomb = compress(&vec![0u8; 32 << 20], Compression::Deflate);
+        assert!(bomb.len() < 128 * 1024, "{} bytes stored", bomb.len());
+
+        let claimed = 24 << 20;
+        let error = decompress(&bomb, Compression::Deflate, claimed)
+            .expect_err("a claim past the absolute ceiling should not decode");
+        assert!(error.contains("ceiling for one deflate block"), "{error}");
     }
 
     /// The bound is a ceiling, not a rule: a block that really does compress
