@@ -326,23 +326,27 @@ impl Survey {
     /// tool this survey saw nothing extruded under falls back to the only
     /// slot it did see — a plate may load a filament it barely uses.
     pub fn melt_at(&self, tool: usize) -> Option<f64> {
-        self.melt_rate.get(tool).copied().flatten().or_else(|| {
-            match self.melt_rate.iter().flatten().count() {
-                1 => self.melt_rate.iter().flatten().copied().next(),
+        self.melt_rate
+            .get(tool)
+            .copied()
+            .flatten()
+            .or_else(|| match self.melt_rate.len() {
+                1 => self.melt_rate[0],
                 _ => None,
-            }
-        })
+            })
     }
 
     /// How far `tool`'s travels have to run before the file retracts for
     /// them, with the same single-slot fallback as [`melt_at`](Self::melt_at).
     pub fn hop_at(&self, tool: usize) -> Option<f64> {
-        self.hop_travel.get(tool).copied().flatten().or_else(|| {
-            match self.hop_travel.iter().flatten().count() {
-                1 => self.hop_travel.iter().flatten().copied().next(),
+        self.hop_travel
+            .get(tool)
+            .copied()
+            .flatten()
+            .or_else(|| match self.hop_travel.len() {
+                1 => self.hop_travel[0],
                 _ => None,
-            }
-        })
+            })
     }
 
     /// How much filament `tool` pulls back for a travel, with the same
@@ -352,8 +356,8 @@ impl Survey {
             .get(tool)
             .copied()
             .flatten()
-            .or_else(|| match self.retract_length.iter().flatten().count() {
-                1 => self.retract_length.iter().flatten().copied().next(),
+            .or_else(|| match self.retract_length.len() {
+                1 => self.retract_length[0],
                 _ => None,
             })
     }
@@ -2185,6 +2189,22 @@ G1 X2 Y0 E1
         let survey = Survey::of("; retraction_length = 0.8\nG1 Z0.2\n");
         assert_eq!(survey.retract_at(0), Some(0.8));
         assert_eq!(survey.retract_at(3), Some(0.8));
+    }
+
+    /// Retraction off is a real per-filament figure: a profile that disables
+    /// it for one tool states `0` for that slot. A zeroed slot must not be
+    /// read as "no figure stated" and then inherit the sibling's pull — the
+    /// fallback is for a file that states one retraction, not one out of a
+    /// per-tool list.
+    #[test]
+    fn a_zeroed_retraction_slot_does_not_inherit_its_siblings_pull() {
+        let survey = Survey::of("; retraction_length = 0.8,0\nG1 Z0.2\n");
+        assert_eq!(survey.retract_at(0), Some(0.8));
+        assert_eq!(
+            survey.retract_at(1),
+            None,
+            "a slot must not borrow slot zero's pull"
+        );
     }
 
     /// A slicer brackets a tool change with codes of its own — Bambu uses
