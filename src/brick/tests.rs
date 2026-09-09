@@ -1,11 +1,18 @@
 use super::*;
 
+fn tagged_bead<'a>(text: &'a str, tag: &str) -> Line<'a> {
+    text.lines()
+        .map(Line::parse)
+        .find(|line| line.comment().is_some_and(|comment| comment.trim() == tag))
+        .unwrap_or_else(|| panic!("missing {tag}: {text}"))
+}
+
 fn layer(z: f64) -> String {
     format!(";LAYER_CHANGE\nG1 Z{z:.2} F600\n")
 }
 
-/// A file printing a filament with melt to spare, so a fixture about
-/// geometry is not also a fixture about the rate a raise has to be slowed to.
+/// A relative-extrusion fixture with an explicit layer height and a generous
+/// global melt ceiling; local throughput still limits every bead.
 fn relative(body: &str) -> String {
     format!("; layer_height = 0.2\n; filament_max_volumetric_speed = 500\nM83\n{body}")
 }
@@ -1620,16 +1627,8 @@ fn a_lone_hole_is_bricked_beside_a_wall_in_the_same_region() {
         ..Config::default()
     };
     let outcome = apply(&source, &config);
-    assert!(
-        outcome.gcode.contains("E1.00000 ; wall2"),
-        "{}",
-        outcome.gcode
-    );
-    assert!(
-        outcome.gcode.contains("E1.00000 ; hole1"),
-        "{}",
-        outcome.gcode
-    );
+    assert_eq!(tagged_bead(&outcome.gcode, "wall2").e, Some(1.0));
+    assert_eq!(tagged_bead(&outcome.gcode, "hole1").e, Some(1.0));
     assert_eq!(outcome.stats.loops, 15);
     assert_eq!(outcome.stats.raised, 6);
 }
@@ -1797,8 +1796,8 @@ fn every_internal_wall_is_metered_at_the_multiplier() {
         ..Config::default()
     };
     let out = run(&source, &config);
-    assert!(out.contains("E1.50000 ; loop2"), "raised loop:\n{out}");
-    assert!(out.contains("E1.50000 ; loop1"), "flat loop:\n{out}");
+    assert_eq!(tagged_bead(&out, "loop2").e, Some(1.5));
+    assert_eq!(tagged_bead(&out, "loop1").e, Some(1.5));
     assert!(!out.contains("E1 ; loop"), "nothing left as sliced:\n{out}");
 }
 
@@ -1824,7 +1823,7 @@ fn the_surfaces_that_show_are_left_as_sliced() {
             "{tag} moved:\n{out}"
         );
     }
-    assert!(out.contains("E1.50000 ; loop1"), "wall scaled:\n{out}");
+    assert_eq!(tagged_bead(&out, "loop1").e, Some(1.5));
 }
 
 /// A bead on the plate is pressed by the plate rather than by a layer, so
@@ -1848,10 +1847,7 @@ fn the_layer_on_the_bed_is_left_as_sliced() {
         out.contains("E1 ; L0loop2"),
         "bed layer, raised loop:\n{out}"
     );
-    assert!(
-        out.contains("E1.50000 ; L3loop1"),
-        "the layers above:\n{out}"
-    );
+    assert_eq!(tagged_bead(&out, "L3loop1").e, Some(1.5));
 }
 
 /// A file handed no settings at all still gets the shipped slope, and the
@@ -1865,8 +1861,8 @@ fn the_shipped_default_meters_the_hidden_walls_over() {
     assert_eq!(Config::default().wall_flow, None);
     assert_eq!(Config::default().extra_flow, DEFAULT_EXTRA_FLOW);
     let out = run(&source, &Config::default());
-    assert!(out.contains("E1.02500 ; loop1"), "{out}");
-    assert!(out.contains("E1.02500 ; loop2"), "{out}");
+    assert_eq!(tagged_bead(&out, "loop1").e, Some(1.025));
+    assert_eq!(tagged_bead(&out, "loop2").e, Some(1.025));
 }
 
 /// The reference profile is the anchor: its layer is half its nozzle, so
@@ -2078,8 +2074,8 @@ fn the_width_the_file_states_sets_the_flow() {
         ),
         &Config::default(),
     );
-    assert!(narrow.contains("E1.03314 ; loop1"), "{narrow}");
-    assert!(wide.contains("E1.01676 ; loop1"), "{wide}");
+    assert_eq!(tagged_bead(&narrow, "loop1").e, Some(1.03314));
+    assert_eq!(tagged_bead(&wide, "loop1").e, Some(1.01676));
 }
 
 /// The flow is read per layer, not once per file, so a slice whose layers
@@ -2108,8 +2104,8 @@ fn an_adaptive_slice_meters_each_layer_at_its_own_flow() {
         "{low} to {high}"
     );
     // Layer 3 is 0.3 mm over a 0.4 mm plane, layer 1 is 0.1 mm over 0.2.
-    assert!(out.contains("E1.03959 ; L3loop1"), "thick layer:\n{out}");
-    assert!(out.contains("E1.01187 ; L1loop1"), "thin layer:\n{out}");
+    assert_eq!(tagged_bead(&out, "L3loop1").e, Some(1.03959));
+    assert_eq!(tagged_bead(&out, "L1loop1").e, Some(1.01187));
 }
 
 /// The dial names the slope, not the answer: it is the extra a wall takes
@@ -2253,7 +2249,7 @@ fn a_flow_given_on_the_command_line_overrides_the_file() {
         ..Config::default()
     };
     let out = run(&source, &config);
-    assert!(out.contains("E1.10000 ; loop1"), "{out}");
+    assert_eq!(tagged_bead(&out, "loop1").e, Some(1.1));
 }
 
 /// The multiplier is booked apart from the flow the geometry asks for, so
@@ -2311,7 +2307,8 @@ fn the_visible_wall_is_drawn_in_toward_the_loop_behind_it() {
     // 1.3 of the flow widens it by 0.107 and it moves in by half of that,
     // 0.054, on every side. The bead gains 1.3 of the flow it had, over a
     // path 0.9893 of its old length.
-    assert!(out.contains("G1 X9.946 Y0.054 E1.28607 ; skin1"), "{out}");
+    assert_eq!(tagged_bead(&out, "skin1").xy(), Some((9.946, 0.054)));
+    assert_eq!(tagged_bead(&out, "skin1").e, Some(1.28607));
     assert!(out.contains("G1 X9.946 Y9.946 E1.28607"), "{out}");
     assert!(out.contains("G1 X0.054 Y9.946 E1.28607"), "{out}");
     assert!(out.contains("G1 X0.054 Y0.054 E1.28607"), "{out}");
@@ -2354,7 +2351,8 @@ fn a_wall_reached_over_a_hop_is_still_approached_at_the_ring_it_moved_to() {
         "the nozzle is left at {x}, {y} rather than taken to the ring the \
          wall was moved to:\n{out}"
     );
-    assert!(out.contains("G1 X9.946 Y0.054 E1.28607 ; skin1"), "{out}");
+    assert_eq!(tagged_bead(&out, "skin1").xy(), Some((9.946, 0.054)));
+    assert_eq!(tagged_bead(&out, "skin1").e, Some(1.28607));
 }
 
 /// A slicer names only the axes that change, so the travel that reaches a
@@ -2425,7 +2423,8 @@ fn a_bead_that_names_one_axis_is_a_bead_and_not_a_travel() {
     // One closed ring, so the wall is still taken in by the offset the flow
     // asked for, approach and all.
     assert!(out.contains("G1 X0.054 Y0.054 F9000"), "{out}");
-    assert!(out.contains("G1 X9.946 Y0.054 E1.28607 ; skin1"), "{out}");
+    assert_eq!(tagged_bead(&out, "skin1").xy(), Some((9.946, 0.054)));
+    assert_eq!(tagged_bead(&out, "skin1").e, Some(1.28607));
     // And the bead itself is one of the wall's, metered at the wall's flow
     // rather than replayed untouched as part of a travel — and moved along
     // the one axis it names. The axis it does not name it inherits, and that
@@ -2593,8 +2592,7 @@ fn a_wall_drawn_in_carries_the_filament_its_new_width_asks_for() {
     )));
     let out = run(&source, &drawn_in());
     // Each side runs 9.893 of the 10 mm it did, at 1.3 the flow.
-    assert!(!out.contains("E1.00000 ; skin1"), "{out}");
-    assert!(out.contains("E1.28607 ; skin1"), "{out}");
+    assert_eq!(tagged_bead(&out, "skin1").e, Some(1.28607));
 }
 
 /// A hole is emitted clockwise, so the same rule moves its wall out of the
@@ -2809,10 +2807,8 @@ fn a_visible_wall_drawn_with_an_arc_moves_with_its_centre() {
         "the arc must be redrawn about the centre it kept: {out}"
     );
     // Start (10.000, -0.054) plus J puts the centre back at (10, 5).
-    assert!(
-        out.contains("G1 X10.000 Y-0.054 E1.29311 ; arcskin"),
-        "the straight bead is not over the raised square: {out}"
-    );
+    assert_eq!(tagged_bead(&out, "arcskin").xy(), Some((10.0, -0.054)));
+    assert_eq!(tagged_bead(&out, "arcskin").e, Some(1.29311));
 }
 
 /// An open fragment has no inside, so there is no direction to move it in.
@@ -2827,7 +2823,8 @@ fn an_open_run_of_visible_wall_is_not_moved() {
         wall_of(1, "loop", 0.6, 8.8, 1.0)
     )));
     let out = run(&source, &drawn_in());
-    assert!(out.contains("G1 X10.00 Y0.00 E1.30000 ; open"), "{out}");
+    assert_eq!(tagged_bead(&out, "open").xy(), Some((10.0, 0.0)));
+    assert_eq!(tagged_bead(&out, "open").e, Some(1.3));
 }
 
 /// The half layer a column is displaced by is paid over two layers rather
@@ -3223,13 +3220,17 @@ fn a_long_bead_is_metered_where_its_gap_changes() {
 fn a_split_full_circle_keeps_its_curve_and_absolute_or_relative_extrusion() {
     for mode in [Code::AbsoluteE, Code::RelativeE] {
         let survey = Survey::of("; layer_height = 0.2\nM83\n");
-        let config = plain();
+        let config = Config {
+            wall_flow: Some(1.5),
+            ..plain()
+        };
         let mut out = Vec::new();
         let mut pass = Pass::new(&mut out, &config, &survey);
         pass.layer = 3;
         pass.layer_z = 0.8;
         pass.nozzle_z = Some(0.8);
         pass.extruder.set_mode(mode);
+        pass.melt_rate = None;
         pass.feature = Feature::InternalPerimeter;
         pass.ground.add(
             (2.0, 0.0),
@@ -3264,8 +3265,12 @@ fn a_split_full_circle_keeps_its_curve_and_absolute_or_relative_extrusion() {
         let mut stock = 0.0;
         let mut length = 0.0;
         let mut pieces = 0;
+        let mut feed = 600.0;
         for raw in out.lines() {
             let line = Line::parse(raw);
+            if let Some(rate) = line.f {
+                feed = rate;
+            }
             let from = modal.position();
             modal.apply(&line);
             if let Some(value) = line.e {
@@ -3278,7 +3283,13 @@ fn a_split_full_circle_keeps_its_curve_and_absolute_or_relative_extrusion() {
                     (from.0 + arc.i).abs() < 0.002 && (from.1 + arc.j).abs() < 0.002,
                     "the circle's centre moved: {raw}"
                 );
-                length += footprint::along((from.0, from.1), (to.0, to.1), Some(arc));
+                let span = footprint::along((from.0, from.1), (to.0, to.1), Some(arc));
+                let original_rate = 600.0 / (60.0 * std::f64::consts::TAU * 2.0);
+                assert!(
+                    delta * feed / (60.0 * span) <= original_rate * 1.00001,
+                    "split piece exceeds original throughput: {raw}"
+                );
+                length += span;
                 stock += delta;
                 pieces += 1;
             }
@@ -3289,7 +3300,7 @@ fn a_split_full_circle_keeps_its_curve_and_absolute_or_relative_extrusion() {
             "extra revolution: {out}"
         );
         assert!(
-            (stock - 0.75).abs() < 0.01,
+            (stock / 1.5 - 0.75).abs() < 0.01,
             "one half filled at half flow: {out}"
         );
         assert_eq!(out.matches("; full circle").count(), 1);
@@ -3476,6 +3487,36 @@ fn a_loop_written_out_of_order_carries_the_rate_its_region_stated() {
 /// the wall it belongs to has room to spare. Slowing per LOOP put the bridge's
 /// speed on the whole wall.
 #[test]
+fn extra_material_slows_each_bead_even_with_unlimited_melt_headroom() {
+    for command in [
+        "G1 X10 Y0 E1 F600",
+        "G1 X0.02 Y0 E1 F600",
+        "G3 X10 Y0 I5 J0 E1 F600",
+    ] {
+        for ceiling in [None, Some(1000.0)] {
+            let survey = Survey::of("; layer_height = 0.2\nM83\n");
+            let config = plain();
+            let mut pass = Pass::new(Vec::new(), &config, &survey);
+            pass.extruder.set_mode(Code::RelativeE);
+            pass.melt_rate = ceiling;
+            let line = Line::parse(command);
+            pass.at = line.xy().unwrap();
+            pass.buffer(line, (0.0, 0.0));
+            assert!(
+                (pass.metered_rate(0, 1.5, &[None]).unwrap() - 400.0).abs() < 1e-9,
+                "{command}"
+            );
+            assert_eq!(pass.metered_rate(0, 1.0, &[None]), None, "{command}");
+            assert_eq!(
+                pass.metered_rate(0, 0.5, &[None]),
+                None,
+                "a thinner bead must not be sped up: {command}"
+            );
+        }
+    }
+}
+
+#[test]
 fn only_the_bead_that_goes_over_is_slowed() {
     // No stated ceiling, so the fastest bead in the file sets it — which is
     // the bridge. Every other bead of the wall is a third of that.
@@ -3521,10 +3562,9 @@ fn only_the_bead_that_goes_over_is_slowed() {
         "the bead at the ceiling was not slowed:\n{out}"
     );
     for tag in ["wall1", "wall2", "wall3"] {
-        assert_eq!(
-            rate(tag),
-            1200.0,
-            "{tag} was slowed to the bridge's rate:\n{out}"
+        assert!(
+            (rate(tag) - 1200.0 / 1.025).abs() < 0.001,
+            "{tag} must retain its own throughput, not take the bridge's: {out}"
         );
     }
 }
@@ -4085,6 +4125,90 @@ fn a_hole_beside_an_island_keeps_its_own_contour() {
     );
 }
 
+#[test]
+fn a_square_and_circle_meeting_inside_a_wall_keep_their_own_stagger_and_seams() {
+    for count in [3, 4] {
+        let mut body = String::new();
+        let mut wanted = Vec::new();
+        for index in (0..count).rev() {
+            body.push_str(if index == 0 {
+                ";TYPE:External perimeter\n"
+            } else {
+                ";TYPE:Perimeter\n"
+            });
+            let inset = index as f64 * 0.45;
+            let near = inset;
+            let far = 20.0 - inset;
+            body.push_str(&format!("G1 X{near:.3} Y{near:.3} F3000\n"));
+            let corners = [
+                (near, near),
+                (far, near),
+                (far, far),
+                (near, far),
+                (near, near + 0.06),
+            ];
+            for edge in 0..4 {
+                let from = corners[edge];
+                let to = corners[edge + 1];
+                let steps = (to.0 - from.0).hypot(to.1 - from.1).ceil() as usize;
+                for step in 1..=steps {
+                    let share = step as f64 / steps as f64;
+                    let note = if edge == 0 && step == 1 {
+                        format!(" ; square{index}")
+                    } else {
+                        String::new()
+                    };
+                    body.push_str(&format!(
+                        "G1 X{:.3} Y{:.3} E0.05{note}\n",
+                        from.0 + (to.0 - from.0) * share,
+                        from.1 + (to.1 - from.1) * share
+                    ));
+                }
+            }
+            wanted.push((format!("square{index}"), index % 2 == 1));
+        }
+        let inner = 20.0 - (count - 1) as f64 * 0.45;
+        let radius = 4.0 + (count - 1) as f64 * 0.45;
+        let centre = inner - 0.4 - radius;
+        for index in (0..count).rev() {
+            body.push_str(if index == 0 {
+                ";TYPE:External perimeter\n"
+            } else {
+                ";TYPE:Perimeter\n"
+            });
+            let radius = 4.0 + index as f64 * 0.45;
+            let start = centre + radius;
+            let end_x = centre + radius * (0.06 / radius).cos();
+            let end_y = 10.0 + radius * (0.06 / radius).sin();
+            body.push_str(&format!("G1 X{start:.3} Y10 F3000\nG2 X{:.3} Y10 I-{radius:.3} J0 E0.5 ; circle{index}\nG2 X{end_x:.3} Y{end_y:.3} I{radius:.3} J0 E0.5 ; seam{index}\n", centre - radius));
+            wanted.push((format!("circle{index}"), index % 2 == 1));
+            wanted.push((format!("seam{index}"), index % 2 == 1));
+        }
+        wanted.sort();
+        let output = run(&middle_layer(&body), &plain());
+        assert_eq!(parities(&output), wanted);
+        for index in 0..count {
+            for (tag, delta) in [
+                (format!("square{index}"), 0.05),
+                (format!("circle{index}"), 0.5),
+                (format!("seam{index}"), 0.5),
+            ] {
+                let before = tagged_bead(&body, &tag);
+                let after = tagged_bead(&output, &tag);
+                assert_eq!(
+                    (before.x, before.y, before.i, before.j),
+                    (after.x, after.y, after.i, after.j),
+                    "{tag}"
+                );
+                assert!(
+                    (after.e.unwrap() - delta).abs() < 0.00002,
+                    "{tag}: {output}"
+                );
+            }
+        }
+    }
+}
+
 /// The layer above a column's first climbing layer stands on half a raise,
 /// not a whole one.
 ///
@@ -4279,10 +4403,8 @@ fn a_visible_wall_drawn_with_a_radius_moves_with_the_centre_that_radius_names() 
         out.contains("G2 X10.000 Y10.054 R5.054"),
         "the arc must keep the circle it was drawn on: {out}"
     );
-    assert!(
-        out.contains("G1 X10.000 Y-0.054 E1.29311 ; arcskin"),
-        "the straight bead is not over the raised square: {out}"
-    );
+    assert_eq!(tagged_bead(&out, "arcskin").xy(), Some((10.0, -0.054)));
+    assert_eq!(tagged_bead(&out, "arcskin").e, Some(1.29311));
 }
 
 /// A move no printer makes cannot be rasterised, so the cells along it are

@@ -141,11 +141,11 @@ The formula is the slicer's own bead model: PrusaSlicer's [`Flow::rounded_rectan
 
 ### ⏱️ Why some walls print slower
 
-**A bead given more filament is given more time to melt it.** The first bead of a raised column spans one and a half layers, so it carries 1.5× the filament — at the slicer's own speed that is 1.5× the throughput, and your hot end does not have it. Your slicer already caps every bead against the filament's `filament_max_volumetric_speed`: measured on a stock Bambu plate whose filament states 15 mm³/s, **98.64% of the sliced path sits at exactly 15**. There is no headroom left to take.
+**Extra material takes more time, not a higher extrusion rate.** Each bricked bead stays at or below its original filament-per-second rate, even when the filament profile permits more throughput. A bead needing 55% more material per millimetre slows from 50 to about 32.3 mm/s and takes 55% longer to print.
 
-So where a bead would go over, `F` comes down by just enough to stay inside it. **The filament is never changed for this** — the same material goes down, over slightly more time. Left alone, the one bead that has to fill the gap under a raised column is the one that comes out starved, which is the transform's whole benefit lost exactly where it was meant to happen.
+**The required filament amount is unchanged by the slowdown.** `E` still fills the measured gap; `F` gives the nozzle longer to deliver it. The active tool's volumetric ceiling remains an additional limit. A bead needing less material is never sped up.
 
-It costs nothing where your filament has room: a bead at 5 mm³/s scaled to 7.7 is still well inside a 15 mm³/s limit and is left at full speed. **Each bead is judged on its own**, so a bridge the slicer already slowed to the limit does not drag the rest of its wall down with it. Measured across the stored plates, the bulk of a wall is slowed to **97-100%** of its own speed and only the beads that start a raised column reach **65%**, for **+4.4% to +4.7%** of the time spent laying bead.
+Each bead is judged on its own, including arcs and short pieces split at gap changes. A bridge's slower rate is not imposed on the rest of its wall, and travel and retraction speeds are preserved.
 
 ---
 

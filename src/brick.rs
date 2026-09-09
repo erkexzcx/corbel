@@ -26,7 +26,7 @@ use crate::gcode::feature::{Feature, is_layer_marker};
 use crate::gcode::{Code, Extruder, Line, Lines, MAX_LINE, Modal, repaired, write_e, write_fixed};
 use crate::geometry::Edge;
 use crate::geometry::{Arc, Cells, Trace, footprint, inset};
-use crate::scan::{BRICK_STAMP, FALLBACK_Z_FEEDRATE, MELT_GAUGE, Markerless, Survey, is_a_height};
+use crate::scan::{BRICK_STAMP, FALLBACK_Z_FEEDRATE, Markerless, Survey, is_a_height};
 
 /// How far apart two loops may run and still count as neighbours in one wall,
 /// in mm.
@@ -709,15 +709,6 @@ struct Loop {
     /// begins on this layer, so its first bead climbs from the plane rather
     /// than being raised to an offset nothing under it earned.
     steps: usize,
-    /// True where the material this loop is laid on was left standing proud by
-    /// the layer below. Read off that layer's own footprint rather than
-    /// assumed from this loop's parity, which can differ from the one the
-    /// column had beneath it.
-    on_a_raise: f64,
-    /// True where that raise was a column still climbing rather than one that
-    /// had settled, so it stood at half the offset. Measured for the same
-    /// reason: how old a column is cannot be read off its own loop's age.
-    on_a_climb: bool,
     /// Extent of what the loop extrudes, as `[left, bottom, right, top]`, and
     /// how many points it lays down. Measured once, since grouping compares
     /// every loop with both the one before it and the one after.
@@ -745,28 +736,13 @@ struct Pass<'a, W: Write> {
     /// survey. A wall raised beside support stands proud of material a single
     /// bead wide that is printed to be broken off, so it is held flat instead.
     support: &'a [Cells],
-    /// Cells the layer below was left standing proud in, so a bead can be
-    /// metered for the gap it really crosses rather than for the one its own
-    /// parity implies.
-    standing: Cells,
     ground: Ground,
     next_ground: Ground,
-    /// The part of `standing` a column had only climbed half way to. A raise
-    /// reaches its offset over [`RAMP`] layers, so what is under a bead is one
-    /// of exactly two heights, and which one it is has to be measured for the
-    /// same reason the raise itself does.
-    climbed: Cells,
-    /// The same for the layer being written, filled as each loop is settled
-    /// and handed to `standing` when the layer closes.
-    rising: Cells,
-    climbing: Cells,
     /// Cells this layer has already left standing proud, grown as each raised
     /// loop is *written* rather than when it is decided.
     ///
-    /// `rising` is the whole layer's answer and is known before a line of it
-    /// is emitted, which is the wrong question for a travel: what can be in
-    /// the nozzle's way is what has actually been laid by the time the travel
-    /// runs.
+    /// What a travel might meet is what has actually been laid by the time it
+    /// runs, not the layer's full planned footprint.
     laid: Cells,
     /// How high the tallest of them stands, so a travel is only lifted where
     /// it would otherwise pass below one.
@@ -829,8 +805,7 @@ struct Pass<'a, W: Write> {
     /// The feedrate the slicer retracts at, taken from its own retractions.
     retract_feed: Option<f64>,
     /// Cells of the loop being settled, kept between calls so the walk that
-    /// weighs a loop against the layers either side of it can hand its path
-    /// to `rising` rather than be repeated for it.
+    /// weighs a loop against the layers either side of it runs once.
     path: Vec<u32>,
     /// True once a refused walk has been reported. A print is already running
     /// by the time this pass sees the file, so a move no printer makes is a
@@ -945,12 +920,8 @@ impl<'a, W: Write> Pass<'a, W> {
             uncovered: &survey.uncovered,
             unsupported: &survey.unsupported,
             support: &survey.support,
-            standing: Cells::on(footprint::Grid::default()),
             ground: Ground::default(),
             next_ground: Ground::default(),
-            climbed: Cells::on(footprint::Grid::default()),
-            rising: Cells::on(footprint::Grid::default()),
-            climbing: Cells::on(footprint::Grid::default()),
             laid: Cells::on(footprint::Grid::default()),
             laid_top: f64::NEG_INFINITY,
             raised_cells: Vec::new(),
@@ -1740,8 +1711,6 @@ impl<'a, W: Write> Pass<'a, W> {
             raised: false,
             capped: false,
             steps: 0,
-            on_a_raise: 0.0,
-            on_a_climb: false,
             outline: None,
             points: 0,
             cells: (0, 0),
@@ -1749,17 +1718,10 @@ impl<'a, W: Write> Pass<'a, W> {
         self.travelled = false;
     }
 
-    /// Hands the footprint this layer left standing proud to the next one,
-    /// reusing both buffers rather than allocating a set per layer.
+    /// Hands the footprint this layer left standing proud to the next one.
     fn close_layer(&mut self) {
         std::mem::swap(&mut self.ground, &mut self.next_ground);
         self.next_ground.clear();
-        self.rising.settle();
-        self.climbing.settle();
-        std::mem::swap(&mut self.standing, &mut self.rising);
-        std::mem::swap(&mut self.climbed, &mut self.climbing);
-        self.rising.clear();
-        self.climbing.clear();
         self.laid.clear();
         self.laid_top = f64::NEG_INFINITY;
         self.floor = None;
@@ -2087,29 +2049,30 @@ impl<'a, W: Write> Pass<'a, W> {
         wrote
     }
 
-    /// The rate one bead has to be laid at so the filament it is given is not
-    /// asked for faster than the file's own walls melt it, or `None` where
-    /// this bead has the headroom to run as the slicer asked.
-    ///
-    /// Per BEAD, never per loop. The multiple of filament is one number for a
-    /// whole loop, but what each bead already flows at is not: a slicer slows
-    /// a bridge or an overhang right down and gives it a fatter bead, so that
-    /// one segment sits at the ceiling while the rest of its wall has room to
-    /// spare. Taking the tightest bead and slowing the loop to it put the
-    /// bridge's speed on the whole wall.
-    ///
-    /// Measured on the bead as it will be WRITTEN, not as it was read. The
-    /// visible wall is moved sideways, and a corner does not change length by
-    /// the same proportion as the ring it belongs to — so on a wall that walks
-    /// outward the two differ, and reading the input's geometry left a bead
-    /// 1.9% over. At the three decimals it is written to, for the same reason:
-    /// a micron of rounding on a half-millimetre bead is a fifth of a percent
-    /// of its flow.
+    /// The input bead's filament throughput, capped by its tool's melt limit.
+    /// Global headroom must never increase the local extrusion load.
+    fn bead_limit(&self, index: usize, asked: f64) -> Option<f64> {
+        let buffered = self.buffer[index];
+        let from = index
+            .checked_sub(1)
+            .map_or(self.entry, |previous| self.buffer[previous].at);
+        let span = footprint::along(from, buffered.at, buffered.arc);
+        let delta = buffered.delta.filter(|delta| *delta > 0.0)?;
+        if span <= 0.0 || !span.is_finite() {
+            return None;
+        }
+        let original = delta / span * asked / 60.0;
+        Some(
+            self.melt_rate
+                .map_or(original, |ceiling| ceiling.min(original)),
+        )
+    }
+
     fn metered_rate(&self, index: usize, factor: f64, moved: &[Option<Moved>]) -> Option<f64> {
-        let ceiling = self.melt_rate?;
         let buffered = self.buffer[index];
         let delta = buffered.delta.filter(|delta| *delta > 0.0)?;
         let asked = buffered.f.or(self.wanted_feed)?;
+        let ceiling = self.bead_limit(index, asked)?;
         let to = written(moved[index].map_or(buffered.at, |moved| moved.to));
         let from = written(match index.checked_sub(1) {
             Some(previous) => moved[previous].map_or(self.buffer[previous].at, |moved| moved.to),
@@ -2132,7 +2095,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 None => arc,
             });
         let along = footprint::along(from, to, arc);
-        if along < MELT_GAUGE {
+        if along <= 0.0 || !along.is_finite() {
             return None;
         }
         // The filament that actually reaches the nozzle is the value as
@@ -2141,7 +2104,11 @@ impl<'a, W: Write> Pass<'a, W> {
         // written `E` rounds up: measured on the cone plate, a bead metered
         // at 0.0027551 mm came out as E0.00276 and melted 0.18% over the
         // file's own ceiling.
-        let flow = (delta * factor * 100_000.0).round() / 100_000.0;
+        let mut extruder = self.extruder;
+        extruder.set_mode(e_mode(buffered.absolute));
+        let before = extruder.advance(0.0);
+        let after = extruder.advance(delta * factor);
+        let flow = ((after * 100_000.0).round() - (before * 100_000.0).round()) / 100_000.0;
         let rate = flow / along * asked / 60.0;
         (rate > ceiling).then(|| asked * ceiling / rate)
     }
@@ -2946,7 +2913,7 @@ impl<'a, W: Write> Pass<'a, W> {
         // not it named one, because a `G1 F` in front of it is a line the
         // surface transform can reorder away from the bead it was written for
         // — and only where it differs from what the line would otherwise run
-        // at, so a file with melt to spare comes through byte for byte.
+        // at, so unchanged beads do not gain redundant rate words.
         let needed = buffered.delta.filter(|delta| *delta > 0.0).and_then(|_| {
             self.metered_rate(index, factor * ratio, moved)
                 .or(buffered.f)
@@ -3332,8 +3299,8 @@ impl<'a, W: Write> Pass<'a, W> {
             );
             let needed = asked.map(|rate| {
                 match self
-                    .melt_rate
-                    .filter(|_| length >= MELT_GAUGE && along > 0.0 && rounded > 0.0)
+                    .bead_limit(index, rate)
+                    .filter(|_| along > 0.0 && rounded > 0.0)
                 {
                     Some(ceiling) => rate.min(ceiling * along * 60.0 / rounded),
                     None => rate,
@@ -3485,12 +3452,9 @@ impl<'a, W: Write> Pass<'a, W> {
     /// path is laid where nothing stands beneath it.
     ///
     /// Both answers come from the same walk of the loop's path, since the walk
-    /// is what costs: five sets are tested for the price of one. The last two
-    /// are what the layer below left standing proud and how much of that was a
-    /// column still climbing, which is what tells a bead laid on a raise from
-    /// one laid on the plane and a full raise from half of one — none of the
-    /// three can be read off this loop's own parity or age, and a bead metered
-    /// for the wrong one crosses less of the gap it was fed for.
+    /// is what costs: four sets are tested for the price of one. What a bead
+    /// is laid on is measured against the layer below's actual paths by
+    /// [`Ground`], never read off this loop's own parity or age.
     fn mark_columns(&mut self) {
         // The object's last wall layer is capped whether or not the file gave
         // the survey the geometry to work the rest out for itself.
@@ -3517,19 +3481,11 @@ impl<'a, W: Write> Pass<'a, W> {
             .get(self.layer)
             .filter(|cells| !cells.is_empty())
             .map(|cells| cells.dilated(2));
-        // Both are held by this pass rather than the survey, so they are taken
-        // out for the walk and handed straight back.
-        let standing = self.standing.take();
-        let climbed = self.climbed.take();
-        let mut rising = self.rising.take();
-        let mut climbing = self.climbing.take();
         let mut path = std::mem::take(&mut self.path);
-        let proud = (!standing.is_empty()).then_some(&standing);
-        let part_way = (!climbed.is_empty()).then_some(&climbed);
 
         for index in 0..self.loops.len() {
             let (share, points, traced) = self.shares(
-                [above, here, below, proud, part_way, beside.as_ref()],
+                [above, here, below, beside.as_ref()],
                 self.loops[index],
                 &mut path,
             );
@@ -3539,7 +3495,7 @@ impl<'a, W: Write> Pass<'a, W> {
             // left on its layer's plane instead: a wall printed as the slicer
             // sliced it is a wall that prints, where a raise measured against
             // a part of a loop is a bead metered for a gap it does not cross.
-            // Nothing of it is absorbed into `rising` either, so the layer
+            // Nothing of it is recorded in `next_ground` either, so the layer
             // above measures nothing standing here — which is exactly what
             // will have been printed.
             if traced == Trace::Refused {
@@ -3547,28 +3503,15 @@ impl<'a, W: Write> Pass<'a, W> {
                 self.loops[index].raised = false;
                 self.loops[index].capped = false;
                 self.loops[index].steps = object;
-                self.loops[index].on_a_raise = 0.0;
-                self.loops[index].on_a_climb = false;
                 continue;
             }
             let over = |set: usize| points > 0 && share[set] as f64 > points as f64 * CAP_SHARE;
-            self.loops[index].capped = tops || over(0) || share[5] > 0;
+            self.loops[index].capped = tops || over(0) || share[3] > 0;
             self.loops[index].steps = match (over(1), over(2)) {
                 (true, _) => 0,
                 (_, true) => 1,
                 _ => object,
             };
-            self.loops[index].on_a_raise = match points {
-                0 => 0.0,
-                _ => share[3] as f64 / points as f64,
-            };
-            // What is climbing is a subset of what is standing, so the raise
-            // below is a climbing one where most of what stands under this
-            // loop is. A mix takes the settled height, which is the taller of
-            // the two: reading a bead as crossing less than it does leaves it
-            // a little short, and reading it as crossing more pours what the
-            // gap cannot hold.
-            self.loops[index].on_a_climb = share[4] * 2 > share[3];
             let current = self.loops[index];
             let mut next_ground = std::mem::take(&mut self.next_ground);
             let rise = self.rise_of(current);
@@ -3577,21 +3520,11 @@ impl<'a, W: Write> Pass<'a, W> {
             });
             self.next_ground = next_ground;
             if self.rise_of(current) > 0.0 {
-                rising.absorb(&path);
                 let start = self.raised_cells.len();
                 self.raised_cells.extend_from_slice(&path);
                 self.loops[index].cells = (start, self.raised_cells.len());
-                // The intermediate step of the ramp, which the layer above
-                // has to meter against rather than against the full offset.
-                if current.steps < RAMP {
-                    climbing.absorb(&path);
-                }
             }
         }
-        self.standing = standing;
-        self.climbed = climbed;
-        self.rising = rising;
-        self.climbing = climbing;
         self.path = path;
     }
 
@@ -3634,11 +3567,11 @@ impl<'a, W: Write> Pass<'a, W> {
     /// back with it describe part of the loop and are not a share of it.
     fn shares(
         &self,
-        sets: [Option<&Cells>; 6],
+        sets: [Option<&Cells>; 4],
         current: Loop,
         path: &mut Vec<u32>,
-    ) -> ([usize; 6], usize, Trace) {
-        let mut found = [0usize; 6];
+    ) -> ([usize; 4], usize, Trace) {
+        let mut found = [0usize; 4];
         let mut traced = Trace::Whole;
         path.clear();
         self.trace(current, |from, to, arc| {
