@@ -1243,6 +1243,14 @@ impl<'a, W: Write> Pass<'a, W> {
         // section begins.
         if matches!(line.code, Code::RelativePosition | Code::Inches) && self.modal.is_plain() {
             self.flush()?;
+            // The last moment a plain write is possible, so a loop still
+            // waiting goes down here rather than at the next plain boundary.
+            // A `T` inside the section makes that next boundary a tool change,
+            // and the loop is then laid in the other filament — measured on a
+            // user's dual-nozzle plate at 41818 mm of bead crossing from one
+            // tool to the other. Writing it now is safe precisely because the
+            // section has not started: the mode is still plain.
+            self.write_held()?;
         }
         let moved = self.modal.apply(&line);
 

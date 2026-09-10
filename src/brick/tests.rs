@@ -107,6 +107,35 @@ fn run(source: &str, config: &Config) -> String {
     apply(source, config).gcode
 }
 
+/// A tool change is a wall a loop may never cross, and a `T` inside a
+/// `G91`/`G20` section is still one. Nothing this pass writes says what it
+/// means inside such a section, so the loop cannot be written there — which
+/// means it has to go down before the section starts, in the plain mode the
+/// section is about to leave. Waiting for the next plain boundary instead puts
+/// it after the change, and it is laid in the other filament.
+#[test]
+fn a_held_loop_is_written_before_a_tool_change_inside_a_relative_section() {
+    let mut body = format!(";TYPE:Perimeter\n{}", wall_of(3, "W", 0.0, 10.0, 0.5));
+    body.push_str("G91\nT1\nG90\n");
+    let out = run(&middle_layer(&body), &Config::default());
+    assert!(
+        out.contains("corbel brick raised"),
+        "nothing was raised, so this fixture proves nothing:\n{out}"
+    );
+    // A raise belongs to the tool that was printing when it was read: nothing
+    // between a `T` and the next layer may carry one.
+    let mut after_change = false;
+    for line in out.lines() {
+        if line.trim() == "T1" {
+            after_change = true;
+        } else if line.starts_with(";LAYER_CHANGE") {
+            after_change = false;
+        } else if after_change && line.contains("corbel brick raised") {
+            panic!("a raised loop was laid after the tool change:\n{out}");
+        }
+    }
+}
+
 /// Two lines too long to be held whole, one after the other, are still two
 /// lines. A piece of a long line is `partial` whether it opens the line or
 /// closes it, so the caller could learn only that *a* line was being spilled —
