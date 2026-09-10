@@ -3605,6 +3605,7 @@ fn the_first_bead_of_a_region_is_metered_against_its_entry() {
         absolute: true,
         resets_origin: false,
         width: None,
+        marker: None,
     });
     assert_eq!(
         pass.metered_rate(0, 1.0, &[None]),
@@ -5083,6 +5084,7 @@ fn replay_gives_an_owed_prime_back_at_the_bead_not_the_wipe() {
         carries: false,
         absolute: false,
         resets_origin: false,
+        marker: None,
         width: None,
     });
     pass.replay(0, 1.0, &[None]).unwrap();
@@ -5133,6 +5135,7 @@ fn replay_books_the_filament_it_actually_writes() {
         positions: false,
         carries: false,
         absolute: false,
+        marker: None,
         resets_origin: false,
         width: None,
     });
@@ -5179,6 +5182,7 @@ fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
                 absolute: false,
                 resets_origin: false,
                 width: None,
+                marker: None,
             });
             pass.input_withdrawn = (pass.input_withdrawn - delta).max(0.0);
             index
@@ -5235,6 +5239,7 @@ fn an_intentionally_withdrawn_bead_is_preserved_regardless_of_length() {
                 absolute: false,
                 resets_origin: false,
                 width: None,
+                marker: None,
             });
             pass.input_withdrawn = (pass.input_withdrawn - delta).max(0.0);
             index
@@ -5296,6 +5301,7 @@ fn a_prime_answers_the_actual_withdrawal() {
         positions: false,
         carries: false,
         absolute: false,
+        marker: None,
         resets_origin: false,
         width: None,
     });
