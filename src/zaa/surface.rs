@@ -407,9 +407,17 @@ impl Builder {
             } = self;
             let [mine, over, under] = &*inside;
             let [to_mine, to_over, to_under] = distance;
+            // Each transform waits in its own slot rather than going straight
+            // into a spawn, so that a refused spawn costs time and not the job.
+            let first = std::sync::Mutex::new(Some(move || {
+                transform(mine, to_mine, false, width, height);
+            }));
+            let second = std::sync::Mutex::new(Some(move || {
+                transform(over, to_over, true, width, height);
+            }));
             std::thread::scope(|scope| {
-                scope.spawn(|| transform(mine, to_mine, false, width, height));
-                scope.spawn(|| transform(over, to_over, true, width, height));
+                spawn_or_run(scope, &first);
+                spawn_or_run(scope, &second);
                 transform(under, to_under, false, width, height);
             });
         }
@@ -764,6 +772,37 @@ impl Builder {
 }
 
 /// The chamfer transform of one set, as two raster passes over the window.
+/// Runs `job` on a thread of `scope`, or on this one when the OS will not give
+/// a thread.
+///
+/// `Scope::spawn` panics on a failed spawn, and with `panic = "abort"` in a
+/// release build that is the whole run — on a file a slicer handed this tool as
+/// the user's only copy. A failed spawn also consumes the closure it refused,
+/// so the job waits in a slot and the calling thread takes it back out when no
+/// thread came. Nothing here changes who does the work in the ordinary case.
+fn spawn_or_run<'scope, F>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    slot: &'scope std::sync::Mutex<Option<F>>,
+) where
+    F: FnOnce() + Send,
+{
+    let spawned = std::thread::Builder::new()
+        .spawn_scoped(scope, || {
+            if let Ok(mut held) = slot.lock()
+                && let Some(job) = held.take()
+            {
+                job();
+            }
+        })
+        .is_ok();
+    if !spawned
+        && let Ok(mut held) = slot.lock()
+        && let Some(job) = held.take()
+    {
+        job();
+    }
+}
+
 fn transform(inside: &[u8], distance: &mut Vec<u16>, within: bool, width: usize, height: usize) {
     distance.clear();
     distance.resize(width * height, UNREACHED);
