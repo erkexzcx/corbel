@@ -253,11 +253,18 @@ impl Source {
 
         let writer = match &self.kind {
             Kind::Text => Writer::Text(BufWriter::with_capacity(WRITE_BUFFER, file)),
-            Kind::Binary { container, .. } => Writer::Binary(
-                container
-                    .writer(file)
-                    .map_err(|source| Error::io(&temporary, source))?,
-            ),
+            Kind::Binary { container, .. } => Writer::Binary(match container.writer(file) {
+                Ok(writer) => writer,
+                // The `Sink` that would have removed the temporary is not
+                // built yet, so a container that cannot write its own
+                // prelude has to take the file away here. Without this a
+                // failed run left a `.tmp` beside the target, which the
+                // whole design of this module exists to avoid.
+                Err(source) => {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(Error::io(&temporary, source));
+                }
+            }),
         };
 
         Ok(Sink {
