@@ -317,6 +317,30 @@ fn followed(tag: &str) {
     );
 }
 
+/// A plate sliced with one wall: there is no hidden loop anywhere in it, so
+/// bricking has nothing to raise and must raise nothing.
+///
+/// It used to raise Bambu's `Floating vertical shell`, which is 100%
+/// concentric solid infill the slicer names with a word the wall arm reads.
+/// Read as a perimeter it joined the alternation and went up half a layer —
+/// into the surface printed over it, and with the wall's flow multiplier on a
+/// bead the survey had counted as filling a gap.
+#[test]
+fn a_single_wall_with_nothing_behind_it() {
+    let tag = "walls-1";
+    let source = plate(tag);
+    let (gcode, said) = processed(tag, &source, &["--bricks"]);
+    assert_sound(tag, &["--bricks"], &source, &gcode, 0.0, Some(&said));
+    let raised = gcode
+        .lines()
+        .filter(|line| line.contains("corbel brick raised"))
+        .count();
+    assert_eq!(
+        raised, 0,
+        "{tag}: a one-wall plate has no hidden loop to interlock with"
+    );
+}
+
 /// One test per plate rather than one loop over all of them, so the suite
 /// spreads them over the cores it has and a failure names the dialect.
 macro_rules! plates {
@@ -335,7 +359,6 @@ plates! {
     a_cone_whose_wall_walks_outward => "cone",
     the_visible_wall_printed_first => "outer-first",
     a_wall_printed_from_both_sides_inward => "inner-outer-inner",
-    a_single_wall_with_nothing_behind_it => "walls-1",
     an_odd_number_of_walls => "walls-3",
     six_walls_deep => "walls-6",
     variable_width_beads => "arachne",

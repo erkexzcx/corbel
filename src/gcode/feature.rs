@@ -183,6 +183,13 @@ fn classify(label: &str) -> Feature {
     // naming the wall in the label must not put it back among them.
     } else if names(label, &["gap"]) {
         Feature::GapFill
+    // Bambu fills this one at 100% density and spells it with the word the
+    // wall arm reads, and `detect_floating_vertical_shell` is on by default —
+    // so it is in most Bambu files. It is concentric solid infill, not a
+    // perimeter: read as a wall it joins the alternation, is raised, and takes
+    // the wall's flow multiplier instead of a metered gap.
+    } else if names(label, &["floating"]) {
+        Feature::SolidInfill
     } else if names(label, WALL) {
         if names(label, OUTER) {
             Feature::ExternalPerimeter
@@ -680,6 +687,7 @@ mod tests {
             (";TYPE:Overhang shell", Feature::Overhang),
             (";TYPE:Internal solid infill", Feature::SolidInfill),
             (";TYPE:Solid fill", Feature::SolidInfill),
+            ("; FEATURE: Floating vertical shell", Feature::SolidInfill),
             (";TYPE:Bottom skin", Feature::SolidInfill),
             (";TYPE:Top solid infill", Feature::TopSurface),
             (";TYPE:Top skin", Feature::TopSurface),
