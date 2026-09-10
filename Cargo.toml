@@ -40,8 +40,15 @@ strip = true
 # replayed over 25 real plates — so unoptimised it spends minutes in code the
 # binary runs in seconds. Every assertion, overflow check and `debug_assert`
 # is still on; only the code generation changes.
+#
+# The integration tests do not call the library: they run the compiled binary
+# through `CARGO_BIN_EXE_corbel`, so the binary's profile is what the suite
+# pays for. Measured on `walls-3`, one `--bricks` pass: **18.0 s** at
+# `opt-level = 2` against **11.3 s** at 3, and `plates.rs` alone is 21 of those
+# passes. The dependencies are not held lower than the crate any more either —
+# they build once and are cached, so the split bought nothing to keep.
 [profile.test]
-opt-level = 2
+opt-level = 3
 
-[profile.test.package."*"]
+[profile.dev]
 opt-level = 3
