@@ -264,6 +264,7 @@ impl Source {
             writer: Some(writer),
             endings: self.endings,
             held: false,
+            pending_cr: false,
             temporary,
             target,
             committed: false,
@@ -339,6 +340,11 @@ pub struct Sink {
     /// A newline held back because it may turn out to be the file's last byte,
     /// on a file that did not end on one.
     held: bool,
+    /// A carriage return held back because a write ended on it. Whether it
+    /// needs a newline behind it is decided by the next write, which may open
+    /// with one — the two halves of a `\r\n` terminator split by the boundary
+    /// between two writes, which is where re-adding one on sight doubled it.
+    pending_cr: bool,
     temporary: PathBuf,
     target: PathBuf,
     committed: bool,
@@ -379,6 +385,16 @@ enum Writer {
 impl Sink {
     /// Finishes the file and moves it over the target.
     pub fn commit(mut self) -> Result<()> {
+        // A carriage return still held is the file's last byte and nothing
+        // follows it, so it goes out as it stands. Held together with a
+        // newline it is the half of a terminator the input did not carry, and
+        // that terminator is dropped whole.
+        if self.pending_cr && !self.held {
+            self.pending_cr = false;
+            self.writer()
+                .write_all(b"\r")
+                .map_err(|source| Error::io(&self.temporary, source))?;
+        }
         // A newline still held here is the one the input did not carry, so it
         // is dropped rather than written.
         let writer = self.writer.take().expect("a sink is committed once");
@@ -415,7 +431,10 @@ impl Sink {
         }
         if self.held {
             // More arrived, so the newline held back was not the last byte.
+            // Its carriage return was held with it and never written, so
+            // `newline` puts the pair back whole.
             self.held = false;
+            self.pending_cr = false;
             self.newline()?;
         }
         if !self.endings.final_newline && data.last() == Some(&b'\n') {
@@ -424,6 +443,19 @@ impl Sink {
         }
         if !self.endings.carriage_return {
             return self.writer().write_all(data);
+        }
+        if self.pending_cr {
+            // The carriage return held from the last write is the first half
+            // of the terminator opening this one — or the input's own stray
+            // byte, with nothing behind it.
+            self.pending_cr = false;
+            match data.first() {
+                Some(&b'\n') => {
+                    self.newline()?;
+                    data = &data[1..];
+                }
+                _ => self.writer().write_all(b"\r")?,
+            }
         }
         while let Some(at) = data.iter().position(|byte| *byte == b'\n') {
             // The byte before the newline is the input's own `\r` when the
@@ -436,6 +468,12 @@ impl Sink {
             self.writer().write_all(&data[..end])?;
             self.newline()?;
             data = &data[at + 1..];
+        }
+        if data.last() == Some(&b'\r') {
+            // Hold it: only the next write can say whether a newline follows,
+            // and writing it now is what doubled the pair at a write boundary.
+            self.pending_cr = true;
+            data = &data[..data.len() - 1];
         }
         self.writer().write_all(data)
     }
@@ -1098,6 +1136,42 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// A `\r` and the `\n` behind it do not have to arrive in the same write.
+    /// `io::copy` hands over 8 KiB at a time, so a `\r` on a chunk boundary
+    /// comes back as the tail of one write and its `\n` as the head of the
+    /// next — and a `restore` that only looks inside one chunk re-adds a `\r`
+    /// the caller had already written, turning the line into `\r\r\n`.
+    #[test]
+    fn a_carriage_return_split_across_two_writes_is_not_doubled() {
+        // The first line has to be short enough that the head sees a `\r\n`
+        // and the file is read as CRLF at all, and long enough overall that a
+        // carriage return lands on byte 8191 — the last byte of `io::copy`'s
+        // first 8 KiB chunk, which leaves its `\n` at the head of the second.
+        let mut original = String::from("G1 X1\r\n");
+        while original.len() < 8184 {
+            original.push_str("G1 X2\r\n");
+        }
+        original.push_str(&"9".repeat(8191 - original.len()));
+        original.push_str("\r\nG1 X3\r\nG1 X4\r\n");
+
+        let input = scratch("crlf-split").join("in.gcode");
+        fs::write(&input, &original).expect("seed the input");
+
+        let source = Source::open(&input).expect("open");
+        let sink = source.sink(&input).expect("sink");
+        source
+            .rewrite(sink, |mut reader, writer| io::copy(&mut reader, writer))
+            .expect("rewrite");
+
+        let back = fs::read(&input).expect("read back");
+        let doubled = back.windows(3).position(|window| window == b"\r\r\n");
+        assert_eq!(
+            back,
+            original.as_bytes(),
+            "a carriage return split across two writes was doubled at {doubled:?}"
+        );
     }
 
     #[test]
