@@ -107,6 +107,32 @@ fn run(source: &str, config: &Config) -> String {
     apply(source, config).gcode
 }
 
+/// A width pinned by a caller is a knob, and like every number that reaches
+/// the nozzle it has to read as a length. `zaa` already refuses one that does
+/// not; `brick` took it as given, and a kilometre-wide bead — what a broken
+/// settings line parses as — both moved the visible face further than the part
+/// is big and overflowed the neighbourhood the ground is searched over.
+#[test]
+fn a_pinned_wall_width_is_still_a_length() {
+    let source = middle_layer(&format!(
+        ";TYPE:Perimeter\n{};TYPE:External perimeter\n{}",
+        wall_of(2, "W", 0.90, 8.20, 0.5),
+        wall_of(1, "V", 0.00, 10.00, 0.5)
+    ));
+    let sane = run(&source, &Config::default());
+    let absurd = run(
+        &source,
+        &Config {
+            wall_width: Some(1e12),
+            ..Config::default()
+        },
+    );
+    assert_eq!(
+        absurd, sane,
+        "a width no bead can have changed what the walls were metered against"
+    );
+}
+
 /// A region is written when its marker line is written, not when it is read.
 ///
 /// A marker can sit in the lead of a loop that is raised and held to the end

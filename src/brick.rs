@@ -1004,10 +1004,16 @@ impl<'a, W: Write> Pass<'a, W> {
             // misplaces it by the whole offset.
             skin_width: survey
                 .skin_width
-                .or(config.wall_width)
+                .or(config.wall_width.filter(is_a_height))
                 .or(survey.wall_width)
                 .unwrap_or(REFERENCE_WIDTH),
-            wall_width: config.wall_width.or(survey.wall_width),
+            // A width pinned by a caller is a knob like any other, and like
+            // every number that reaches the nozzle it has to read as a length.
+            // This one also sets how far the ground is searched and how far
+            // the visible wall is moved inward, and `zaa` already filters the
+            // same field — a width of 1e12 moved the face further than the
+            // part is big and overflowed the ground's neighbourhood.
+            wall_width: config.wall_width.filter(is_a_height).or(survey.wall_width),
             travelled: false,
             loops_seen: 0,
             raised: 0,
