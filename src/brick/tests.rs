@@ -107,6 +107,57 @@ fn run(source: &str, config: &Config) -> String {
     apply(source, config).gcode
 }
 
+/// A region is written when its marker line is written, not when it is read.
+///
+/// A marker can sit in the lead of a loop that is raised and held to the end
+/// of its layer — Bambu puts `; FEATURE:` behind the travel that reaches a
+/// region's first bead. Claiming the region as written the moment the line is
+/// read leaves every loop of that region flushed before it with no marker
+/// line of its own, so its beads go out under whatever region the output last
+/// carried: a wall printed at another region's fan, speed and acceleration.
+/// Measured on 20 of the 24 stored fixtures, 1.2% to 48.5% of a region's path.
+#[test]
+fn a_region_whose_marker_rides_a_held_loop_still_labels_the_loops_before_it() {
+    let mut body = String::from(";TYPE:Sparse infill\nG1 X5.00 Y5.00 F9000\n");
+    body.push_str("G1 X6.00 Y5.00 E0.5\nG1 X7.00 Y5.00 E0.5\n");
+    // The travel that reaches the first hidden loop, and the region's own
+    // marker line behind it, which is where a slicer puts it.
+    body.push_str("G1 X0.45 Y0.45 F9000\n;TYPE:Perimeter\n");
+    let square = |body: &mut String, near: f64, far: f64, tag: &str| {
+        body.push_str(&format!("G1 X{near:.2} Y{near:.2} F9000\n"));
+        body.push_str(&format!("G1 X{far:.2} Y{near:.2} E0.5 ; {tag}\n"));
+        for (x, y) in [(far, far), (near, far), (near, near)] {
+            body.push_str(&format!("G1 X{x:.2} Y{y:.2} E0.5\n"));
+        }
+    };
+    // Three hidden loops, printed outermost first, with no visible wall in the
+    // contour to anchor the alternation: the first loop then takes the odd
+    // phase and is raised, so it is the one held back to the end of the layer
+    // with the marker line in its lead, while the loop behind it is written.
+    square(&mut body, 0.90, 9.10, "H1");
+    square(&mut body, 1.35, 8.65, "H2");
+    square(&mut body, 1.80, 8.20, "H3");
+    let out = run(&middle_layer(&body), &Config::default());
+    assert!(
+        out.contains("corbel brick raised"),
+        "nothing was raised, so this fixture proves nothing:\n{out}"
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains("; H2"))
+        .unwrap_or_else(|| panic!("the second hidden loop was never written:\n{out}"));
+    let region = lines[..at]
+        .iter()
+        .rev()
+        .find(|line| line.contains(";TYPE:") || line.contains("; FEATURE:"));
+    assert_eq!(
+        region.copied(),
+        Some(";TYPE:Perimeter"),
+        "a loop of the region was written under another region's marker:\n{out}"
+    );
+}
+
 /// The shipped settings with the flow left alone, for a test that measures
 /// what the geometry asks for rather than what the multiplier adds to it.
 fn plain() -> Config {
