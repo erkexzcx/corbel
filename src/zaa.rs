@@ -1439,8 +1439,12 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         } else {
             let mut settled = Vec::new();
             line.write_e(&mut settled, e)?;
-            let settled = String::from_utf8_lossy(&settled).into_owned();
-            Line::parse(&settled).write_z(&mut self.out, z)?;
+            // Parsed against the bytes that arrived, not re-read from them:
+            // the line may carry a byte the file's own encoding put there, and
+            // `Line::parse` takes the text it is handed as the bytes to write,
+            // which would put a `?` where the slicer's byte was.
+            let text = repaired(&settled);
+            Line::parse_bytes(&text, &settled).write_z(&mut self.out, z)?;
         }
         match stamped {
             true => self.out.write_all(b"\n"),

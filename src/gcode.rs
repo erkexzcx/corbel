@@ -383,6 +383,20 @@ impl<'a> Line<'a> {
             let Some(value) = number(&body[start..at]) else {
                 continue;
             };
+            // A word that is not a finite number is not a number this tool may
+            // act on. `1e400`, `inf` and `nan` all parse, and a bead written
+            // back carrying one of them is a filament length no printer can
+            // act on — under absolute extrusion the one bad word then poisons
+            // every line after it. The span is left unset as well, so a line
+            // that is rewritten keeps the word it arrived with.
+            //
+            // `E` and `F` only. A non-finite coordinate is left where it is on
+            // purpose: it is what leaves a layer's outline unreadable, and
+            // `brick` leaves such a layer exactly as sliced rather than moving
+            // it blind.
+            if matches!(letter, b'e' | b'f') && !value.is_finite() {
+                continue;
+            }
             match letter {
                 b'x' => {
                     line.x = Some(value);
@@ -690,7 +704,12 @@ impl<'a> Line<'a> {
         }
         let mut bytes = Vec::new();
         rewrite(&mut bytes, self.origin, &[], &append)?;
-        let text = String::from_utf8_lossy(&bytes);
+        // `repaired`, never a lossy repair: this text is what gets parsed and
+        // these bytes are what gets written, and a span read off one indexes
+        // the other only while the two are the same length. A lossy repair
+        // turns one bad byte into three, so every span behind it runs off the
+        // end of the shorter slice and the split panics mid-file.
+        let text = repaired(&bytes);
         let mut line = Line::parse_bytes(&text, &bytes);
         if line.r.is_some()
             && let Some((_, radius, _, sweep)) =
@@ -1721,6 +1740,47 @@ mod tests {
     fn rewriting_a_line_without_e_is_a_copy() {
         let line = Line::parse("G1 X1 Y1");
         assert_eq!(with_e(&line, 1.0), "G1 X1 Y1");
+    }
+
+    /// A word that is not a finite number is not a number this tool may act
+    /// on. `1e400`, `inf` and `nan` all parse, and a bead carrying one of them
+    /// is a filament length no printer can act on — under absolute extrusion
+    /// the one bad word then poisons every line after it. The axis is still
+    /// known to be named, because the move did go through the plane.
+    #[test]
+    fn a_word_that_is_not_a_finite_number_is_no_word_at_all() {
+        for text in ["G1 X11 Y0 E1e400", "G1 X11 Y0 Einf", "G1 X11 Y0 ENaN"] {
+            let line = Line::parse(text);
+            assert_eq!(line.e, None, "{text}");
+            assert!(line.is_xy_move(), "{text}");
+        }
+        assert_eq!(Line::parse("G1 X1 Y1 F1e400").f, None);
+        assert_eq!(Line::parse("G1 X1 Y1 F9000").f, Some(9000.0));
+        // A coordinate is left alone: a layer whose outline cannot be read is
+        // one `brick` leaves exactly as the slicer sliced it.
+        assert_eq!(Line::parse("G1 X1e999 Y1").x, Some(f64::INFINITY));
+    }
+
+    /// A bead line carrying a byte the host encoding made non-UTF-8, written
+    /// back through the splitter. `write_segment_at` parses a repair of the
+    /// line and writes the bytes it arrived as, which only works while the two
+    /// are the same length: a lossy repair turns that byte into three, so the
+    /// spans read off the text run off the end of the shorter slice and the
+    /// split panics partway through the user's only copy of the file.
+    #[test]
+    fn a_split_bead_line_survives_a_byte_the_file_could_not_encode() {
+        let raw = b"(Caf\xe9) G1 X79.945 Y77.673 E-.8113";
+        let text = repaired(raw);
+        let line = Line::parse_bytes(&text, raw);
+        let mut out = Vec::new();
+        line.write_segment_at(&mut out, (79.945, 77.673), (80.0, 78.0), None, 0.4, None)
+            .expect("the split writes");
+        assert!(
+            out.windows(4).any(|window| window == b"Caf\xe9"),
+            "the comment kept its own byte: {:?}",
+            repaired(&out)
+        );
+        assert_eq!(Line::parse(&repaired(&out)).e, Some(0.4));
     }
 
     #[test]

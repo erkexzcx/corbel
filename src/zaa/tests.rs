@@ -746,6 +746,33 @@ fn levelling_to_a_height_already_commanded_writes_nothing() {
     assert!(written.contains("Z0.740"), "{written}");
 }
 
+/// A bead given a height on a line that already names one is written back
+/// from the bytes it arrived as, comment and all. Re-reading the written
+/// line as text would take the repair for the line itself and put a `?`
+/// where the slicer's own byte was: one byte of the user's only copy.
+#[test]
+fn a_ridden_height_keeps_the_bytes_the_line_arrived_with() {
+    let source = cone(6);
+    let survey = Survey::of(&source);
+    let mut out = Vec::new();
+    let mut pass = Pass::new(&mut out, source.as_bytes(), &config(), &survey);
+
+    let raw = b"G1 X1.000 Y1.000 Z0.400 E0.10000 F9000 ; Caf\xe9";
+    let text = repaired(raw);
+    let line = Line::parse_bytes(&text, raw);
+    pass.write_ridden(&line, 0.2, 0.45)
+        .expect("writing to a Vec cannot fail");
+
+    assert!(
+        out.windows(4).any(|window| window == b"Caf\xe9"),
+        "the comment kept its own byte: {}",
+        String::from_utf8_lossy(&out)
+    );
+    let written = repaired(&out);
+    assert!(written.contains("E0.20000"), "{written}");
+    assert!(written.contains("Z0.450"), "{written}");
+}
+
 /// A file whose regions are never labelled says nothing about which layer
 /// is which, and a surface that cannot be found must not be guessed at.
 #[test]
