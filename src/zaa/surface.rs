@@ -373,6 +373,7 @@ impl Builder {
         // which one layer's ramp meets the next one's, and the quarter past
         // it is where the amplitude tapers away instead — see [`FADE`].
         let carried = reach * (1.0 + FADE);
+        let cells = width * height;
         // An upward-facing surface around a hole is a pocket this layer
         // encloses and the layer above opens wider, and until the two are
         // told apart every one of them reads as covered. Both pairs of
@@ -390,6 +391,41 @@ impl Builder {
             let (marks, stack, spans) = (&mut self.marks, &mut self.stack, &mut self.spans);
             mouths(own, over, marks, stack, spans, width, height, waist, tread);
             mouths(under, own, marks, stack, spans, width, height, waist, tread);
+        }
+        // A layer that encloses everything the one below it does is the
+        // underside of an overhang, and nothing about it faces upward: every
+        // cell has the layer beneath standing at least as far out as this
+        // one, so the subtraction `sloped` is read off cannot come out
+        // positive anywhere and the whole field is the plane.
+        //
+        // This is exact rather than a guess, and the reason is where the two
+        // distances are measured from. Both are taken to the outside of a
+        // layer, and the flood that sorts inside from out seeds the window's
+        // edge — no bead and no mouth reaches it — so the edge ring is a
+        // source of both, they are finite everywhere, and nesting the two
+        // sets of *inside* nests the two sets of *sources* the other way
+        // round. A chamfer transform can only lose distance when it is given
+        // more sources, pass by pass, so `to_under` comes out at most
+        // `to_mine` in every cell and `down - out` is never positive.
+        if nested(&self.inside[BELOW][..cells], &self.inside[HERE][..cells]) {
+            // The window is laid out all the same, and which of its cells are
+            // exposed with it, so a caller asking about a point gets the
+            // answer the long way round would have given. Only the measuring
+            // is skipped, and every value it would have produced is the plane.
+            field.grid = grid;
+            field.left = left;
+            field.bottom = bottom;
+            field.width = width;
+            field.height = height;
+            grow(&mut field.rise, cells, 0);
+            grow(&mut field.open, cells, false);
+            field.rise[..cells].fill(0);
+            let (own, over) = (&self.inside[HERE], &self.inside[ABOVE]);
+            for (at, open) in field.open[..cells].iter_mut().enumerate() {
+                *open = is_inside(own[at]) && !is_inside(over[at]);
+            }
+            field.flat = true;
+            return;
         }
         // Distance from a point of the strip to the outside of its own layer,
         // to the layer printed over it, and to the outside of the layer it
@@ -430,7 +466,6 @@ impl Builder {
         // Grown rather than emptied and refilled: a `fill` over the window
         // is one memset where `clear` and `resize` is a loop the compiler
         // does not always see through.
-        let cells = width * height;
         grow(&mut field.rise, cells, 0);
         grow(&mut field.open, cells, false);
         grow(&mut self.rough, cells, 0.0);
@@ -876,6 +911,18 @@ const FORWARD: [(isize, isize, u16); 8] = [
     (-1, -2, LEAP),
     (1, -2, LEAP),
 ];
+
+/// True where every cell `lower` holds as inside is inside `upper` too.
+///
+/// Both are the same window's masks, read after the mouths have been carved
+/// out of them, so this is the question [`Builder::build`] asks of a layer and
+/// the one below it before deciding there is no surface to follow.
+fn nested(lower: &[u8], upper: &[u8]) -> bool {
+    lower
+        .iter()
+        .zip(upper)
+        .all(|(&below, &above)| !is_inside(below) || is_inside(above))
+}
 
 /// Reads the pockets of `lower` that `upper` opens wider as air rather than
 /// as something printed over.
@@ -1409,6 +1456,33 @@ mod tests {
         // The same geometry with the wall sloping away below is followed.
         let sloped = field_of(&here, Some(&above), Some(&square(32.0)), 12.0);
         assert!(!sloped.is_flat());
+    }
+
+    /// The underside of an overhang is not a surface, and it is the one case
+    /// [`Builder::build`] answers without measuring: the layer below stands
+    /// inside this one everywhere, so the layer under every cell is nearer to
+    /// its own middle than this layer's is and the subtraction the slope is
+    /// read off cannot come out positive.
+    ///
+    /// The mirror is the pin. Nesting the two layers the wrong way round — or
+    /// opening the early out to any pair of layers that merely differ — leaves
+    /// the second case flat, which is a staircase nothing removes.
+    #[test]
+    fn the_underside_of_an_overhang_is_not_followed() {
+        // The part widens as it goes up: the layer below is inside this one on
+        // every cell it holds.
+        let overhang = field_of(&square(20.0), Some(&square(8.0)), Some(&square(8.0)), 12.0);
+        assert!(overhang.is_flat(), "an overhang underside is not followed");
+        assert_eq!(overhang.at(9.0, 0.0), 0.0);
+
+        // The mirror, which is a cone: the layer below reaches further out
+        // than this one, and the tread between them is the surface.
+        let cone = field_of(&square(20.0), Some(&square(8.0)), Some(&square(32.0)), 12.0);
+        assert!(!cone.is_flat());
+        // The tread runs from 4 mm out to 10, high at its inner edge and low
+        // at its outer one.
+        assert!(cone.at(4.5, 0.0) > 0.3, "the climb is still followed");
+        assert!(cone.at(9.5, 0.0) < -0.3, "and it still falls away");
     }
 
     /// The shortcut for the middle of a vertical face has to answer exactly
