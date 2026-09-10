@@ -1678,6 +1678,46 @@ fn both_transforms_at_once_leave_coherent_gcode() {
     assert!(report.contains("surface moves on"), "{report}");
 }
 
+/// Bricking measures every layer against the plane the slicer wrote, and a
+/// contoured file no longer sits on it: `zaa` writes beads below the plane by
+/// construction, so a raise taken from the lowest height a layer commands
+/// comes out short by up to the deepest bead followed. The other way round is
+/// safe — bricking only ever lifts — so this is the one pairing refused.
+#[test]
+fn bricking_over_a_contoured_file_is_refused() {
+    let sandbox = Sandbox::new("zaa-then-bricks");
+    let path = sandbox.with_gcode(&sloped_gcode(6));
+    let once = sandbox.path().join("once.gcode");
+    assert!(
+        run(&[
+            "--zaa",
+            "--output",
+            once.to_str().unwrap(),
+            path.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+
+    let before = fs::read_to_string(&once).expect("read result");
+    let output = run(&["--bricks", once.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("has already been contoured"), "{message}");
+    assert_eq!(
+        fs::read_to_string(&once).expect("read result"),
+        before,
+        "the file is left alone"
+    );
+
+    // And --force is the way through, as it is for a second contour.
+    assert!(
+        run(&["--bricks", "--force", once.to_str().unwrap()])
+            .status
+            .success()
+    );
+}
+
 /// Running twice would measure a surface against a plane it is no longer on,
 /// so a file carrying either transform's marks is refused rather than
 /// processed again.

@@ -159,6 +159,17 @@ fn run(cli: &Cli) -> Result<()> {
 /// Both transforms measure against the plane the slicer wrote, so a second run
 /// over their own output compounds a shift the file no longer describes.
 fn already_done(survey: &Survey, bricks: bool, contours: bool) -> Option<&'static str> {
+    // Bricking measures every layer against the plane the slicer wrote, and a
+    // contoured file no longer sits on it: `zaa` writes beads below the plane
+    // by construction, so a raise taken from the lowest height a layer
+    // commands comes out short by up to the deepest bead followed, and the
+    // stagger can vanish outright. The other way round is safe — bricking only
+    // ever lifts — so this is the one pairing that has to be refused, and the
+    // switches are a group that says which transforms to run, not which the
+    // file has already had.
+    if bricks && survey.contoured {
+        return Some("contoured");
+    }
     match (bricks && survey.bricked, contours && survey.contoured) {
         (true, true) => Some("bricked and contoured"),
         (true, false) => Some("bricked"),
