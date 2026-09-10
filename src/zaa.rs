@@ -576,7 +576,12 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             }
             _ => {}
         }
-        if line.z.is_some() && line.is_move() {
+        // `draws`, not `is_move`: a slicer asked for a spiral lift climbs on a
+        // `G2`/`G3` naming `Z` and no `X` or `Y`, and `is_move` is `G0`/`G1`
+        // alone — so read that way the hop is invisible and the plane is left
+        // at whatever the layer before it commanded. `brick` counts arcs here
+        // already, for the same reason.
+        if line.z.is_some() && line.draws() {
             let z = self.modal.position().2;
             self.plane = Some(self.plane.map_or(z, |had: f64| had.min(z)));
             self.commanded = Some(z);
@@ -622,10 +627,10 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             // every height compared against this one is absolute and in mm.
             z: line
                 .z
-                .filter(|_| line.is_move())
+                .filter(|_| line.draws())
                 .map(|_| self.modal.position().2),
             f: line.f,
-            positions: line.is_move() && (line.is_xy_move() || line.z.is_some()),
+            positions: line.draws() && (line.is_xy_move() || line.z.is_some()),
             // A line already carrying one of this tool's own stamps can still
             // take a height: the comment slot is only needed for a stamp, and
             // there is already one there. Anything else keeps its comment.
@@ -633,7 +638,7 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             // the tail outlives the section, so this is asked once, here,
             // while the mode it was read in is still known.
             carries: self.modal.is_plain()
-                && line.is_move()
+                && line.draws()
                 && (line.is_xy_move() || line.z.is_some())
                 && line.e.is_none()
                 && line.comment().is_none_or(is_stamp),
@@ -1428,7 +1433,7 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         if let Some(rate) = line.f {
             self.feedrate = Some(rate);
         }
-        if line.z.is_some() && line.is_move() {
+        if line.z.is_some() && line.draws() {
             self.nozzle_z = Some(self.modal.position().2);
             self.lifted = false;
         }
