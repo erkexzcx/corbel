@@ -1558,7 +1558,12 @@ impl<'a, W: Write> Pass<'a, W> {
     /// OrcaSlicer file, and for all 132 once an `M73` followed every layer's
     /// `G1 Z`.
     fn keep(&mut self, line: Line<'_>, from: (f64, f64)) -> io::Result<()> {
-        let lays = (line.x.is_some() || line.y.is_some()) && line.e.is_some();
+        // `draws_in_plane`, never the words the line happens to name: an arc
+        // naming only `I`/`J` is a full circle, and the survey counts it as a
+        // bead. Asked the other way this pass holds it as a tail line and then
+        // opens it as a perimeter loop, which is a cell one pass asked about
+        // that the other never drew.
+        let lays = line.draws_in_plane() && line.e.is_some();
         let holds = self.loops.is_empty() && self.buffer.len() < TAIL && !lays;
         if holds {
             if self.buffer.is_empty() {

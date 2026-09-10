@@ -107,6 +107,32 @@ fn run(source: &str, config: &Config) -> String {
     apply(source, config).gcode
 }
 
+/// A bead spelled as a full circle — an arc naming neither `X` nor `Y` — is
+/// still a bead, and in a region that is not a wall it is not one of a wall's
+/// loops. Read only where the line names a coordinate, this pass holds it back
+/// as a tail line and then opens it as a perimeter loop: it joins the
+/// alternation of a wall it has nothing to do with, and the survey is asked
+/// about a cell it never drew.
+#[test]
+fn a_full_circle_bead_outside_a_wall_is_not_one_of_its_loops() {
+    let body = |extra: &str| {
+        format!(
+            ";TYPE:Support\nG1 X5.00 Y5.00 F9000\n{extra};TYPE:External perimeter\n{}",
+            wall_of(1, "V", 0.00, 10.00, 0.5)
+        )
+    };
+    let plain = apply(&middle_layer(&body("")), &Config::default()).stats;
+    let circle = apply(
+        &middle_layer(&body("G2 I0.500 J0 E0.50000\n")),
+        &Config::default(),
+    )
+    .stats;
+    assert_eq!(
+        circle.loops, plain.loops,
+        "a bead laid outside a wall was counted as one of its loops"
+    );
+}
+
 /// A width pinned by a caller is a knob, and like every number that reaches
 /// the nozzle it has to read as a length. `zaa` already refuses one that does
 /// not; `brick` took it as given, and a kilometre-wide bead — what a broken

@@ -592,9 +592,12 @@ impl<W: Write, R: BufRead> Pass<W, R> {
             .e
             .filter(|_| line.draws())
             .map(|e| self.extruder.observe(e));
-        let lays = line.draws()
-            && (line.x.is_some() || line.y.is_some())
-            && delta.is_some_and(|delta| delta > 0.0);
+        // `draws_in_plane`, never the words the line happens to name: an arc
+        // spelling out neither coordinate is a full circle, which is what that
+        // predicate exists to catch and what the survey already counts as a
+        // bead. Asking the other way makes the two passes disagree about what
+        // was printed, and this one then leaves the bead exactly as sliced.
+        let lays = line.draws_in_plane() && delta.is_some_and(|delta| delta > 0.0);
         if !lays {
             return self.hold(line, delta);
         }
