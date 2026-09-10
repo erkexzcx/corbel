@@ -107,6 +107,24 @@ fn run(source: &str, config: &Config) -> String {
     apply(source, config).gcode
 }
 
+/// A coordinate no printer could reach must not wrap into somebody else's
+/// cell. `Grid::at` saturates past its range, so the neighbour a bead's ground
+/// is searched over was added to a clamped cell — and a wrapped index is not a
+/// missing one: it hands another bead's rise back as this bead's ground, or
+/// panics where overflow checks are on.
+#[test]
+fn a_coordinate_past_the_grid_does_not_wrap_into_another_cell() {
+    let body = format!(
+        ";TYPE:Perimeter\n{}G1 X1000000000 Y0 F9000\nG1 X1000000000 Y1 E0.5\n",
+        wall(2, "W")
+    );
+    let out = run(&middle_layer(&body), &Config::default());
+    assert!(
+        out.contains("X1000000000"),
+        "a move no printer could make was not left where it was:\n{out}"
+    );
+}
+
 /// A bead spelled as a full circle — an arc naming neither `X` nor `Y` — is
 /// still a bead, and in a region that is not a wall it is not one of a wall's
 /// loops. Read only where the line names a coordinate, this pass holds it back

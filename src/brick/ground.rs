@@ -172,12 +172,19 @@ impl Ground {
 
     pub(super) fn at(&self, point: (f64, f64), reach: f64) -> f64 {
         let cell = Grid::default().at(point.0, point.1);
-        let neighbors = (reach / CELL).ceil() as i32 + 1;
+        // `Grid::at` saturates a coordinate past the cell range, so both this
+        // and the neighbour below it can overflow — and a wrapped cell is not
+        // a missing cell, it is somebody else's rise handed back as this
+        // bead's ground. Saturating is what `footprint::floor` does for the
+        // other axis and what this module's own rule asks for: a coordinate no
+        // printer could reach warns and carries on, it never fails.
+        let neighbors = ((reach / CELL).ceil() as i32).saturating_add(1);
         let mut nearest = reach;
         let mut rise = 0.0_f64;
         for column in -neighbors..=neighbors {
             for row in -neighbors..=neighbors {
-                if let Some(entries) = self.cells.get(&(cell.0 + column, cell.1 + row)) {
+                let key = (cell.0.saturating_add(column), cell.1.saturating_add(row));
+                if let Some(entries) = self.cells.get(&key) {
                     for &index in entries {
                         let path = &self.paths[index];
                         let distance = path.distance(point);
