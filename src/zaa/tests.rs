@@ -715,6 +715,23 @@ fn heights_the_file_cannot_tell_apart_are_the_same_height() {
     assert!(!same_height(10.739, 10.744));
 }
 
+/// A tie at the third decimal is the writer's to break, not ours. `1.0625`
+/// is written `1.062`, because the formatter breaks the tie to even, so it is
+/// the same command as `1.062` and a different one from `1.063`. Scaling and
+/// rounding away from zero gets one of those backwards in each direction:
+/// a stop reserved for a height the nozzle already held, and a height change
+/// that was real swallowed whole.
+#[test]
+fn a_height_tie_is_broken_the_way_the_word_is_written() {
+    assert!(same_height(1.0625, 1.062));
+    assert!(!same_height(1.0625, 1.063));
+    assert!(same_height(0.3125, 0.312));
+    assert!(!same_height(0.3125, 0.313));
+    // A hair below zero and zero print differently and are one height to the
+    // printer, so they must not cost a stop between them either.
+    assert!(same_height(-0.0004, 0.000));
+}
+
 /// A levelling move must never command the height the nozzle already
 /// holds. It writes nothing and costs a dead stop with a primed nozzle,
 /// which is exactly what riding a move exists to avoid — and comparing the

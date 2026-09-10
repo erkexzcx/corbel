@@ -116,14 +116,33 @@ const TOLERANCE: f64 = 0.005;
 
 /// Whether two heights reach the printer as the same command.
 ///
-/// A Z word is written to three decimals, so two heights closer than a micron
-/// are one height as far as the file is concerned. Comparing the full-precision
-/// values instead writes a levelling move that commands the height the nozzle
-/// already holds — a dead stop with a primed nozzle, which is the one thing
-/// [`Pass::carrier`] exists to avoid. Measured on a real Benchy before this
-/// was checked: 73 of 341 inserted height changes were exactly that.
+/// The question is whether they write as the same three-decimal `Z` word, and
+/// the only honest way to ask is of the writer. Rounding the scaled value is a
+/// *different* rule, and at an exact half-way point the two disagree in both
+/// directions: `1.0625` is written `1.062` by a formatter that breaks the tie
+/// to even, while scaling and rounding away from zero calls it `1.063` — which
+/// both reserved a stop for a height the nozzle already held and swallowed a
+/// change that was real. A real Benchy lost 73 of 341 inserted height changes
+/// to comparing the full-precision values; comparing a second rule of our own
+/// loses them just as quietly.
 fn same_height(a: f64, b: f64) -> bool {
-    (a * 1000.0).round() == (b * 1000.0).round()
+    written_height(a) == written_height(b)
+}
+
+/// The height a `Z` word really carries: the value at the three decimals the
+/// word is written to, read back.
+///
+/// Read back rather than compared as text, so that a hair below zero and zero
+/// — which print `-0.000` and `0.000` and are one height to the printer — stay
+/// one height here too.
+fn written_height(value: f64) -> f64 {
+    let mut text = Vec::new();
+    // Writing to a `Vec` cannot fail.
+    let _ = crate::gcode::write_fixed(&mut text, value, 3);
+    std::str::from_utf8(&text)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(value)
 }
 
 /// A coordinate as it will be written: three decimals, which is the micron
