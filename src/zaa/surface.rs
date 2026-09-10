@@ -485,89 +485,97 @@ impl Builder {
             let (to_mine, to_over, to_under) = (&to_mine[..], &to_over[..], &to_under[..]);
             let [mine, over, _] = &*inside;
             let (mine, over) = (&mine[..], &over[..]);
+            // One slot per band, for the same reason as the two transforms
+            // above: a spawn the OS refuses must leave its band to this thread
+            // rather than take it, and a refused `Scope::spawn` under
+            // `panic = "abort"` is the run and not an error to catch.
+            let mut slots = Vec::new();
+            let mut base = 0;
+            for ((open, rough), live) in field.open[..cells]
+                .chunks_mut(step)
+                .zip(rough[..cells].chunks_mut(step))
+                .zip(live[..height].chunks_mut(step / width))
+            {
+                let from = base;
+                base += open.len();
+                slots.push(std::sync::Mutex::new(Some(move || {
+                    for (offset, open) in open.iter_mut().enumerate() {
+                        let at = from + offset;
+                        *open = is_inside(mine[at]) && !is_inside(over[at]);
+                        let up = to_over[at];
+                        let out = to_mine[at];
+                        // Either leg unreached, or the two of them
+                        // already spanning the whole strip, and the cell
+                        // keeps the height the slicer gave it.
+                        if u32::from(up) + u32::from(out) >= span
+                            || up == UNREACHED
+                            || out == UNREACHED
+                        {
+                            continue;
+                        }
+                        let up = mm(up);
+                        let out = mm(out);
+                        let strip = up + out;
+                        if strip <= 0.0 || !strip.is_finite() {
+                            continue;
+                        }
+                        let down = mm(to_under[at]);
+                        // Under a uniform slope the layer below reaches
+                        // one strip further out than this one; under a
+                        // vertical face it stops in the same place. A
+                        // layer below that runs past the window is
+                        // shallower still, so it counts as fully sloped.
+                        // The gauge is only half a strip because the two
+                        // figures are read off the same grid to different
+                        // precisions — see [`SLOPE_MARGIN`].
+                        let sloped = match down.is_finite() {
+                            true => ((down - out) / (strip * SLOPE_MARGIN)).clamp(0.0, 1.0),
+                            false => 1.0,
+                        };
+                        let fading = ((carried - strip) / (reach * FADE)).clamp(0.0, 1.0);
+                        // And a strip narrower than the nozzle's own
+                        // underside is not a slope either. The nozzle
+                        // rears up to it and comes back down inside its
+                        // own footprint, which leaves a crest one bead
+                        // wide with the pass beside it on the plane — and
+                        // a flat nozzle can follow a surface that rises
+                        // away from it but cannot pass a crest. Full
+                        // amplitude from one bead width up, since that is
+                        // where the nozzle first fits inside the crest,
+                        // and tapered rather than cut below it so two
+                        // strips either side of the width do not step
+                        // apart. Measured on a 25-layer Benchy, whose hull
+                        // is steep enough that this is nearly all the top
+                        // surface it has: the deepest a bead was laid
+                        // under a crest of its own neighbour went from
+                        // 100 µm — half a layer — to 24.
+                        let riding = (strip / (bead * 2.0)).clamp(0.0, 1.0);
+                        let across = ((out + shift) / strip).clamp(0.0, 1.0);
+                        // Filled in for every cell of the window, covered
+                        // ones included: reading the field between cells
+                        // is what turns a strip into a ramp, and a covered
+                        // cell is where a strip's high end continues.
+                        // Fading on the width of the strip rather than on
+                        // the distance to the layer above is what keeps
+                        // that honest: a covered cell deep inside the part
+                        // measures a strip as wide as the part, so it
+                        // fades to nothing instead of leaking a rise into
+                        // the strip beside it, while one just inside the
+                        // strip measures the strip itself and continues it
+                        // exactly.
+                        rough[offset] = ((across - 0.5) * sloped * fading * riding) as f32;
+                    }
+                    // Read back while the band is still in cache, so the
+                    // blur can walk the rows that hold something.
+                    for (row, live) in live.iter_mut().enumerate() {
+                        let row = &rough[row * width..(row + 1) * width];
+                        *live = row.iter().any(|rise| *rise != 0.0);
+                    }
+                })));
+            }
             std::thread::scope(|scope| {
-                let mut base = 0;
-                for ((open, rough), live) in field.open[..cells]
-                    .chunks_mut(step)
-                    .zip(rough[..cells].chunks_mut(step))
-                    .zip(live[..height].chunks_mut(step / width))
-                {
-                    let from = base;
-                    base += open.len();
-                    scope.spawn(move || {
-                        for (offset, open) in open.iter_mut().enumerate() {
-                            let at = from + offset;
-                            *open = is_inside(mine[at]) && !is_inside(over[at]);
-                            let up = to_over[at];
-                            let out = to_mine[at];
-                            // Either leg unreached, or the two of them
-                            // already spanning the whole strip, and the cell
-                            // keeps the height the slicer gave it.
-                            if u32::from(up) + u32::from(out) >= span
-                                || up == UNREACHED
-                                || out == UNREACHED
-                            {
-                                continue;
-                            }
-                            let up = mm(up);
-                            let out = mm(out);
-                            let strip = up + out;
-                            if strip <= 0.0 || !strip.is_finite() {
-                                continue;
-                            }
-                            let down = mm(to_under[at]);
-                            // Under a uniform slope the layer below reaches
-                            // one strip further out than this one; under a
-                            // vertical face it stops in the same place. A
-                            // layer below that runs past the window is
-                            // shallower still, so it counts as fully sloped.
-                            // The gauge is only half a strip because the two
-                            // figures are read off the same grid to different
-                            // precisions — see [`SLOPE_MARGIN`].
-                            let sloped = match down.is_finite() {
-                                true => ((down - out) / (strip * SLOPE_MARGIN)).clamp(0.0, 1.0),
-                                false => 1.0,
-                            };
-                            let fading = ((carried - strip) / (reach * FADE)).clamp(0.0, 1.0);
-                            // And a strip narrower than the nozzle's own
-                            // underside is not a slope either. The nozzle
-                            // rears up to it and comes back down inside its
-                            // own footprint, which leaves a crest one bead
-                            // wide with the pass beside it on the plane — and
-                            // a flat nozzle can follow a surface that rises
-                            // away from it but cannot pass a crest. Full
-                            // amplitude from one bead width up, since that is
-                            // where the nozzle first fits inside the crest,
-                            // and tapered rather than cut below it so two
-                            // strips either side of the width do not step
-                            // apart. Measured on a 25-layer Benchy, whose hull
-                            // is steep enough that this is nearly all the top
-                            // surface it has: the deepest a bead was laid
-                            // under a crest of its own neighbour went from
-                            // 100 µm — half a layer — to 24.
-                            let riding = (strip / (bead * 2.0)).clamp(0.0, 1.0);
-                            let across = ((out + shift) / strip).clamp(0.0, 1.0);
-                            // Filled in for every cell of the window, covered
-                            // ones included: reading the field between cells
-                            // is what turns a strip into a ramp, and a covered
-                            // cell is where a strip's high end continues.
-                            // Fading on the width of the strip rather than on
-                            // the distance to the layer above is what keeps
-                            // that honest: a covered cell deep inside the part
-                            // measures a strip as wide as the part, so it
-                            // fades to nothing instead of leaking a rise into
-                            // the strip beside it, while one just inside the
-                            // strip measures the strip itself and continues it
-                            // exactly.
-                            rough[offset] = ((across - 0.5) * sloped * fading * riding) as f32;
-                        }
-                        // Read back while the band is still in cache, so the
-                        // blur can walk the rows that hold something.
-                        for (row, live) in live.iter_mut().enumerate() {
-                            let row = &rough[row * width..(row + 1) * width];
-                            *live = row.iter().any(|rise| *rise != 0.0);
-                        }
-                    });
+                for slot in &slots {
+                    spawn_or_run(scope, slot);
                 }
             });
         }
