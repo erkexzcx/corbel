@@ -67,6 +67,12 @@ pub struct Lines<R> {
     /// next piece of it.
     carry: Vec<u8>,
     partial: bool,
+    /// True where the piece just handed over carries a line's own tail forward
+    /// from the read before it. A piece that does not is the first of a line,
+    /// so whatever was being spilled before it has just finished — which is
+    /// the only way a caller can tell two long lines apart, since `partial` is
+    /// true of the first piece of a long line as well as of its last.
+    continuing: bool,
     /// A repaired line, which no longer matches the bytes in `buffer`.
     repaired: String,
 }
@@ -78,6 +84,7 @@ impl<R: BufRead> Lines<R> {
             buffer: Vec::new(),
             carry: Vec::new(),
             partial: false,
+            continuing: false,
             repaired: String::new(),
         }
     }
@@ -91,6 +98,12 @@ impl<R: BufRead> Lines<R> {
     /// would obey.
     pub fn partial(&self) -> bool {
         self.partial
+    }
+
+    /// True where the piece just handed over continues the line before it,
+    /// rather than opening one of its own.
+    pub fn continuing(&self) -> bool {
+        self.continuing
     }
 
     /// The next line, or `None` at the end of the stream.
@@ -127,6 +140,7 @@ impl<R: BufRead> Lines<R> {
             cut = true;
         }
         self.partial = cut || opened > 0;
+        self.continuing = opened > 0;
 
         if ended {
             self.buffer.pop();

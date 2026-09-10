@@ -107,6 +107,24 @@ fn run(source: &str, config: &Config) -> String {
     apply(source, config).gcode
 }
 
+/// Two lines too long to be held whole, one after the other, are still two
+/// lines. A piece of a long line is `partial` whether it opens the line or
+/// closes it, so the caller could learn only that *a* line was being spilled —
+/// never that the one before it had ended — and wrote no terminator between
+/// them: measured, two 140001-byte lines in and one 280002-byte line out.
+#[test]
+fn two_long_lines_in_a_row_do_not_become_one() {
+    let long = |tag: &str| format!("; {tag}{}\n", "x".repeat(140_000));
+    let source = relative(&format!("{}{}", long("first"), long("second")));
+    let out = run(&source, &Config::default());
+    for tag in ["; first", "; second"] {
+        assert!(
+            out.lines().any(|line| line.starts_with(tag)),
+            "{tag} did not come out as a line of its own"
+        );
+    }
+}
+
 /// A coordinate no printer could reach must not wrap into somebody else's
 /// cell. `Grid::at` saturates past its range, so the neighbour a bead's ground
 /// is searched over was added to a clamped cell — and a wrapped index is not a

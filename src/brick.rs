@@ -390,6 +390,16 @@ pub fn stream<R: BufRead, W: Write>(
         // of what the read before it carried over — so anything answering no
         // is a line of its own, and the one before it is finished.
         if lines.partial() {
+            // A piece that does not carry a line's own tail forward opens a new
+            // line, so the one being spilled has finished and owes a
+            // terminator. Without this two lines longer than the read window
+            // come out as one: `partial` is true of the first piece of a long
+            // line as well as of its last, so the caller never learned where
+            // one ended and the other began. Measured on two 140001-byte lines
+            // in a row, one 280002-byte line out.
+            if !lines.continuing() {
+                pass.rejoin()?;
+            }
             pass.spill(&held)?;
             continue;
         }
