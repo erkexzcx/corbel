@@ -140,16 +140,41 @@ impl Path {
 }
 
 impl Ground {
+    /// The ground across a bead's width: the mean of the nearest path at each
+    /// of `count` points spread over ±`reach` of the bead's centreline.
+    ///
+    /// The candidates are collected ONCE, against the centreline, and every
+    /// sample is answered from that list. Asking each sample point for its own
+    /// neighbourhood looks equivalent and is not: a sample already `0.89 ×
+    /// reach` out from the centreline then reaches `reach` PAST its own offset,
+    /// so the footprint is `1.89 × reach` wide instead of `reach`. Measured on
+    /// a user's adaptive slice, where the reach is sized from the layer being
+    /// written and the paths under it were laid at the layer below's pitch: a
+    /// loop one spacing away — 0.390 mm against a reach of 0.216 mm — was
+    /// inside the outermost sample's reach, so a bead standing on a raised
+    /// column read its flat neighbour's rise as its own ground, was metered for
+    /// a gap twice the one it crossed, and the surplus had nowhere to go but
+    /// into the column beside it. A loop that far out is not under the bead.
     fn across(&self, path: &Path, share: f64, reach: f64) -> f64 {
         let point = path.at(share);
         let normal = path.normal(share);
         let count = ((reach * 2.0 / Grid::FINEST).ceil() as usize).max(1);
+        let mut gathered = Gathered::default();
+        self.gather(Grid::default().at(point.0, point.1), reach, &mut gathered);
         let height = |index: usize| {
             let sideways = reach * (2.0 * (index as f64 + 0.5) / count as f64 - 1.0);
-            self.at(
-                (point.0 + normal.0 * sideways, point.1 + normal.1 * sideways),
-                reach,
-            )
+            let at = (point.0 + normal.0 * sideways, point.1 + normal.1 * sideways);
+            let mut nearest = reach;
+            let mut rise = 0.0;
+            for &index in &gathered.paths {
+                let path = &self.paths[index as usize];
+                let distance = path.distance(at);
+                if distance < nearest || (distance == nearest && path.rise > rise) {
+                    nearest = distance;
+                    rise = path.rise;
+                }
+            }
+            rise
         };
         let first = height(0);
         first + (1..count).map(|index| height(index) - first).sum::<f64>() / count as f64
@@ -270,25 +295,6 @@ impl Ground {
         self.paths.push(path);
     }
 
-    pub(super) fn at(&self, point: (f64, f64), reach: f64) -> f64 {
-        let cell = Grid::default().at(point.0, point.1);
-        let mut gathered = self.gathered.borrow_mut();
-        if gathered.cell != Some(cell) || gathered.reach != reach.to_bits() {
-            self.gather(cell, reach, &mut gathered);
-        }
-        let mut nearest = reach;
-        let mut rise = 0.0_f64;
-        for &index in &gathered.paths {
-            let path = &self.paths[index as usize];
-            let distance = path.distance(point);
-            if distance < nearest || (distance == nearest && path.rise > rise) {
-                nearest = distance;
-                rise = path.rise;
-            }
-        }
-        rise
-    }
-
     /// Collects the paths a query standing in `cell` may be measured against,
     /// each once, into `into`.
     ///
@@ -394,10 +400,16 @@ mod tests {
             (0, 0),
             "the query stands in the cell before the path's own"
         );
-        assert_eq!(ground.at((cell * 0.95, 0.0), cell / 2.0), 0.1);
+        assert_eq!(
+            ground.mean((cell * 0.95, 0.0), (cell * 0.95, 0.0), None, cell / 2.0),
+            0.1
+        );
         // And the same query still reads the plane where the reach does not
         // stretch: the path is a tenth of a cell past it.
-        assert_eq!(ground.at((cell * 0.95, 0.0), cell / 10.0), 0.0);
+        assert_eq!(
+            ground.mean((cell * 0.95, 0.0), (cell * 0.95, 0.0), None, cell / 10.0),
+            0.0
+        );
     }
 
     /// The window a query sweeps is remembered between samples that land in
@@ -407,11 +419,11 @@ mod tests {
         let mut ground = Ground::default();
         ground.add((0.0, 0.0), (0.6, 0.0), None, 0.1);
         ground.add((0.6, 0.6), (1.2, 0.6), None, 0.2);
-        assert_eq!(ground.at((0.3, 0.0), 0.15), 0.1);
-        assert_eq!(ground.at((0.9, 0.6), 0.15), 0.2);
+        assert_eq!(ground.mean((0.3, 0.0), (0.3, 0.0), None, 0.15), 0.1);
+        assert_eq!(ground.mean((0.9, 0.6), (0.9, 0.6), None, 0.15), 0.2);
         // Back to the first cell, whose answer must not have been overwritten
         // by the sweep the second one made.
-        assert_eq!(ground.at((0.3, 0.0), 0.15), 0.1);
+        assert_eq!(ground.mean((0.3, 0.0), (0.3, 0.0), None, 0.15), 0.1);
     }
 
     /// A layer's paths are dropped and laid down again, and the window a query
@@ -424,13 +436,13 @@ mod tests {
         ground.add((0.0, 0.0), (0.6, 0.0), None, 0.1);
         ground.add((0.0, 0.3), (0.6, 0.3), None, 0.1);
         ground.add((0.0, 0.6), (0.6, 0.6), None, 0.1);
-        assert_eq!(ground.at((0.3, 0.3), 0.15), 0.1);
+        assert_eq!(ground.mean((0.3, 0.3), (0.3, 0.3), None, 0.15), 0.1);
 
         // One path where there were three, queried from the very cell the
         // window was left holding.
         ground.clear();
         ground.add((0.3, 0.0), (0.3, 0.6), None, 0.2);
-        assert_eq!(ground.at((0.3, 0.3), 0.15), 0.2);
+        assert_eq!(ground.mean((0.3, 0.3), (0.3, 0.3), None, 0.15), 0.2);
     }
 
     /// A ground that slides rather than steps must not split a bead into moves
@@ -498,6 +510,30 @@ mod tests {
             (integral - whole).abs() < 0.01,
             "{integral} against {whole}"
         );
+    }
+
+    /// A bead's ground is what its OWN footprint reaches, and a loop beside it
+    /// is not under it.
+    ///
+    /// Every sample point used to be answered with a neighbourhood of its own,
+    /// so the outermost sample — already `0.89 × reach` out — reached `reach`
+    /// past its own offset and the footprint came out `1.89 × reach` wide.
+    /// Measured on a user's adaptive slice, where the reach is sized from the
+    /// layer being written and the paths under it were laid at the layer
+    /// below's pitch: a loop one spacing away, 0.390 mm against a reach of
+    /// 0.216 mm, was inside that sample's reach, so a bead standing on a
+    /// raised column read its flat neighbour's rise as its own ground, was
+    /// metered for a gap twice the one it crossed, and the surplus had nowhere
+    /// to go but into the column beside it.
+    #[test]
+    fn a_loop_beside_a_bead_is_not_its_ground() {
+        let mut ground = Ground::default();
+        ground.add((-1.0, 0.0), (1.0, 0.0), None, 0.08);
+        // a flat loop one spacing away, under a much thicker layer
+        ground.add((-1.0, 0.39), (1.0, 0.39), None, 0.0);
+        let reach = 0.2164;
+        let below = ground.mean((0.0, 0.0), (1.0, 0.0), None, reach);
+        assert!((below - 0.08).abs() < 1e-9, "{below}");
     }
 
     #[test]
