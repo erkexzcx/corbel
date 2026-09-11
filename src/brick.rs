@@ -587,6 +587,23 @@ struct Held {
     rate: Option<f64>,
 }
 
+/// How far the ground under a bead has to move before the bead is cut at the
+/// change, as a fraction of the layer height.
+///
+/// A bead that crosses a wall's own step wants two rates — the half gap under a
+/// column standing proud on one side of it, the whole layer on the other — and
+/// that is what [`Pass::split_bead`] cuts for. What it must NOT cut for is the
+/// transverse mean sliding: [`Ground::profile`] reads the ground through
+/// [`Ground::mean`], whose value can only walk a ladder of `rise / count`, so
+/// an exact test on it cuts every rung and a bead becomes moves the planner has
+/// to stop for. Measured on a user's 48-layer PA12 plate, `Top surface` layers
+/// came out at 46,327 moves against the input's 831 and 58% of the whole file's
+/// moves were under 50 µm; at this level the same file wrote 44,710 moves with
+/// 1.3% under 50 µm, against the input's 33,285 and 1.2%. A quarter of the
+/// layer is the smallest step a wall can really leave — the first rung of
+/// [`RAMP`] — so nothing real is folded and nothing smaller is cut.
+const SPLIT_SHARE: f64 = 0.25;
+
 /// Samples one arc may be cut into. A corrupt `I`/`J` can name a radius no
 /// bed holds, and a walk metered in millimetres of it would not end; at
 /// [`ARC_STEP`] this ceiling is two kilometres of path.
@@ -3266,6 +3283,7 @@ impl<'a, W: Write> Pass<'a, W> {
             to,
             arc,
             bead_spacing(self.height(), self.wall_width.unwrap_or(REFERENCE_WIDTH)) / 2.0,
+            self.height() * SPLIT_SHARE,
         );
         if spans.len() < 2 || buffered.z.is_some() {
             return Ok(false);

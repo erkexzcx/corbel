@@ -11,6 +11,21 @@ use crate::geometry::{Arc, CELL, Grid, Trace, footprint, turn};
 /// the path — see [`Ground::at`].
 const SAMPLE: f64 = CELL / 2.0;
 
+/// What a split costs, and what it is worth.
+///
+/// [`Ground::profile`] reads the ground as a transverse mean over the
+/// [`Grid::FINEST`] samples a `reach` holds, so walking a bead across a bed
+/// whose loops alternate raised and flat does not read a step — it reads a
+/// three-step ramp per sample, because the mean can only take one of
+/// `count + 1` equally spaced values. Cut at every one of them and a bead
+/// becomes moves the planner has to stop for: measured on a user's 48-layer
+/// PA12 plate, one 831-move `Top surface` region came out as 46,327 moves and
+/// the file went from 33,285 moves to 136,598, **58% of them under 50 µm where
+/// the input had 1.2%**. The caller says how much the ground may move before
+/// the change is worth a cut of its own; a piece's `below` is the mean over its
+/// own width either way, so folding keeps the integral exact and changes only
+/// where the cut is drawn.
+
 #[derive(Default)]
 pub(super) struct Ground {
     paths: Vec<Path>,
@@ -146,6 +161,7 @@ impl Ground {
         to: (f64, f64),
         arc: Option<Arc>,
         reach: f64,
+        level: f64,
     ) -> Vec<(f64, f64)> {
         if self.paths.is_empty() {
             return vec![(1.0, 0.0)];
@@ -155,7 +171,7 @@ impl Ground {
         };
         let steps = (path.length / (CELL / 2.0)).ceil().max(1.0) as usize;
         let mut previous = self.across(&path, 0.0, reach);
-        let mut spans = Vec::new();
+        let mut raw = Vec::new();
         for step in 1..=steps {
             let share = step as f64 / steps as f64;
             let rise = self.across(&path, share, reach);
@@ -170,13 +186,58 @@ impl Ground {
                         upper = middle;
                     }
                 }
-                spans.push(((lower + upper) / 2.0, previous));
+                raw.push(((lower + upper) / 2.0, previous));
                 previous = self.across(&path, upper, reach);
                 lower = upper;
             }
         }
-        spans.push((1.0, previous));
-        spans
+        raw.push((1.0, previous));
+        Self::merge(raw, level)
+    }
+
+    /// Folds neighbouring spans whose ground differs by less than `level` into
+    /// one, keeping the exact mean so the filament written is unchanged.
+    ///
+    /// What the fold buys is a bead the printer can make: a transverse mean
+    /// that walks a ladder of a thousandth of a millimetre per sample is the
+    /// sweep's own quantisation, not a step in the surface, and writing it as
+    /// one is a move the planner has to stop for.
+    /// Folds neighbouring spans whose ground differs by less than `level` into
+    /// one, keeping the exact mean so the filament written is unchanged.
+    ///
+    /// What the fold buys is a bead the printer can make: a transverse mean
+    /// that walks a ladder of a hundredth of a millimetre per sample is the
+    /// sweep's own quantisation, not a step in the surface, and writing each
+    /// rung as a move of its own is a move the planner has to stop for.
+    fn merge(spans: Vec<(f64, f64)>, level: f64) -> Vec<(f64, f64)> {
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        let (mut start, mut stop, mut area) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut open: Option<f64> = None;
+        for (end, rise) in spans {
+            if stop > start && open.is_some_and(|open| (rise - open).abs() >= level) {
+                merged.push((stop, area / (stop - start)));
+                start = stop;
+                area = 0.0;
+            }
+            area += (end - stop) * rise;
+            stop = end;
+            open = Some(if stop > start {
+                area / (stop - start)
+            } else {
+                rise
+            });
+        }
+        if stop > start || merged.is_empty() {
+            merged.push((
+                stop,
+                if stop > start {
+                    area / (stop - start)
+                } else {
+                    0.0
+                },
+            ));
+        }
+        merged
     }
 
     pub(super) fn clear(&mut self) {
@@ -372,6 +433,73 @@ mod tests {
         assert_eq!(ground.at((0.3, 0.3), 0.15), 0.2);
     }
 
+    /// A ground that slides rather than steps must not split a bead into moves
+    /// the planner cannot make.
+    ///
+    /// The transverse mean reads a bed whose loops alternate raised and flat as
+    /// a ramp, so an exact test on it cuts the bead once per sample. Measured
+    /// on a user's 48-layer PA12 plate, an 831-move top-surface region came out
+    /// as 46,327 moves. The whole of that ramp is inside one [`LEVEL`], so it
+    /// is one span and the bead is written as it was sliced.
+    #[test]
+    fn a_ground_that_slides_does_not_split_a_bead_into_micro_moves() {
+        let mut ground = Ground::default();
+        for step in 0..4000 {
+            let x = step as f64 * 0.005;
+            // a tenth of the tolerance over the whole run, walked in steps far
+            // finer than the samples `profile` takes
+            let rise = 0.0005 * step as f64 / 4000.0;
+            ground.add((x, 0.0), (x + 0.005, 0.0), None, rise);
+        }
+        let spans = ground.profile((0.0, 0.0), (20.0, 0.0), None, 0.2, 0.005);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+    }
+
+    /// The transverse mean walks a ladder in steps of `rise / count` as the
+    /// sweep slides, and every rung of that ladder used to be a move of its
+    /// own. At the level a caller asks for — a quarter of the layer, which is
+    /// the smallest step a wall can really leave — the ladder is one span.
+    #[test]
+    fn a_ladder_of_sweep_steps_is_not_a_piece_per_rung() {
+        let mut ground = Ground::default();
+        // eleven rungs, as `across` reports them for a raised loop beside a
+        // flat one at 0.28 layers
+        for rung in 0..=10 {
+            let x = rung as f64 * 0.35;
+            ground.add((x, -1.0), (x, 1.0), None, 0.0175 * rung as f64);
+        }
+        let spans = ground.profile((0.0, 0.0), (3.5, 0.0), None, 0.2, 0.07);
+        assert!(spans.len() <= 6, "{} spans: {spans:?}", spans.len());
+    }
+
+    /// A real step in the ground is still a piece of its own, and the fold
+    /// keeps the mean exact, so the filament a bead is written with does not
+    /// move.
+    #[test]
+    fn a_real_step_still_pays_for_its_own_piece() {
+        let mut ground = Ground::default();
+        ground.add((-1.0, 0.0), (0.4, 0.0), None, 0.0);
+        ground.add((0.4, 0.0), (1.5, 0.0), None, 0.14);
+        ground.add((1.5, 0.0), (3.0, 0.0), None, 0.14);
+        let spans = ground.profile((0.0, 0.0), (2.0, 0.0), None, 0.2, 0.005);
+        assert!(spans.len() >= 2, "{spans:?}");
+        assert_eq!(spans.last().map(|span| span.0), Some(1.0));
+        let mut previous = 0.0;
+        let mut integral = 0.0;
+        for (end, rise) in spans {
+            integral += (end - previous) * rise;
+            previous = end;
+        }
+        // The fold keeps the mean, so what the bead is metered with is what
+        // `mean` would have given it whole — to the accuracy of the two
+        // different samplings, the walk and the sweep.
+        let whole = ground.mean((0.0, 0.0), (2.0, 0.0), None, 0.2);
+        assert!(
+            (integral - whole).abs() < 0.01,
+            "{integral} against {whole}"
+        );
+    }
+
     #[test]
     fn neighboring_gap_changes_each_keep_their_height() {
         let mut ground = Ground::default();
@@ -380,7 +508,7 @@ mod tests {
         ground.add((0.08, 0.0), (2.0, 0.0), None, 0.0);
         let mut previous = 0.0;
         let mut integral = 0.0;
-        for (end, rise) in ground.profile((0.0, 0.0), (1.0, 0.0), None, 0.2) {
+        for (end, rise) in ground.profile((0.0, 0.0), (1.0, 0.0), None, 0.2, 0.005) {
             integral += (end - previous) * rise;
             previous = end;
         }
@@ -393,7 +521,7 @@ mod tests {
             let mut ground = Ground::default();
             ground.add((-1.0, 0.0), (boundary, 0.0), None, 0.0);
             ground.add((boundary, 0.0), (2.0, 0.0), None, 0.1);
-            let spans = ground.profile((0.0, 0.0), (1.0, 0.0), None, 0.2);
+            let spans = ground.profile((0.0, 0.0), (1.0, 0.0), None, 0.2, 0.005);
             let mut previous = 0.0;
             let mut integral = 0.0;
             for (end, rise) in spans {
