@@ -184,30 +184,6 @@ A curve needs a move per bend, so the exported file grows by a few per cent on a
 
 ---
 
-## ✨ Why this one
-
-Common to both transforms:
-
-- 🔀 **Two transforms, one pass** — run together they compose in a single read, and they own different regions of the print, so neither disturbs the other.
-- 🎛️ **Nothing to fill in, nothing to check first** — line width and nozzle come from your file, layer height is measured off the print itself, and PrusaSlicer, SuperSlicer, OrcaSlicer, Bambu Studio and Cura share one code path.
-- 📦 **One binary, any file size, any character set** — streamed rather than loaded, so a 300 MB slice costs the same memory as a small one, and read as bytes, so an object name in any encoding passes through untouched.
-- 🛡️ **Your file cannot be destroyed** — written aside and moved into place; a file that does not read as G-code is refused before a byte is written, and a second run is refused rather than stacking. Every change is stamped, so `grep corbel` tells you it ran and where.
-
-Against [GeekDetour/BrickLayers](https://github.com/GeekDetour/BrickLayers) and [TengerTechnologies/Bricklayers](https://github.com/TengerTechnologies/Bricklayers), both Python scripts that ask you to change slicer settings first:
-
-- 🐍 **No Python, and no numbers to keep in sync** — no interpreter, no `-layerHeight` to match your profile, no extrusion multiplier to guess.
-- 🔧 **No slicer settings to change first** — arc fitting stays on, wall order is read rather than dictated, and `.bgcode` is read and written natively with thumbnails and config copied byte for byte.
-- **Fewer seam stops, no double priming**: height changes ride existing travels where possible. Reordered wipes and primes preserve the nozzle's original charge at each bead.
-- 🧩 **Two walls are enough, and the visible wall is in on it** — a region with one internal loop is bricked against the wall you can see; that wall takes the same flow as every other and is drawn back in by half of what it gains.
-
-Against [Theaninova/GCodeZAA](https://github.com/Theaninova/GCodeZAA), the post-processor that Z anti-aliasing started as:
-
-- 🧊 **No STL, object name or position to type in** — the surface is recovered from the outlines the slicer already wrote, exact for a flat slope and erring toward the plane for anything else.
-- 📏 **No reach or resolution to pick** — how shallow a tread must be is a slope off your layer height, and the grid comes from the size of your part, spending a fixed budget of cells so a small part is measured finely rather than cheaply.
-- 🌀 **Arcs work, on any firmware** — `G2`/`G3` are resampled rather than skipped, each sampled for its own radius to within a micron; no Klipper requirement, no wall order to set first.
-
----
-
 ## 🙏 Credits
 
 Neither idea started here. This is a Rust implementation of both, without their prerequisites.
