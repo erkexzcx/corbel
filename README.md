@@ -112,7 +112,7 @@ The gaps are drawn far larger than life — on a 0.2 mm layer they are a few mic
 
 #### 📐 How much flow it adds
 
-**`--extra-flow` is the extra a wall takes when your layer is as thick as your nozzle.** Print thinner than that — everyone does — and you get proportionally less:
+**`--extra-flow` is the extra a wall takes when your layer is as thick as your nozzle.** Print thinner than that and you get proportionally less:
 
 > **extra flow ≈ `--extra-flow` × (layer height ÷ nozzle diameter)**
 
