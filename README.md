@@ -109,19 +109,8 @@ Z anti-aliasing has no dials: how wide a tread is worth following is a *slope* o
 
 The gaps are drawn far larger than life — on a 0.2 mm layer they are a few microns across.
 
-**What it touches.** Walls interlock; infill, bridges, surfaces and thin fillers stay at their sliced heights but receive less filament wherever a raised bead below leaves a smaller gap. Moves crossing different gaps are metered in pieces, including arcs. Support and ironing are unchanged. Two walls are enough; three or more interlocks twice as much.
 
-**Each bead is metered for its own gap.** A loop can sit over a raised column along one edge and flat material along another. Giving both edges the loop's average flow overfills one and starves the other, even when the filament total looks right. Compensation follows the material under each bead, including columns still climbing to their offset.
-
-- **The first layer on the bed is left exactly as sliced.** Nothing presses a bead there, so surplus spreads sideways instead of filling anything — on a Benchy it filled in the recessed nameplate, which is exactly one layer deep. A raised column climbs to its half layer over two layers rather than stepping up in one.
-- **The outer wall gets the flow and is then moved inward by half the width it gains**, so the gain feeds the joint behind it and the commanded outer face stays where the slicer drew it. What it gains is `flow - 1` of its *spacing*, not of its nominal width.
-- **A `G2`/`G3` arc moves with it**, keeping its centre and changing radius by the offset, with `I`/`J` restated. A loop whose arcs cannot be moved without distorting their circle is left as sliced, which on a real slice is a handful of beads in twenty thousand.
-
-The compensation is exact on the toolpath, but plastic is looser than a coordinate — the walls behind the visible one keep their gain, and a raised bead is out of reach of the nozzle's underside, so a bricked part can come out slightly over nominal in XY. If yours does, `--extra-flow 0` disables extra wall flow and the inward move; each bead still receives compensation for its gap. Beyond that, your slicer's XY size compensation trims a measured offset.
-
----
-
-### 📐 How much flow it adds
+#### 📐 How much flow it adds
 
 **`--extra-flow` is the extra a wall takes when your layer is as thick as your nozzle.** Print thinner than that — everyone does — and you get proportionally less:
 
