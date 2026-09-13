@@ -1867,7 +1867,14 @@ impl<'a, W: Write> Pass<'a, W> {
             width: self.width,
             marker: self.marker,
             external: self.feature == Feature::ExternalPerimeter,
-            hidden: self.feature == Feature::InternalPerimeter,
+            // A bricked fill's strand is hidden exactly as an inner wall is:
+            // it is not the face the part shows, and `hold_overhangs` reads
+            // the flag to decide which loops it may leave flat. Set here and
+            // not only on the loop's continuation beads — a ring the slicer
+            // fits to a full circle is ONE bead, so there is no continuation
+            // bead to set it, and the ring was held on its plane while the
+            // raised rings either side of it stood half a layer proud.
+            hidden: self.feature == Feature::InternalPerimeter || self.bricked_fill(),
             filler: is_filler(self.feature),
             fill: self.bricked_fill(),
             raised: false,
@@ -2629,6 +2636,20 @@ impl<'a, W: Write> Pass<'a, W> {
                     other != index
                         && outer.fill
                         && outer.outline.is_some_and(|held| holds(held, extent))
+                        // The holder has to be the ring BESIDE it. Extent
+                        // alone cannot say which island a ring belongs to: on
+                        // a 0-wall slice the ring around the part spans the
+                        // whole part, so every other island lies inside its
+                        // bounding box, and on the user's 48-layer bar that
+                        // left TWO three-ring stacks of fill unmarked and
+                        // chained. Neither could be anchored, the fallback
+                        // anchor went to one of them, and the other stack's
+                        // face — the ring a surface band is laid against —
+                        // came out raised, three phases in from its
+                        // neighbour's. Measured on that file: 541 anchors
+                        // added, 1178 raised loops down to 1080, and the split
+                        // stacks read flat/raised/flat from their own faces.
+                        && self.adjacent(other, index)
                 });
                 let beside_a_wall = self.loops.iter().enumerate().any(|(other, wall)| {
                     other != index && !wall.fill && self.adjacent(other, index)
@@ -2848,9 +2869,32 @@ impl<'a, W: Write> Pass<'a, W> {
             // one, which lands it a step from the anchor when it is a whole
             // stack away. Measuring the geometry is the only way to tell, and
             // it is only paid for where the order is not already monotonic.
-            let ranked = anchor
-                .filter(|&place| place != 0 && place + 1 != walls)
-                .and(anchor_at)
+            // The buffer order is also broken by a contour that chains two
+            // NESTED islands, and there the anchor can sit at an end and hide
+            // it. Measured on a user's 0-wall concentric slice, a contour of
+            // ten rings printed its innermost two FIRST — a second island
+            // lying inside the eight that follow — so numbering them by
+            // distance along the buffer ran their places BACKWARDS against
+            // the stack. The island's outermost ring took a phase an odd
+            // number of steps from the anchor and came out raised, standing
+            // half a layer proud of the rings beside and outside it. A
+            // contour whose places in the buffer are not its places in the
+            // stack is therefore numbered by geometry whatever the anchor's
+            // place is.
+            //
+            // A contour of bricked fill is the only one this asks of. A wall's
+            // contour holds the loops of every hole in it too, and those are
+            // not a stack of the island's — they are not nested in it, so the
+            // test would answer no for every contoured hole and renumber a
+            // wall that the rule above already numbers correctly. Measured
+            // over the stored fixtures: gated on the fill, every one of them
+            // comes out byte for byte as it did, and ungated two do not.
+            let bricked_fill = (start..end).any(|at| self.loops[at].fill && !self.loops[at].filler);
+            let scrambled = bricked_fill && !self.in_stack_order(start, end);
+            let ranked = anchor_at
+                .filter(|_| {
+                    scrambled || anchor.is_some_and(|place| place != 0 && place + 1 != walls)
+                })
                 .map(|at| {
                     let mut gaps: Vec<(usize, f64)> = (start..end)
                         .filter(|&loop_| !self.loops[loop_].filler)
@@ -2883,6 +2927,49 @@ impl<'a, W: Write> Pass<'a, W> {
             }
             self.hold_overhangs(start, end);
             start = end;
+        }
+    }
+
+    /// True where a contour's places in the buffer are its places in the
+    /// stack, so numbering by distance along the buffer numbers the stack.
+    ///
+    /// A loop's depth is how many of the contour's loops enclose it, which is
+    /// its place in a stack of nested rings and says nothing about where the
+    /// slicer happened to print it. Two nested fill islands chained into one
+    /// contour break the assumption the buffer order rests on: the island
+    /// lying inside the other is printed as a run of its own, so its rings
+    /// arrive as a block whose depths run the other way, and the phase the
+    /// buffer hands them counts backwards through the stack.
+    ///
+    /// Two loops at one depth — two islands neither of which holds the other —
+    /// answer no as well: which of them is number one is then not a question
+    /// about nesting, and the geometric ranking is the one that can say.
+    /// A loop with no measured extent cannot answer at all.
+    fn in_stack_order(&self, start: usize, end: usize) -> bool {
+        let mut depths = Vec::with_capacity(end - start);
+        for at in (start..end).filter(|&at| !self.loops[at].filler) {
+            let Some(extent) = self.loops[at].outline else {
+                return false;
+            };
+            depths.push(
+                (start..end)
+                    .filter(|&other| other != at && !self.loops[other].filler)
+                    .filter(|&other| {
+                        self.loops[other]
+                            .outline
+                            .is_some_and(|held| holds(held, extent))
+                    })
+                    .count(),
+            );
+        }
+        // A stack of two loops takes the same phase either way round, so
+        // there is nothing here to get wrong.
+        if depths.len() < 3 {
+            return true;
+        }
+        match depths[1] > depths[0] {
+            true => depths.windows(2).all(|pair| pair[1] > pair[0]),
+            false => depths.windows(2).all(|pair| pair[1] < pair[0]),
         }
     }
 

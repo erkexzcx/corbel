@@ -21,10 +21,15 @@ instead of stacking their weak points.
 
 ```
         loop 1   loop 2   loop 3          <- one wall, seen end-on
-layer N   ###     ...      ###
-          ###     ###      ###            <- raised loops sit half a layer high
-layer N-1 ...     ###      ...
+layer N   ###     ...      ###            <- loop 1 and 3 sit half a layer high
+          ###     ###      ###
+layer N-1 ###     ...      ###            <- the SAME loops, raised again
 ```
+
+The two rows are consecutive layers and the pattern in them is the same. What
+alternates is the COLUMNS; what staggers is the join between the two rows, which
+under loop 1 sits half a layer higher than under loop 2. An arrow from one row to
+the other that swaps them is the one thing this transform must not do.
 
 Four consequences that are easy to get backwards:
 
@@ -430,6 +435,27 @@ even. Two things were needed, and both are load-bearing:
   from the anchor than any two neighbours ever are; comparing only against the
   previous loop split it into a contour of its own and numbered it from
   scratch. This broke at 7 walls and above.
+
+**A fill contour's places in the buffer are not its places in the stack, and an
+anchor at an end does not make them so.** A contour that chains two NESTED fill
+islands — which is what a 0-wall concentric slice does wherever a `Top surface`
+or `Floating vertical shell` band cuts the fill into strips — holds the inner
+island's rings as a run of its own, printed either side of the outer island's.
+Numbering them by distance along the buffer runs their places BACKWARDS through
+the stack, and the inner island's outermost ring — the ring its own stack is
+counted from, and a face the part shows — lands an odd number of steps from the
+anchor and comes out raised, half a layer proud of the ring outside it.
+`Pass::in_stack_order` measures each loop's DEPTH (how many of the contour's
+loops enclose it) and, where the depths do not run one way along the buffer,
+numbers the contour by geometry instead — the path `inner-outer-inner` already
+used. Gate it on the contour holding bricked fill: a wall's contour holds the
+loops of every hole in it, which are not nested in the island, so an ungated test
+answers "scrambled" for every contoured hole and renumbers walls that were
+already right (measured: ungated, `walls-3` and `walls-6` stop being
+byte-identical; gated, all eight stored fixtures still are). Measured on a user's
+48-layer 0-wall slice: 5478 of 124561 beads changed the height they are drawn at
+and the raised total moved by one, because what changes is the pattern rather
+than the amount. Pinned by `a_fill_island_inside_another_keeps_its_own_phase`.
 
 Verified across all three sequences at 2 to 9 walls: identical output, no two
 neighbouring walls on the same level anywhere. Throughput unchanged at

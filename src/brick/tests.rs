@@ -3539,6 +3539,35 @@ fn concentric(rings: usize, tag: &str) -> String {
     text
 }
 
+/// A solid concentric fill of circles: `rings` rings a bead apart, laid
+/// innermost first with `tag` labelling each one in print order, and the ring
+/// numbered `single` (one-based) emitted as ONE full-circle arc.
+///
+/// Arc fitting is on by default in OrcaSlicer and Bambu Studio, and a ring the
+/// slicer can fit to a circle is one `G3` naming only `I` and `J` — a whole
+/// ring in a single bead. Measured on a stock Benchy with it on, arcs carry 32%
+/// of the internal wall's extrusion.
+fn circles(rings: usize, tag: &str, single: usize) -> String {
+    let mut text = String::from("; FEATURE: Sparse infill\n");
+    for index in 0..rings {
+        let radius = 0.45 * (index + 1) as f64;
+        text.push_str(&format!("G1 X0 Y{radius:.2} F9000\n"));
+        if index + 1 == single {
+            text.push_str(&format!(
+                "G3 I0 J{:.2} E0.5 ; {tag}{}\n",
+                -radius,
+                index + 1
+            ));
+            continue;
+        }
+        text.push_str(&format!("G1 X{radius:.2} Y0 E0.5 ; {tag}{}\n", index + 1));
+        for (x, y) in [(0.0, -radius), (-radius, 0.0), (0.0, radius)] {
+            text.push_str(&format!("G1 X{x:.2} Y{y:.2} E0.5\n"));
+        }
+    }
+    text
+}
+
 /// The same island filled with a serpentine: one continuous path that turns
 /// back at each end, which is what `zig-zag` lays at full density. Its strands
 /// run beside each other, but they are one path rather than a ring each, and
@@ -3658,6 +3687,179 @@ fn a_wall_and_the_fill_touching_it_alternate_as_one_stack() {
             ("ring3", true),
         ]),
         "{out}"
+    );
+}
+
+/// A closed rectangular ring, reached by its own travel, tagged on its first
+/// bead like [`square`].
+fn rectangle(x0: f64, y0: f64, x1: f64, y1: f64, tag: &str) -> String {
+    let mut text = format!("G1 X{x0:.2} Y{y0:.2} F9000\n");
+    text.push_str(&format!("G1 X{x1:.2} Y{y0:.2} E0.5 ; {tag}\n"));
+    for (x, y) in [(x1, y1), (x0, y1), (x0, y0)] {
+        text.push_str(&format!("G1 X{x:.2} Y{y:.2} E0.5\n"));
+    }
+    text
+}
+
+/// Three fill islands in one layer: a stack of rings around the whole part, and
+/// two congruent strips in the middle, 1.6 mm apart and inside the ring's
+/// bounding box.
+///
+/// This is the arrangement measured on the user's 48-layer bar on print layers
+/// 11 and 12: two stacks of fill, every one of whose loops lies inside the ring
+/// around the part, with the first carrying two rings and the second three, so
+/// that a fallback anchor on the second strip's face hands the first strip's
+/// face a phase THREE steps in — raised, half a layer proud of the surface band
+/// beside it. Nothing runs beside the ring around the part, so it is not the
+/// ring either strip is counted from.
+///
+/// The two strips here do NOT chain: measured, this pass joins two loops only
+/// where more than half of one's path lies within [`MAX_LOOP_GAP`] of the
+/// other's, and two strips offset 1.6 mm apart fall short of it however they
+/// are shaped — so a defect that needs the chain cannot be reached with them.
+/// What this pins is the invariant that holds whether or not the chain is
+/// there: every island is numbered from its own face, so no island's face is
+/// ever raised.
+fn strips_inside_a_ring() -> String {
+    let mut text = String::from("; FEATURE: Sparse infill\n");
+    for (tag, inset) in [("ring1", 0.0), ("ring2", 0.45), ("ring3", 0.9)] {
+        text.push_str(&rectangle(inset, inset, 60.0 - inset, 60.0 - inset, tag));
+    }
+    for (tag, inset) in [("near1", 0.0), ("near2", 0.3)] {
+        text.push_str(&rectangle(
+            5.0 + inset,
+            5.0 + inset,
+            6.0 - inset,
+            45.0 - inset,
+            tag,
+        ));
+    }
+    for (tag, inset) in [("far1", 0.0), ("far2", 0.2), ("far3", 0.4)] {
+        text.push_str(&rectangle(
+            6.6 + inset,
+            5.0 + inset,
+            7.6 - inset,
+            45.0 - inset,
+            tag,
+        ));
+    }
+    text
+}
+
+#[test]
+fn a_fill_island_beside_another_is_not_numbered_from_it() {
+    let source = middle_layer(&solid(&strips_inside_a_ring()));
+    let out = run(&source, &Config::default());
+    assert_eq!(
+        parities(&out),
+        expected(&[
+            // The ring around the part, from its face inward.
+            ("ring1", false),
+            ("ring2", true),
+            ("ring3", false),
+            // Each strip, from its own face inward.
+            ("near1", false),
+            ("near2", true),
+            ("far1", false),
+            ("far2", true),
+            ("far3", false),
+        ]),
+        "a strip's face must not be raised from its neighbour's phase:\n{out}"
+    );
+}
+
+/// A closed square ring, reached by its own travel, with `tag` on its first
+/// bead so its nozzle height can be read back out of the output.
+fn square(near: f64, far: f64, tag: &str) -> String {
+    let mut text = format!("G1 X{near:.2} Y{near:.2} F9000\n");
+    text.push_str(&format!("G1 X{far:.2} Y{near:.2} E0.5 ; {tag}\n"));
+    for (x, y) in [(far, far), (near, far), (near, near)] {
+        text.push_str(&format!("G1 X{x:.2} Y{y:.2} E0.5\n"));
+    }
+    text
+}
+
+/// Two nested fill islands in ONE contour, printed the way a slicer laid them
+/// on a user's 0-wall concentric slice: the inner island's two rings first, as
+/// a run of their own, then the outer island's eight from its innermost ring
+/// outward.
+///
+/// The outer island's outermost ring is the anchor and is printed LAST, so
+/// distance along the buffer is not distance through the stack: it counts the
+/// inner island's rings backwards from the anchor, and the innermost two places
+/// it assigns them are the two outermost rings of a stack.
+fn nested_islands() -> String {
+    let mut text = String::from("; FEATURE: Sparse infill\n");
+    for (tag, near) in [("inner1", 3.60), ("inner2", 4.05)] {
+        text.push_str(&square(near, 10.0 - near, tag));
+    }
+    for index in 0..8 {
+        let near = 3.15 - 0.45 * index as f64;
+        text.push_str(&square(near, 10.0 - near, &format!("ring{}", index + 1)));
+    }
+    text
+}
+
+/// A second island lying inside the first does not take the first island's
+/// anchor as its own, and does not take its phase either.
+///
+/// The two runs chain into one contour — the rings really do run beside each
+/// other — and the anchor sits at an end of it, which is what made the buffer
+/// order look trustworthy. It is not: the inner island's rings are a stack of
+/// their own, and numbered by distance along the buffer their places came out
+/// BACKWARDS, so the island's outermost ring — the one the stack is counted
+/// from — was raised and stood half a layer proud of the ring outside it. Its
+/// own alternation held; the step was between the two islands, in the middle of
+/// what the pass had decided was one stack.
+#[test]
+fn a_fill_island_inside_another_keeps_its_own_phase() {
+    let source = middle_layer(&solid(&nested_islands()));
+    let out = run(&source, &Config::default());
+    assert_eq!(
+        parities(&out),
+        expected(&[
+            // The outer island, from its anchor inward.
+            ("ring1", true),
+            ("ring2", false),
+            ("ring3", true),
+            ("ring4", false),
+            ("ring5", true),
+            ("ring6", false),
+            ("ring7", true),
+            ("ring8", false),
+            // The inner island, carrying the alternation on inward.
+            ("inner1", false),
+            ("inner2", true),
+        ]),
+        "the inner island's outermost ring must not be raised:\n{out}"
+    );
+}
+
+/// A ring of a bricked fill laid down as ONE bead is still a loop of the stack,
+/// and still takes its place in the alternation.
+///
+/// `Loop::hidden` is what says a loop is not the part's visible face, and for a
+/// fill it was only ever set on a loop's SECOND bead — the bead that continues
+/// a loop already open, since the first one opens it. A ring the slicer fits to
+/// a full circle is one `G3` and one bead, so it never picked the flag up, and
+/// `hold_overhangs` then read it as the visible face and held it flat. The ring
+/// stacked on top of the raised rings either side of it instead of staggering
+/// between them, which is the one thing `--bricks` exists to prevent.
+#[test]
+fn a_fill_ring_written_as_one_arc_is_still_raised() {
+    let source = middle_layer(&solid(&circles(4, "ring", 1)));
+    let out = run(&source, &Config::default());
+    // Printed innermost first, so `ring4` is the outermost and the anchor, and
+    // the alternation runs inwards from it.
+    assert_eq!(
+        parities(&out),
+        expected(&[
+            ("ring1", true),
+            ("ring2", false),
+            ("ring3", true),
+            ("ring4", false),
+        ]),
+        "a one-arc ring was left on its plane:\n{out}"
     );
 }
 

@@ -47,8 +47,14 @@ Measured with the marking in place on the user's 48-layer 0-wall slice: **0 of t
 
 ## What tells you it worked
 
-- On the 0-wall slice: 3460 loops and 1224 raised over an 8-layer window, where before it was 0 and 0 — and the outermost strand of every layer still sits exactly on its plane.
-- On a 2-wall plate with the same fill: 3523 loops, 1264 raised, against 1095 and 475 for the same plate at 15% fill. Two walls of a fourteen-object plate cannot raise 1264 loops on their own, so the count is the wall and the fill numbered as one.
+- On the 0-wall slice: 3460 loops and **1235** raised over an 8-layer window, where before it was 0 and 0 — and the outermost strand of every layer still sits exactly on its plane, which `audit.py invariant` reports as 0 of 5348 external extrusions raised.
+- On a 2-wall plate with the same fill: 3523 loops, **1267** raised, against 1095 and 475 for the same plate at 15% fill. Two walls of a fourteen-object plate cannot raise 1267 loops on their own, so the count is the wall and the fill numbered as one.
+
+## Which ring is the face of an island
+
+An island's own outermost ring is the face it shows, so it is the anchor and it is flat. `assign_contours` marks it before the contours are built, and the test is **not** "does any other fill loop's bounding box hold this one" — on a 0-wall slice the ring around the part spans the whole part, so EVERY other island lies inside its box and none of them was marked. Measured on a user's 48-layer bar, print layers 11 and 12: two three-ring stacks of fill whose outermost rings pass 2.0 mm apart, both inside the ring around the part, both unmarked and chained into one contour. Neither could be anchored, the "widest ring in the contour" fallback went to one of them, and the other stack's face — the ring a surface band is laid against — came out **raised three phases in**, standing half a layer proud of the band beside it, with the alternation shifted for every ring behind it. That is the user's "one side causes bricks to be not staggered in the rest of the part".
+
+The holder therefore has to be the ring **BESIDE** the loop: `outer.fill && holds(outer.outline, extent) && self.adjacent(other, index)`. On that file the rule adds 541 anchors, takes raised loops from 1178 to 1080, and splits each stack so it reads flat/raised/flat from its own face; across all 31 stored fixtures 28 are byte-identical, and the three that change (`infill-solid`, `infill-solid-1wall`, `infill-solid-2walls`) keep `invariant` at 0 and move by 11, 7 and 3 raised loops. Pinned by `a_fill_island_beside_another_is_not_numbered_from_it`, which asserts each island's face is flat and the alternation runs inward from it.
 - On the `zig-zag` plate: **0 raised**, and the run fails if any loop is.
 - On the other thirty-one fixtures: byte-identical output, established by building the same tree with the gate forced off and diffing every one.
 
