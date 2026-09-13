@@ -1032,3 +1032,10 @@ This is an independent Rust reimplementation of
 The triage of that project's issues and pull requests — what is a real defect,
 what was refuted by measurement, and what is still unverified — is in
 [references/upstream-tracker.md](./references/upstream-tracker.md).
+
+A slicer run with `wall_loops = 0` and 100% concentric infill lays a stack of
+nested rings with no perimeter region in the file at all — the geometry of a
+1000-wall slice without the `Top surface` regions that route makes the slicer
+invent. `--bricks` does nothing on it today. The measurements, the two cases
+that must stay unraised, and the change in the order it has to be made are in
+[references/infill-bricking.md](./references/infill-bricking.md).
