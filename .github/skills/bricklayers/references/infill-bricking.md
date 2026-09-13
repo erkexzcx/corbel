@@ -37,3 +37,13 @@ The test that separates the sound case from the unsound one is nesting, and the 
 
 - On the 0-wall slice: perimeter loops stop being 0 and the raised count is in the hundreds; the outermost ring of every layer is not raised; the top surface's beads are metered for the rings under them.
 - On every existing fixture: output byte-identical, both modes, and `audit.py invariant` still 0 external perimeters raised.
+
+## What the first attempt at this measured
+
+Built and reverted. Every step above was written — the predicate on `Feature`, the survey's second footprint with its own draw arm, close, accessors and teardown, the cap-set selection in `mark_columns`, the anchor from the longest ring, the nesting guard in `hold_overhangs` — and two things came out of it that change the shape of the work.
+
+**`with_the_wall` is only half the gate.** Widening it to admit `is_concentric_fill` compiles, raises nothing, and the file still reports 0 loops: a loop is only OPENED under a condition somewhere else, in the caller of the function at `src/brick.rs` around line 1755 that pushes the `Loop`. That caller is where infill has to be admitted, and it was not reached.
+
+**Widening the wall's buffer is wrong anyway.** With the gate half-open the suite went from 623 green to 5 failures, all in `tests/plates.rs`, all on fixtures that have walls AND infill: granting infill a place in the same buffer changes files that lay both, because a buffered loop is reordered and re-metered wherever it sits. So the buffer, not just the guard, has to be structured differently — either infill is buffered without joining a wall's region in `continues`, or rings get a buffered stream of their own and a writer that never sees a wall's loops.
+
+That is a design revision rather than more of the same list, and it is the thing to settle before writing any of the seven steps above.
