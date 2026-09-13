@@ -676,6 +676,14 @@ impl Iterator for Along {
     }
 }
 
+/// True for a slicer's statement of how wide the beads after it are. It is a
+/// comment, so nothing on the printer reads it — but every previewer does, and
+/// so does anything that prices a file.
+fn is_a_width(line: Line<'_>) -> bool {
+    line.marker()
+        .is_some_and(|marker| marker.trim_start().starts_with("LINE_WIDTH"))
+}
+
 /// True for a region a slicer lays between the loops of a wall rather than as
 /// one of them.
 ///
@@ -685,14 +693,6 @@ impl Iterator for Along {
 /// contour, and neither may be raised: a thin wall's two faces are both the
 /// visible one, so half a layer of step on it is half a layer of step on the
 /// outside of the part.
-/// True for a slicer's statement of how wide the beads after it are. It is a
-/// comment, so nothing on the printer reads it — but every previewer does, and
-/// so does anything that prices a file.
-fn is_a_width(line: Line<'_>) -> bool {
-    line.marker()
-        .is_some_and(|marker| marker.trim_start().starts_with("LINE_WIDTH"))
-}
-
 fn is_filler(feature: Feature) -> bool {
     matches!(feature, Feature::GapFill | Feature::ThinWall)
 }
@@ -917,11 +917,6 @@ struct Pass<'a, W: Write> {
     arena: Vec<u8>,
     buffer: Vec<Buffered>,
     loops: Vec<Loop>,
-    /// True while the region being written has had the lines the slicer wrote
-    /// after its last bead held back for the layer that follows it. The region
-    /// has not really ended, so nothing is written to settle the nozzle:
-    /// what was held runs before anything else does.
-    holding: bool,
     /// True while a line too long to be held whole is being copied through in
     /// pieces, so the newline it is owed has not been written yet.
     spilling: bool,
@@ -1020,7 +1015,6 @@ impl<'a, W: Write> Pass<'a, W> {
             arena: Vec::new(),
             buffer: Vec::new(),
             loops: Vec::new(),
-            holding: false,
             spilling: false,
             // The visible wall gains material whether or not the file says how
             // wide it is, and material it gains without being moved grows the
@@ -1836,9 +1830,7 @@ impl<'a, W: Write> Pass<'a, W> {
             .collect();
         let entry = self.buffer[last].at;
         self.buffer.truncate(split);
-        self.holding = !held.is_empty();
         self.flush()?;
-        self.holding = false;
         self.entry = entry;
         for (mut buffered, bytes) in held {
             buffered.start = self.arena.len();
@@ -3840,10 +3832,16 @@ fn write_line<W: Write>(out: &mut W, line: &[u8]) -> io::Result<()> {
 
 /// A point as it will be written: three decimals, which is the micron every
 /// slicer resolves to.
+///
+/// Read back from the word rather than scaled and rounded, because those are
+/// two rules: at an exact half-way point the writer breaks the tie to even
+/// where scaling rounds away from zero. Two points a micron apart are the same
+/// point to the printer, and `split_bead` decides where a bead splits and what
+/// it is metered for from these.
 fn written(at: (f64, f64)) -> (f64, f64) {
     (
-        (at.0 * 1000.0).round() / 1000.0,
-        (at.1 * 1000.0).round() / 1000.0,
+        crate::gcode::as_written(at.0, 3),
+        crate::gcode::as_written(at.1, 3),
     )
 }
 

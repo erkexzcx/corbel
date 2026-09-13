@@ -912,6 +912,50 @@ pub fn write_fixed<W: Write>(out: &mut W, value: f64, decimals: usize) -> io::Re
     }
 }
 
+/// The value a word of `decimals` digits really carries, read back from the
+/// text the writer emits.
+///
+/// Scaling and rounding away from zero is a DIFFERENT rule from the one a
+/// formatter applies, and at an exact half-way point the two disagree in both
+/// directions: `1.0625` prints as `1.062` where scaling calls it `1.063`. A
+/// coordinate compared against the model, or against its neighbour, rather
+/// than against the word it is printed as is a comparison against a line
+/// nobody prints — see `zaa::written_height`, on which this measured 73 lost
+/// height changes on one Benchy.
+///
+/// Away from a half-way point the two rules agree exactly, and that is every
+/// coordinate a slicer writes, so the cheap path is the answer and only the
+/// tie a slicer cannot express pays for the formatting.
+pub(crate) fn as_written(value: f64, decimals: usize) -> f64 {
+    let scale = POWERS_OF_TEN[decimals.min(MAX_FIXED_DECIMALS)];
+    let scaled = value * scale;
+    let rounded = scaled.round();
+    if scaled.is_finite()
+        && scaled.abs() < 1e15
+        && (scaled - rounded).abs() < 0.5 - scaled.abs() * (4.0 * f64::EPSILON)
+    {
+        return rounded / scale;
+    }
+    let mut text = [0u8; WRITTEN_WIDTH];
+    let written = {
+        let mut cursor = &mut text[..];
+        // A value too wide for this buffer is one no printer resolves, so the
+        // value stands as it is.
+        if write_fixed(&mut cursor, value, decimals).is_err() {
+            return value;
+        }
+        WRITTEN_WIDTH - cursor.len()
+    };
+    std::str::from_utf8(&text[..written])
+        .ok()
+        .and_then(|word| word.parse().ok())
+        .unwrap_or(value)
+}
+
+/// Room for the widest word a coordinate is ever written as, with the sign, a
+/// point and a decimal part: `-123456789012345.678` is 20.
+const WRITTEN_WIDTH: usize = 48;
+
 fn fixed(value: f64, decimals: usize, out: &mut [u8; FIXED_WIDTH]) -> Option<usize> {
     if decimals > MAX_FIXED_DECIMALS {
         return None;
@@ -1165,12 +1209,21 @@ impl Extruder {
 
     /// Reads an `E` word from the input and returns the filament delta it asks
     /// for.
+    ///
+    /// Both streams are kept as the ABSOLUTE position the extruder stands at,
+    /// whichever mode the file states, because that is the only reading a mode
+    /// change survives. A file is free to switch `M83`/`M82` part way — a
+    /// colour change or a start script may — and an `input` left at the value
+    /// before a relative run makes the first absolute `E` after it a delta of
+    /// the whole run: measured on a synthetic file that primes `E5` relative
+    /// and then states `E10` absolute, the bead came out 5 mm light.
     pub fn observe(&mut self, value: f64) -> f64 {
         if self.absolute {
             let delta = value - self.input;
             self.input = value;
             delta
         } else {
+            self.input += value;
             value
         }
     }
@@ -1189,12 +1242,8 @@ impl Extruder {
 
     /// Reserves `delta` mm of filament and returns the `E` word to emit.
     pub fn advance(&mut self, delta: f64) -> f64 {
-        if self.absolute {
-            self.output += delta;
-            self.output
-        } else {
-            delta
-        }
+        self.output += delta;
+        if self.absolute { self.output } else { delta }
     }
 }
 
@@ -2218,6 +2267,43 @@ mod tests {
         extruder.set_mode(Code::RelativeE);
         assert_eq!(extruder.observe(0.5), 0.5);
         assert_eq!(extruder.advance(0.75), 0.75);
+    }
+
+    /// A file is free to change convention part way — a colour change or a
+    /// start script may — and an absolute `E` after a relative run is measured
+    /// from where that run left the extruder, not from where the run began.
+    #[test]
+    fn a_mode_change_is_measured_from_where_the_extruder_stands() {
+        let mut extruder = Extruder::new();
+        extruder.set_mode(Code::RelativeE);
+        let primed = extruder.observe(5.0);
+        extruder.advance(primed);
+
+        extruder.set_mode(Code::AbsoluteE);
+        assert_eq!(
+            extruder.observe(10.0),
+            5.0,
+            "5 mm of the prime, then E10 absolute is 5 more"
+        );
+    }
+
+    /// The value a word carries is the value the writer printed, so the sweep
+    /// goes over the exact half-way points where scaling and formatting
+    /// disagree as well as the ordinary values where they cannot.
+    #[test]
+    fn a_value_read_back_is_the_value_the_writer_printed() {
+        let mut printed = Vec::new();
+        for step in 0..40_000u64 {
+            // Sixteenths are exact in binary, so every odd one sits exactly on
+            // the half-way point a three-decimal word has to break.
+            let value = step as f64 / 16.0 - 100.0;
+            printed.clear();
+            write_fixed(&mut printed, value, 3).unwrap();
+            let word: f64 = std::str::from_utf8(&printed).unwrap().parse().unwrap();
+            assert_eq!(as_written(value, 3), word, "value {value}");
+        }
+        assert_eq!(as_written(1.0625, 3), 1.062, "the tie goes to even");
+        assert_ne!(as_written(1.0625, 3), (1.0625f64 * 1000.0).round() / 1000.0);
     }
 
     #[test]

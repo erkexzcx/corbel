@@ -136,19 +136,13 @@ fn same_height(a: f64, b: f64) -> bool {
 /// — which print `-0.000` and `0.000` and are one height to the printer — stay
 /// one height here too.
 fn written_height(value: f64) -> f64 {
-    let mut text = Vec::new();
-    // Writing to a `Vec` cannot fail.
-    let _ = crate::gcode::write_fixed(&mut text, value, 3);
-    std::str::from_utf8(&text)
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(value)
+    crate::gcode::as_written(value, 3)
 }
 
 /// A coordinate as it will be written: three decimals, which is the micron
 /// every slicer resolves to.
 fn written(value: f64) -> f64 {
-    (value * 1000.0).round() / 1000.0
+    crate::gcode::as_written(value, 3)
 }
 
 /// Points one move may be sampled at. A move longer than a bed is not a move,

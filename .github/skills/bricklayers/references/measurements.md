@@ -134,7 +134,7 @@ laid on the plane over a column that had been raised was fed for a whole layer
 of gap when half of it was already filled.
 
 `audit.py flow OUT IN` is the measurement: it matches each internal bead to the
-column beneath it and compares `E_out/E_in` against `(h + rise − rise_below)/h ×
+column beneath it and compares `E_out/E_in` against `(h + rise − ground)/h ×
 flow`. Stock OrcaSlicer 2.4.2 Benchy, 0.2 mm layers, 0.4 nozzle, arc fitting on:
 
 | file | over-fed before | over-fed after | worst ratio |
@@ -149,7 +149,9 @@ seen is a clean fraction — 2.00 (flat over a raise, fed for a full layer), 0.6
 0.80, 0.83, 1.33 — so any new ratio is worth explaining before it is accepted.
 
 The share of a loop's path standing on the layer below's raised footprint is
-strongly bimodal, which is what lets `SEAM_SHARE` sit at 0.25:
+strongly bimodal — the population a `SEAM_SHARE = 0.25` threshold was chosen
+from, and the one a wall that walks sideways has no valley in, which is why the
+share is now read as a profile and the bead split at it:
 
 | share of path over the raise below | loops on the plane | loops carrying a raise on |
 |---|---|---|

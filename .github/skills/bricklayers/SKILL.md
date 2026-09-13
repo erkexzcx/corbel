@@ -254,9 +254,10 @@ Four consequences that are easy to get backwards:
    deep. `RAMP` (2) spreads it: no bead spans more than a quarter of a layer
    beyond what the slicer metered it for, and the layer on the plate comes
    through byte for byte.
-4. **One formula covers all of it.** `Pass::geometry` is
-   `(layer_height + rise(here) - rise(under)) / layer_height`, where `rise` is
-   the column's offset. It falls out at 1.0 on the bed
+4. **One formula covers all of it.** `Pass::bead_geometry` is
+   `(layer_height + rise_of(here) - ground(under)) / layer_height`, where
+   `rise_of` is the column's offset and `ground` is the rise the bead is
+   actually laid on. It falls out at 1.0 on the bed
    (nothing has risen yet), 1.25 on each climbing layer, 1.0 once the column is
    up — which is where the wall flow applies instead — and 0.5 where a cap
    forces the offset back to zero. A column capped before it
@@ -269,14 +270,14 @@ Four consequences that are easy to get backwards:
    it pours **exactly twice** what the gap holds, which is a blob on an
    overhanging surface. Measured on a stock 2-wall Benchy, **188 mm of internal
    wall path at exactly 2.00×**, most of it between Z8 and Z15 where the hull
-   flares hardest; 2575 mm on the 1000-wall version. So `Pass.rising` collects
-   the cells each layer leaves standing proud, `Pass.standing` is the layer
-   below's, and `Loop.on_a_raise` tests a loop's own path against it.
-   `on_a_raise` is a SHARE — the fraction of the loop's own path that lies
-   over the raise below — and it is **not** `CAP_SHARE`: capping asks whether
+   flares hardest; 2575 mm on the 1000-wall version. So `Pass.ground` measures
+   the rise the layer below left under a bead, and `Pass.next_ground` is the
+   same carried to the layer above it. It is **not** `CAP_SHARE`: capping asks whether
    a column *ends*, where being wrong costs a void, and this asks what a bead
    *sits on*, where being wrong the same way costs a blob, so it is metered
-   continuously rather than thresholded. It used to be a `SEAM_SHARE` (0.25)
+   continuously rather than thresholded, and `Pass::split_bead` breaks a bead
+   where the profile changes height under it so each piece is metered for its
+   own span. It used to be a `SEAM_SHARE` (0.25)
    threshold, chosen from a Benchy where the two populations are bimodal — a
    loop laid on the plane shares a tenth of its path or less, a loop carrying
    a raised column 0.4 to 1.0 — but a wall that WALKS sideways has no valley
@@ -501,7 +502,7 @@ are **buffered with the wall they interrupt but are not loops of it**.
   down into the valley *between* two beads and straddles whatever those two
   did, so it comes out **exactly as the slicer wrote it** — factor 1.0, no wall
   flow. A thin wall is a bead of its own with a plane under it, so it takes
-  `Pass::geometry` like any other bead: where that plane is a column standing
+  `Pass::bead_geometry` like any other bead: where that plane is a column standing
   half a layer proud it has half the gap to fill. That is also the one reason a
   filler may count as covering a raise beneath it.
 
@@ -819,7 +820,7 @@ Filament totals cannot detect excess primes that cancel starved beads. `tests/no
   *every* stock profile look adaptive. Their heights are never read anyway —
   `rise(0)` is 0.
 - **`(h + x) - x` is not `h` in binary** (0.2+0.1-0.1 = 0.20000000000000004).
-  The `offset == rise_below` short-circuit in `span()` is what keeps a
+  The `offset == below` short-circuit in `Pass::bead_geometry` is what keeps a
   steady-state factor exactly 1.0. Do not "simplify" it away.
 - **Measuring from printed Z is correct, not a rounding bug.** Z is emitted to
   three decimals, so a measured height can sit up to 0.001 off the slicer's own

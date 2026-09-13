@@ -8,7 +8,7 @@ Rust one, so a diagram cannot show a wall the binary would not produce:
     flow_ceiling   <- brick::flow_ceiling
     automatic_flow <- brick::automatic_flow
     rise           <- Pass::rise_at
-    offsets        <- Pass::offset / Pass::rise_below, over a whole column
+    offsets        <- Pass::offset / Pass::rise_of, over a whole column
     skin_offset    <- Pass::skin_offset
     raised_loops   <- Pass::number_loops, for the simple monotonic case
 

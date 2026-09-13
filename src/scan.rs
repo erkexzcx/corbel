@@ -1037,6 +1037,8 @@ impl Scan {
         self.below_sealed.clear();
         self.uncovered.clear();
         self.unsupported.clear();
+        self.supported.clear();
+        self.support.clear();
         self.layer_heights.clear();
         self.planes.clear();
         self.object_starts.clear();
@@ -1882,6 +1884,31 @@ G1 X2 Y0 E1
             let survey = Survey::of(known);
             assert_eq!(survey.unknown_regions, 0, "{known}");
             assert_eq!(survey.unknown_region, None, "{known}");
+        }
+    }
+
+    /// A start G-code draws its purge line before the first layer marker, so
+    /// that bead opens a layer of its own and everything it laid out is
+    /// dropped when the marker arrives. Dropping it has to drop what it stood
+    /// beside as well: the layer the marker opens is closed immediately after,
+    /// and a support set left behind is booked to THAT layer — every wall of
+    /// the part's first layer then held flat beside a purge line, and in a
+    /// tree-support print the tree is nowhere near it.
+    #[test]
+    fn a_purge_line_drops_the_support_it_stood_beside() {
+        let survey = Survey::of(
+            "M83\n\
+             ; FEATURE: Support\n\
+             G1 X50 Y50 F9000\nG1 X60 Y50 E0.5\nG1 X60 Y60 E0.5\n\
+             ;LAYER_CHANGE\nG1 Z0.2\n\
+             ;TYPE:Perimeter\n\
+             G1 X0 Y0 F9000\nG1 X10 Y0 E0.5\nG1 X10 Y10 E0.5\n",
+        );
+        for layer in 0..survey.layers {
+            assert!(
+                survey.support(layer).is_none(),
+                "layer {layer} still reports the purge line's support"
+            );
         }
     }
 
