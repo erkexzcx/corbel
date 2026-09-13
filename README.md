@@ -117,13 +117,6 @@ The gaps are drawn far larger than life — on a 0.2 mm layer they are a few mic
 > **extra flow ≈ `--extra-flow` × (layer height ÷ nozzle diameter)**
 
 So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle, and about +1% on a 0.08 mm one. Both numbers are read from your file, on every layer, so an adaptive slice is metered against what it actually printed. Nozzle size barely matters on its own; what matters is how thick your layer is next to your nozzle.
-
-#### 🧱 A solid fill is a wall
-
-A part printed with **no walls at all** — `wall_loops = 0` — with its fill at **100% density** is a stack of strands laid against each other, which is a wall in everything but its label. The outermost of them *is* the part's visible face, so bricking numbers them from the outside in exactly as it numbers a wall, holds that one flat, and staggers the rest. The same goes for a fill inside a wall: where the two stacks touch, they alternate as one.
-
-The pattern does not matter; the geometry does, and it is measured. A fill whose strands run beside each other and **nest** — one inside the next, the same stack on every layer — is bricked. One whose strands are laid *across* each other is left exactly as sliced: Bambu's `zig-zag` at full density is a single serpentine per island and the slicer rotates it 90° every layer, so a raised strand would be crossed at right angles by the layer above over its whole length. Measured on the same plate, a concentric fill lays 455 closed rings a layer against 46 open runs whose ends are 7 to 35 mm apart.
-
 ---
 
 ## 🪄 Z anti-aliasing
