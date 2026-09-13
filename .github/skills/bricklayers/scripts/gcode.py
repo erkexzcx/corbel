@@ -35,6 +35,19 @@ def classify(label: str) -> str:
     # label on at least part of itself, and the whole loop shares one height.
     if "overhang" in low:
         return "overhang"
+    # Before the wall tests, as in src/gcode/feature.rs: Bambu fills this one
+    # at 100% density and spells it with the word the wall arm reads, and it is
+    # concentric solid infill rather than a perimeter. Left to fall through, it
+    # reported as "other" -- unrecognised -- on a file where every one of its
+    # strands is a solid fill.
+    if "floating" in low:
+        return "solid"
+    # Also before the wall tests, and for the same reason: `Ironing` runs over a
+    # top surface and a slicer that says so names the surface in the same label,
+    # so the wall arm would take it. src/gcode/feature.rs reads it as the surface
+    # it follows.
+    if "iron" in low:
+        return "solid"
     if any(needle in low for needle in EXTERNAL):
         return "external"
     if any(needle in low for needle in INTERNAL):
