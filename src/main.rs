@@ -43,7 +43,6 @@ fn run(cli: &Cli) -> Result<()> {
         return Err(Error::Usage(reason));
     }
 
-    warn_slicer_settings(&slicer, bricks);
     if cli.verbose {
         if source.is_binary() {
             eprintln!("corbel: binary G-code container");
@@ -53,7 +52,8 @@ fn run(cli: &Cli) -> Result<()> {
         }
     }
 
-    let survey = source.survey()?;
+    let survey = source.survey_with(slicer.fill_density.as_deref())?;
+    warn_slicer_settings(&slicer, bricks, &survey);
     if let Some(done) = already_done(&survey, bricks, contours)
         && !cli.force
     {
@@ -239,21 +239,28 @@ fn resolve(
 /// Slicer settings under which a transform quietly does nothing, or the
 /// wrong thing. Only ever reached when a slicer ran us, since they come from
 /// the environment it exports.
-fn warn_slicer_settings(slicer: &slicer::Settings, bricks: bool) {
+fn warn_slicer_settings(slicer: &slicer::Settings, bricks: bool, survey: &Survey) {
     if slicer.spiral_vase == Some(true) {
         eprintln!(
             "corbel: warning: spiral vase mode is on; it prints one continuously \
              rising wall, so there are no layer boundaries to interlock"
         );
     }
+    // Only where the file holds no solid fill. Bricking a wall stack needs a
+    // second loop behind the visible one, but a fill laid at full density is
+    // that stack — its strands run beside each other and the outermost of them
+    // is the part's outer face, which is exactly the case this warning used to
+    // get backwards.
     if let Some(walls) = slicer.walls
         && walls < 2
         && bricks
+        && !survey.solid_fill
     {
         eprintln!(
             "corbel: warning: {walls} wall(s) per region leaves no internal \
              perimeter behind the visible one, so there is nothing to raise; \
-             bricking needs two walls or more"
+             bricking needs two walls or more, or a solid fill whose strands \
+             run beside each other"
         );
     }
 }
@@ -270,14 +277,20 @@ fn warn_slicer_settings(slicer: &slicer::Settings, bricks: bool) {
 /// What a file with nothing for the named transforms to do has to be told.
 ///
 /// The two transforms find their work through different markers — bricking
-/// raises perimeter loops and nothing else, the surface transform reshapes a
-/// `Top surface` or an ironing pass — so a file can hold plenty for one of
-/// them and nothing at all for the other. A slice with no walls is exactly
-/// that: `wall_loops = 0` with 100% concentric infill leaves the file with no
-/// perimeter region in it, while the flat top that infill builds is 6637 moves
-/// of surface for `--zaa` to follow. Said as one sentence about "neither
-/// transform", a `--zaa` run was told its file came out unchanged while it
-/// went on to write 8189 moves.
+/// raises a wall's loops and now also the strands of a solid fill, the surface
+/// transform reshapes a `Top surface` or an ironing pass — so a file can hold
+/// plenty for one of them and nothing at all for the other. A slice with no
+/// walls is exactly that: `wall_loops = 0` with 100% infill leaves the file
+/// with no perimeter region in it, while the flat top that infill builds is
+/// 6637 moves of surface for `--zaa` to follow. Said as one sentence about
+/// "neither transform", a `--zaa` run was told its file came out unchanged
+/// while it went on to write 8189 moves.
+///
+/// A file with no perimeter region is not nothing for bricking either once its
+/// fill is solid: the strands of that fill run beside each other exactly as a
+/// wall's loops do, so the fill is where the stagger goes — see
+/// [`Survey::solid_fill`]. Only a file that states neither a perimeter nor a
+/// solid fill has nothing to raise.
 ///
 /// Zero perimeters is also what a file this tool recognises nothing in looks
 /// like — an unknown slicer, or one an earlier post-processor stripped the
@@ -285,11 +298,11 @@ fn warn_slicer_settings(slicer: &slicer::Settings, bricks: bool) {
 /// worth naming the markers for.
 fn nothing_to_work_on(survey: &Survey, bricks: bool, contours: bool) -> Option<String> {
     let starved: Vec<&str> = [
-        (bricks && survey.perimeters == 0).then_some(
-            "--bricks has nothing to raise: this file holds no perimeter region, \
-             and bricking only staggers perimeter loops against each other — a \
-             slice with `wall_loops = 0` is laid entirely as infill, which is \
-             never raised",
+        (bricks && survey.perimeters == 0 && !survey.solid_fill).then_some(
+            "--bricks has nothing to raise: this file holds no perimeter region \
+             and no solid fill, and bricking only staggers loops that run beside \
+             each other — a slice at `wall_loops = 0` and a partial infill is \
+             laid as strands millimetres apart, which have nothing to bond to",
         ),
         (contours && survey.surfaces == 0).then_some(
             "--zaa has nothing to follow: this file holds no `Top surface` and \
@@ -424,7 +437,7 @@ fn report_filament(stats: &brick::Stats, applied: &str) {
 /// What bricking did.
 fn report_bricks(stats: &brick::Stats, config: &brick::Config, applied: &str) {
     eprintln!(
-        "corbel: {} layers, {} perimeter loops, {} raised by {}",
+        "corbel: {} layers, {} loops, {} raised by {}",
         stats.layers,
         stats.loops,
         stats.raised,

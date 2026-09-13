@@ -3507,6 +3507,245 @@ fn a_second_region_in_a_layer_is_grouped_on_its_own() {
     );
 }
 
+/// A ring, with `stationary` inserted part-way round it. Every bead of it is
+/// an extrusion and every corner is named, so the only thing that can split it
+/// in two is the line handed in.
+fn ring_with(stationary: &str) -> String {
+    format!(
+        "G1 X0.45 Y0.45 F9000\nG1 X9.55 Y0.45 E0.5\nG1 X9.55 Y9.55 E0.5\n{stationary}\
+G1 X0.45 Y9.55 E0.5\nG1 X0.45 Y0.45 E0.5\n"
+    )
+}
+
+/// A solid concentric fill: `rings` nested squares a bead apart, laid
+/// innermost first, which is the order a slicer lays them in. Each ring
+/// returns to where it started, and `tag` labels the first bead of each in
+/// print order.
+fn concentric(rings: usize, tag: &str) -> String {
+    let mut text = String::from("; FEATURE: Sparse infill\n");
+    for index in 0..rings {
+        let step = 0.45 * (rings - 1 - index) as f64;
+        let near = step;
+        let far = 10.0 - step;
+        text.push_str(&format!("G1 X{near:.2} Y{near:.2} F9000\n"));
+        text.push_str(&format!(
+            "G1 X{far:.2} Y{near:.2} E0.5 ; {tag}{}\n",
+            index + 1
+        ));
+        for (x, y) in [(far, far), (near, far), (near, near)] {
+            text.push_str(&format!("G1 X{x:.2} Y{y:.2} E0.5\n"));
+        }
+    }
+    text
+}
+
+/// The same island filled with a serpentine: one continuous path that turns
+/// back at each end, which is what `zig-zag` lays at full density. Its strands
+/// run beside each other, but they are one path rather than a ring each, and
+/// the slicer rotates the pattern between layers.
+fn serpentine(tag: &str) -> String {
+    let mut text = String::from("; FEATURE: Sparse infill\n");
+    for pass in 0..6 {
+        let (from, to) = if pass % 2 == 0 {
+            (0.0, 10.0)
+        } else {
+            (10.0, 0.0)
+        };
+        let y = 0.45 * pass as f64;
+        text.push_str(&format!("G1 X{from:.2} Y{y:.2} F9000\n"));
+        text.push_str(&format!(
+            "G1 X{to:.2} Y{y:.2} E0.5{}\n",
+            if pass == 0 {
+                format!(" ; {tag}")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    text
+}
+
+/// A file stating that its fill is solid, so the strands of a fill region are
+/// a stack this pass may stagger along with the wall beside them.
+fn solid(body: &str) -> String {
+    format!("; sparse_infill_density = 100%\n{body}")
+}
+
+/// A solid fill with no wall in the file at all is a stack of rings, and its
+/// OUTERMOST ring is the part's visible face.
+///
+/// This is the case `--bricks` used to do nothing on: the region is labelled
+/// `Sparse infill`, which is not a wall, so no loop was opened and nothing was
+/// raised. The rings run beside each other exactly as a wall's loops do, so
+/// they are numbered from the outside in like one — and the ring that bounds
+/// the island takes phase zero, which is flat. Raising it would put half a
+/// layer of step on the surface of the part at the same time as scaling its
+/// flow without moving it, which grows the part by the width the bead gained.
+#[test]
+fn a_fill_that_is_the_whole_part_is_bricked_from_its_outermost_ring() {
+    let source = middle_layer(&solid(&concentric(4, "ring")));
+    let out = run(&source, &Config::default());
+    // Printed innermost first, so `ring4` is the outermost and the anchor.
+    assert_eq!(
+        parities(&out),
+        expected(&[
+            ("ring1", true),
+            ("ring2", false),
+            ("ring3", true),
+            ("ring4", false),
+        ]),
+        "{out}"
+    );
+}
+
+/// A fill whose strands do not come back on themselves is not a stack of
+/// rings, and is left exactly as the slicer laid it.
+///
+/// `zig-zag` at full density is one serpentine per island: measured on a real
+/// plate, 46 open runs a layer whose ends are 7 to 35 mm apart, against 455
+/// closed rings on a concentric one. The slicer also rotates it 90° every
+/// layer, so a raised strand is crossed at right angles by the layer above
+/// over the whole of its length, with nothing at the same place to bond to.
+#[test]
+fn a_solid_fill_that_runs_away_from_itself_is_not_raised() {
+    let source = middle_layer(&solid(&serpentine("zig")));
+    let out = run(&source, &Config::default());
+    assert_eq!(parities(&out), expected(&[("zig", false)]), "{out}");
+    assert!(
+        !out.contains("corbel brick raised"),
+        "a serpentine has no column of its own to stagger:\n{out}"
+    );
+}
+
+/// A lone fill ring is not a stack either.
+///
+/// An inner wall exists only because the slicer inset it from the wall beside
+/// it, so a lone wall loop always has the visible wall next to it — which is
+/// why `number_loops` raises one. A fill ring can be alone in an island that
+/// holds nothing else, and half a layer of step on a bead with nothing beside
+/// it is a ridge with nothing to bond to.
+#[test]
+fn a_lone_fill_ring_is_left_on_its_plane() {
+    let source = middle_layer(&solid(&concentric(1, "ring")));
+    let out = run(&source, &Config::default());
+    assert_eq!(parities(&out), expected(&[("ring1", false)]), "{out}");
+}
+
+/// A wall and the fill that touches it are ONE stack, and alternate across the
+/// joint.
+///
+/// The fill is inset from the wall by less than a bead, so the outermost ring
+/// and the innermost wall run beside each other exactly as two loops of one
+/// wall do — and numbered apart they would take the same phase at the joint,
+/// which is the seam bricking exists to stagger. The wall is the anchor
+/// because the slicer says so, and the rings then take their places running
+/// inwards from it.
+#[test]
+fn a_wall_and_the_fill_touching_it_alternate_as_one_stack() {
+    let source = middle_layer(&solid(&format!(
+        ";TYPE:External perimeter\n{}{}",
+        wall_of(1, "wall", 0.0, 10.0, 1.0),
+        concentric(3, "ring")
+    )));
+    let out = run(&source, &Config::default());
+    // Printed wall first, then the fill innermost ring outwards.
+    assert_eq!(
+        parities(&out),
+        expected(&[
+            ("wall1", false),
+            ("ring1", true),
+            ("ring2", false),
+            ("ring3", true),
+        ]),
+        "{out}"
+    );
+}
+
+/// A move that ends where the nozzle already stands separates nothing.
+///
+/// Bambu writes `G1 X.. Y.. E0` part-way round a ring — the same point as the
+/// bead before it, and no filament at all — and read as a travel it cut the
+/// ring in two. The halves were contoured, numbered and raised apart, so one
+/// stood half a layer proud of the other in the middle of one wall; and the
+/// half that was reordered carried the slicer's stationary move away from the
+/// bead it belonged to, measured on a real plate as a wipe left 42 mm from the
+/// bead it retraces.
+///
+/// A bare travel to the same point is NOT this: it names no `E`, so the slicer
+/// has stopped drawing here, and the bead behind it is a new loop.
+#[test]
+fn a_move_that_goes_nowhere_does_not_separate_a_loop() {
+    let wall = |ring: String| {
+        middle_layer(&format!(
+            ";TYPE:Perimeter\n{ring}\
+             ;TYPE:External perimeter\nG1 X0 Y0 F9000\nG1 X10 Y0 E0.5\n"
+        ))
+    };
+    let whole = apply(&wall(ring_with("")), &Config::default()).stats;
+    let stopped = apply(&wall(ring_with("G1 X9.55 Y9.55 E0\n")), &Config::default()).stats;
+    assert_eq!(
+        stopped.loops, whole.loops,
+        "a move that goes nowhere must not add a loop"
+    );
+    assert_eq!(stopped.raised, whole.raised);
+}
+
+/// The `; LINE_WIDTH:` in force where the first line holding `needle` is
+/// drawn, which is what a previewer or a file-pricing tool reads there.
+fn width_at(gcode: &str, needle: &str) -> String {
+    let mut width = String::from("(none)");
+    for text in gcode.lines() {
+        if let Some(rest) = text.trim().strip_prefix("; LINE_WIDTH:") {
+            width = rest.trim().to_owned();
+        }
+        if text.contains(needle) {
+            return width;
+        }
+    }
+    panic!("no line holds {needle}:\n{gcode}")
+}
+
+/// The width is MODAL: a slicer states it once for a region and the regions
+/// behind it inherit whatever was declared last, so a region that states none
+/// of its own is one the region before it metered. This pass writes a wall's
+/// loops in another order, each carrying the declaration it was read under,
+/// and the width it leaves standing at the end of one is then not the one the
+/// file has there — every line written straight through behind it inherits the
+/// wrong one.
+///
+/// Measured on a real plate whose inner wall and whose sparse infill are both
+/// declared at 0.45 while its visible wall is 0.42: **52066 mm of 165303 mm, a
+/// third of the file's beads, came out under the outer wall's width**.
+#[test]
+fn a_region_that_states_no_width_of_its_own_keeps_the_one_in_force() {
+    let source = middle_layer(
+        ";TYPE:Outer wall\n; LINE_WIDTH: 0.42\n\
+         G1 X0.00 Y0.00 F9000\n\
+         G1 X10.00 Y0.00 E0.5 ; visible\n\
+         G1 X10.00 Y10.00 E0.5\n\
+         G1 X0.00 Y10.00 E0.5\n\
+         G1 X0.00 Y0.00 E0.5\n\
+         ;TYPE:Inner wall\n; LINE_WIDTH: 0.45\n\
+         G1 X0.45 Y0.45 F9000\n\
+         G1 X9.55 Y0.45 E0.5 ; hidden\n\
+         G1 X9.55 Y9.55 E0.5\n\
+         G1 X0.45 Y9.55 E0.5\n\
+         G1 X0.45 Y0.45 E0.5\n\
+         ;TYPE:Sparse infill\n\
+         G1 X5 Y5 F9000\n\
+         G1 X5.5 Y5 E0.5 ; infill\n",
+    );
+    let out = run(&source, &Config::default());
+
+    // The visible wall is written where it is and the hidden loop behind it is
+    // raised, so it goes down at the end of the layer — which leaves the wall's
+    // 0.42 standing over the infill that the FILE had at 0.45.
+    assert_eq!(width_at(&out, "; infill"), "0.45", "{out}");
+    // And each loop still carries its own.
+    assert_eq!(width_at(&out, "; visible"), "0.42", "{out}");
+    assert_eq!(width_at(&out, "; hidden"), "0.45", "{out}");
+}
+
 /// Slicers scatter their own annotations through a wall. They are not
 /// region markers, so they must neither end the region nor be dropped.
 #[test]

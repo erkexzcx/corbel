@@ -1,9 +1,17 @@
 //! Brick layering.
 //!
-//! Inside every perimeter region the loops are numbered and every other one is
+//! Inside every wall region the loops are numbered and every other one is
 //! raised by half a layer height. Adjacent loops then bond across a staggered
 //! seam instead of stacking their weak points on top of each other, the same
 //! way courses of bricks are offset.
+//!
+//! A fill laid at full density is a wall in everything but its label: its
+//! strands are laid against each other instead of millimetres apart, and with
+//! no perimeter region in the file at all — `wall_loops = 0` — the outermost
+//! of them *is* the part's visible face. Those are numbered and raised with
+//! the wall beside them, where they really do run beside each other and form a
+//! stack; see [`Pass::settle_fill_contours`]. A fill whose strands cross
+//! instead is left exactly as the slicer laid it.
 //!
 //! One region covers an island's outer wall, the walls of every hole in it and
 //! whatever fragments a thin wall broke into, so the numbering restarts at each
@@ -14,8 +22,8 @@
 //! behind it, it anchors the alternation running through the whole stack, and
 //! each closed loop of it is drawn inward by half the width it gains so its
 //! commanded outer face lands where the slicer drew it. Only what is not a wall
-//! is left alone — the top and bottom surfaces, the infill, and the whole of the
-//! layer laid on the build plate.
+//! is left alone — the top and bottom surfaces, the ironing, and the whole of
+//! the layer laid on the build plate.
 
 use std::io::{self, BufRead, Write};
 
@@ -335,9 +343,10 @@ pub struct Stats {
     /// where nothing was raised. The two differ only on an adaptive slice.
     pub raise: Option<(f64, f64)>,
     pub layers: usize,
-    /// Perimeter loops seen, the visible wall included and fillers excluded.
-    /// Only the hidden ones can ever be raised, so this is about twice the
-    /// pool [`Stats::raised`] is drawn from.
+    /// Loops seen, the visible wall included and fillers excluded. Only the
+    /// hidden ones can ever be raised, so this is about twice the pool
+    /// [`Stats::raised`] is drawn from. The strands of a solid fill are counted
+    /// here too, since they are numbered and raised as the wall's loops are.
     pub loops: usize,
     pub raised: usize,
     /// Loops laid flat because nothing stood on them, which would otherwise
@@ -697,6 +706,35 @@ fn is_filler(feature: Feature) -> bool {
     matches!(feature, Feature::GapFill | Feature::ThinWall)
 }
 
+/// The widest of `among`, by the extent of what it draws.
+///
+/// The rings of a solid concentric fill nest, so the widest of them is the one
+/// that BOUNDS the island — and with no wall region in the file that is the
+/// part's own outer face. `None` where none of them measured an extent at all.
+///
+/// This is the fallback for a contour whose rings were NOT marked during
+/// grouping, which is what `assign_contours` does for a fill: the outermost
+/// ring of every island is marked there, before the contours are built, so
+/// that [`taken`](Pass::assign_contours) keeps two islands apart the way it
+/// keeps two visible walls apart. A contour that still has no anchor is one
+/// the marking could not place — so the widest ring stands in, and if the
+/// answer is arbitrary it is arbitrary between rings of one stack.
+fn widest(loops: &[Loop], among: &[usize]) -> Option<usize> {
+    among
+        .iter()
+        .filter_map(|&at| {
+            let extent = loops[at].outline?;
+            Some((at, (extent[2] - extent[0]).max(extent[3] - extent[1])))
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(at, _)| at)
+}
+
+/// True where `inner`'s extent lies wholly inside `outer`'s.
+fn holds(outer: [f64; 4], inner: [f64; 4]) -> bool {
+    outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3]
+}
+
 /// One perimeter loop, as index ranges into the buffer. `lead` covers the
 /// travel that reaches the loop, `body` the extrusions themselves.
 #[derive(Clone, Copy)]
@@ -747,6 +785,15 @@ struct Loop {
     /// of it stay in one contour, but it is not one of them: it takes no place
     /// in the alternation and is never raised.
     filler: bool,
+    /// True where this loop came out of a solid concentric fill.
+    ///
+    /// Its rings are a wall of the part in everything but their label, so they
+    /// are numbered and raised with the wall beside them — but a slicer labels
+    /// no ring of them the visible wall, not even the outermost, which with
+    /// `wall_loops = 0` *is* the part's outer face. So the anchor has to be
+    /// found for them instead of read off the file; see
+    /// [`Pass::anchor_the_fill`].
+    fill: bool,
     raised: bool,
     /// True where nothing stands on this loop on the next layer, so it has to
     /// finish flat whatever the parity says.
@@ -877,6 +924,10 @@ struct Pass<'a, W: Write> {
     /// exactly as it was found.
     modal: Modal,
     feature: Feature,
+    /// True when the file states a solid fill, so its infill regions are a
+    /// stack of strands this pass staggers along with the wall beside them.
+    /// See [`Survey::solid_fill`].
+    fill: bool,
     layer: usize,
     started: bool,
     layer_z: f64,
@@ -999,6 +1050,7 @@ impl<'a, W: Write> Pass<'a, W> {
             extruder: Extruder::new(),
             modal: Modal::new(),
             feature: Feature::Other,
+            fill: survey.solid_fill,
             layer: 0,
             started: false,
             layer_z: 0.0,
@@ -1216,7 +1268,21 @@ impl<'a, W: Write> Pass<'a, W> {
                 // four-loop wall split down the middle inverts it. A thin wall
                 // arrives the same way and for the same reason, where the wall
                 // narrows to less than two beads for a stretch.
-                let with_the_wall = |feature: Feature| feature.is_perimeter() || is_filler(feature);
+                //
+                // A solid concentric fill is the wall's stack continued
+                // inwards, so it arrives in the same place and must not end
+                // the wall either: the rings either side of that marker are
+                // neighbours a bead apart, and numbered apart they take the
+                // same phase — two raised beads side by side where the
+                // alternation asked for one. With `wall_loops = 0` there is no
+                // perimeter region at all, and this is what makes the fill's
+                // own islands one stack each.
+                let fill = self.fill;
+                let with_the_wall = |feature: Feature| {
+                    feature.is_perimeter()
+                        || is_filler(feature)
+                        || (fill && feature == Feature::SparseInfill)
+                };
                 let continues = self.feature.is_perimeter() && feature.is_perimeter()
                     || !self.loops.is_empty()
                         && with_the_wall(self.feature)
@@ -1381,7 +1447,14 @@ impl<'a, W: Write> Pass<'a, W> {
         // Gap fill only joins the buffer where there is a wall in it to keep
         // whole. Writing it straight out while loops are still buffered would
         // put it ahead of the loops the slicer laid before it.
-        if self.feature.is_perimeter() || self.fills_a_buffered_wall() {
+        //
+        // A solid concentric fill is buffered as loops of its own: its rings
+        // nest, each one the last offset inwards, and that is a wall in
+        // everything but its label. Only where the file's own settings say the
+        // fill is solid and concentric — every other pattern lays long open
+        // strands that have no column to stagger, and raising half of them
+        // would stand beads up in mid-air.
+        if self.feature.is_perimeter() || self.bricked_fill() || self.fills_a_buffered_wall() {
             if self.buffer.is_empty() {
                 self.entry = from;
             }
@@ -1390,6 +1463,17 @@ impl<'a, W: Write> Pass<'a, W> {
         }
 
         self.keep(line, from)
+    }
+
+    /// True where the region in force is a fill this pass may brick; see
+    /// [`Survey::solid_fill`].
+    ///
+    /// Whether a particular strand of it really is bricked is settled later
+    /// and geometrically, by [`Pass::settle_fill_contours`]: a strand takes a
+    /// place in an alternation only where it runs beside another strand AND
+    /// those strands nest.
+    fn bricked_fill(&self) -> bool {
+        self.fill && self.feature == Feature::SparseInfill
     }
 
     /// True where this is a filler region that opened inside a wall this
@@ -1668,6 +1752,23 @@ impl<'a, W: Write> Pass<'a, W> {
         // reaches it, to be printed before the nozzle rises.
         let extrudes = line.draws_in_plane() && delta.is_some_and(|d| d > 0.0);
         let steers = line.is_xy_move();
+        // A move that ends where the nozzle already stands separates nothing,
+        // whatever it is called, as long as it also lays nothing. Bambu writes
+        // `G1 X.. Y.. E0` part-way round a loop of a wall — the same point as
+        // the bead before it, and no filament — and read as a travel it cut the
+        // ring in two: the halves were contoured, numbered and raised apart, so
+        // one stood half a layer proud of the other in the middle of one wall,
+        // and the half that was reordered carried the slicer's stationary move
+        // away from the bead it belonged to. Measured on a real plate, a wipe
+        // left standing 42 mm from the bead it retraces.
+        //
+        // A bare travel to the same point is NOT this: it names no `E` at all,
+        // so the slicer has stopped drawing here — Bambu restates a loop's
+        // first vertex that way when a region declares itself — and the bead
+        // behind it is the first of a new loop.
+        let still = delta == Some(0.0)
+            && line.x.unwrap_or(from.0) == from.0
+            && line.y.unwrap_or(from.1) == from.1;
         let positions = steers || (line.draws() && line.z.is_some());
         let carries = positions && line.e.is_none();
         let places = line.x.is_some() || line.y.is_some();
@@ -1722,13 +1823,14 @@ impl<'a, W: Write> Pass<'a, W> {
                 // wall` in turn with no travel between. Which wall it is, is
                 // whatever any bead of it was labelled.
                 let feature = self.feature;
+                let fill = self.bricked_fill();
                 if let Some(current) = self.loops.last_mut() {
                     current.external |= feature == Feature::ExternalPerimeter;
-                    current.hidden |= feature == Feature::InternalPerimeter;
+                    current.hidden |= feature == Feature::InternalPerimeter || fill;
                     current.filler &= is_filler(feature);
                 }
             }
-        } else if steers {
+        } else if steers && !still {
             self.travelled = true;
         }
     }
@@ -1767,6 +1869,7 @@ impl<'a, W: Write> Pass<'a, W> {
             external: self.feature == Feature::ExternalPerimeter,
             hidden: self.feature == Feature::InternalPerimeter,
             filler: is_filler(self.feature),
+            fill: self.bricked_fill(),
             raised: false,
             capped: false,
             steps: 0,
@@ -1847,6 +1950,7 @@ impl<'a, W: Write> Pass<'a, W> {
         }
 
         self.assign_contours();
+        self.settle_fill_contours();
         self.number_loops();
         self.mark_columns();
         let moved = self.move_walls();
@@ -2500,6 +2604,41 @@ impl<'a, W: Write> Pass<'a, W> {
             current.points = points;
         }
 
+        // A fill's outermost ring is where the part shows, and it has to be
+        // known as the visible one BEFORE the contours are grouped. `taken`
+        // below is what stops a second wall being numbered from the first
+        // one's anchor, and it can only see loops that are already marked —
+        // and a slicer marks the visible wall of a wall, never one of a fill.
+        // Without this, two islands whose fills come within the join distance
+        // chain into one contour and the second island's rings are numbered
+        // from the first island's face, which raises the second island's own
+        // outer ring: the one place a raise is a step on the surface.
+        //
+        // A ring a WALL holds is not one of these. An island's fill runs inside
+        // its wall and is numbered with it, which is what makes the wall and
+        // the fill touching it one stack; marking that ring would split them.
+        if self.fill {
+            for index in 0..self.loops.len() {
+                if !self.loops[index].fill {
+                    continue;
+                }
+                let Some(extent) = self.loops[index].outline else {
+                    continue;
+                };
+                let inside_another_fill = self.loops.iter().enumerate().any(|(other, outer)| {
+                    other != index
+                        && outer.fill
+                        && outer.outline.is_some_and(|held| holds(held, extent))
+                });
+                let beside_a_wall = self.loops.iter().enumerate().any(|(other, wall)| {
+                    other != index && !wall.fill && self.adjacent(other, index)
+                });
+                if !inside_another_fill && !beside_a_wall {
+                    self.loops[index].external = true;
+                }
+            }
+        }
+
         // A loop joins the contour it runs beside, which is not always the one
         // printed just before it: `inner-outer-inner` puts the visible wall
         // between the wall's two halves, so the loop after it is the innermost
@@ -2536,6 +2675,122 @@ impl<'a, W: Write> Pass<'a, W> {
                 opened = index;
             }
             self.loops[index].contour = contour;
+        }
+    }
+
+    /// True where a loop's path comes back to where it started, so it is a
+    /// ring around something rather than a pass of a fill.
+    ///
+    /// The same test, at the same tolerance, that decides whether the visible
+    /// wall may be moved. A ring does not return exactly to its start — the
+    /// slicer stops a bead short so the two ends do not pile up at the seam,
+    /// measured 0.0385 to 0.0411 mm over 308 real loops — so one stated bead
+    /// width, ten times that, separates a ring from a strand that runs away.
+    ///
+    /// It is also what tells a concentric fill from a solid one that lays its
+    /// strands across each other. Measured on a real 100%-infilled plate: a
+    /// `concentric` region comes out as 455 closed runs on a layer, every one
+    /// of them closing within 0.06 mm, and a `zig-zag` one as 46 open runs
+    /// whose ends are 7 to 35 mm apart.
+    fn closes_on_itself(&self, current: Loop) -> bool {
+        let Some(last) = (current.body..current.end)
+            .rev()
+            .find(|&at| self.buffer[at].extrudes)
+        else {
+            return false;
+        };
+        let entry = match current.body {
+            0 => self.entry,
+            body => self.buffer[body - 1].at,
+        };
+        let closes = self.buffer[last].at;
+        (closes.0 - entry.0).hypot(closes.1 - entry.1) < self.skin_width
+    }
+
+    /// Settles every contour that holds bricked fill: whether its strands are
+    /// a stack a stagger may run through, and which of them is the visible
+    /// face where the file names no wall of its own.
+    ///
+    /// A fill is bricked because its strands run BESIDE EACH OTHER — the same
+    /// test that makes a wall's loops one wall, and it is measured rather than
+    /// taken from the label. What that test alone does not say is whether the
+    /// strand one layer up is the SAME strand. A `concentric` fill insets the
+    /// region's own outline again and again, so its rings NEST — one inside
+    /// the next — and the pattern is the same on every layer. A `zig-zag` at
+    /// full density does not: it is one serpentine per island whose strands
+    /// are joined at the ends, and Bambu rotates it 90° every layer —
+    /// measured on a real plate, layer 62 runs at 45° and layer 63 at 135°.
+    /// Raise half of that and every ridge is crossed at right angles by the
+    /// layer above over the whole of its length, with nothing at the same
+    /// place to bond to and the nozzle coming back through it.
+    ///
+    /// Nesting is what separates the two, and it is the extent each loop
+    /// already measured: nested strands lie one inside the next, strands laid
+    /// across each other do not. Where they do not nest the contour's fill is
+    /// left on its plane, metered as the slicer metered it — the state
+    /// [`is_filler`] already puts gap fill and a thin wall in, and for the
+    /// same reason: no place in the alternation, and no wall flow. The wall
+    /// loops of such a contour are untouched, since a wall's strands do stack
+    /// however its fill was laid.
+    ///
+    /// A stack that holds no visible wall is then anchored by its outermost
+    /// ring. Everything here hangs off the slicer naming one loop the visible
+    /// one: it takes phase zero, which is flat, and it is the one loop drawn
+    /// inward by half the width the flow gives it. A fill has no such label,
+    /// and with `wall_loops = 0` there is no perimeter region in the file at
+    /// all — its outermost strand *is* the part's outer face, so left
+    /// unanchored the numbering falls back to counting from the far end, which
+    /// raises that strand by half a layer, puts a step right on the surface of
+    /// the part, and then scales it without moving it, so the part grows by
+    /// half the width the bead gained.
+    fn settle_fill_contours(&mut self) {
+        if !self.fill {
+            return;
+        }
+        let mut start = 0;
+        while start < self.loops.len() {
+            let contour = self.loops[start].contour;
+            let mut end = start + 1;
+            while end < self.loops.len() && self.loops[end].contour == contour {
+                end += 1;
+            }
+            let strands: Vec<usize> = (start..end)
+                .filter(|&at| !self.loops[at].filler && self.loops[at].fill)
+                .collect();
+            let (rings, passes): (Vec<usize>, Vec<usize>) = strands
+                .into_iter()
+                .partition(|&at| self.closes_on_itself(self.loops[at]));
+            // A pass of a fill that does not come back on itself is not a
+            // ring, and lives on its plane whatever the strands beside it do.
+            for at in passes {
+                self.loops[at].filler = true;
+            }
+            if !rings.is_empty() {
+                // One ring is not a stack. An inner wall exists only because
+                // the slicer inset it from the wall beside it, so a lone wall
+                // loop always has the visible one next to it — but a fill can
+                // be alone in an island that holds a single ring, and half a
+                // layer of step on a bead with nothing beside it is a ridge
+                // with nothing to bond to.
+                let outer = (rings.len() > 1)
+                    .then(|| widest(&self.loops[..end], &rings))
+                    .flatten();
+                match outer {
+                    Some(outer) => {
+                        if !(start..end).any(|at| self.loops[at].external) {
+                            self.loops[outer].external = true;
+                        }
+                    }
+                    // Nothing measured an extent, so nothing says which ring
+                    // is the outside.
+                    None => {
+                        for at in rings {
+                            self.loops[at].filler = true;
+                        }
+                    }
+                }
+            }
+            start = end;
         }
     }
 
@@ -3069,6 +3324,14 @@ impl<'a, W: Write> Pass<'a, W> {
         // learn it from [`Buffered::marker`]; this one never buffers.
         if declares_region(&line) {
             self.wrote_marker = self.ambient;
+        }
+        // The width is modal too, and a line that states it is what the output
+        // now carries. Any other line has to leave the output on the width the
+        // FILE has in force at that point; see [`Pass::settle_width`].
+        if is_a_width(line) {
+            self.wrote_width = self.width;
+        } else {
+            self.settle_width()?;
         }
         let delta = line
             .e
@@ -3708,7 +3971,7 @@ impl<'a, W: Write> Pass<'a, W> {
     fn matching_charge(&self, delta: f64, wanted: f64) -> f64 {
         let difference = self.withdrawn - wanted - self.stopped.unwrap_or(0.0);
         let adjusted = delta + difference;
-        if delta < 0.0 {
+        if delta <= 0.0 {
             adjusted.min(0.0)
         } else {
             adjusted.max(0.0)
@@ -3768,6 +4031,35 @@ impl<'a, W: Write> Pass<'a, W> {
         // Plain `Display`, not `{:.0}`: the rate was read off the file, and
         // rounding it hands the print back a speed it never asked for.
         writeln!(self.out, "G1 F{rate} ; {BRICK_STAMP}resume")
+    }
+
+    /// Puts the output back on the width the FILE has in force.
+    ///
+    /// `; LINE_WIDTH:` is modal: a slicer states it once for a region and the
+    /// regions behind it inherit whatever was declared last, so a region that
+    /// states none of its own is one the region before it metered. This pass
+    /// writes a wall's loops in another order, each carrying the declaration
+    /// it was read under, so the width the output is left standing in at the
+    /// end of one is not the one the file has there — and every line written
+    /// straight through after it then inherits the wrong one.
+    ///
+    /// Measured on a real plate whose inner wall and whose sparse infill are
+    /// both declared at 0.45 while its visible wall is 0.42: **52066 mm of
+    /// 165303 mm, a third of the file's beads, came out under the outer wall's
+    /// width**, because the infill states no width of its own and the last
+    /// declaration in front of it had become the reordered wall's.
+    ///
+    /// Discharged lazily, at the next line that goes straight out, and never
+    /// inside a `G20`/`G91` section — a comment is inert there, but nothing
+    /// this pass writes belongs in one either.
+    fn settle_width(&mut self) -> io::Result<()> {
+        if self.width == self.wrote_width || !self.modal.is_plain() {
+            return Ok(());
+        }
+        let width = self.widths[self.width].clone();
+        write_line(&mut self.out, &width)?;
+        self.wrote_width = self.width;
+        Ok(())
     }
 
     /// Puts the nozzle back on the plane a deferred region left it above,

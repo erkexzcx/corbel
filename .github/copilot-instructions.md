@@ -98,7 +98,7 @@ leaves the input intact and `--verbose` says whether anything happened:
 
 ```sh
 cargo run -- --bricks --zaa --verbose --output /tmp/out.gcode ~/Downloads/part.gcode
-# corbel: 90 layers, 180 perimeter loops, 53 raised by 0.100 mm
+# corbel: 90 layers, 180 loops, 53 raised by 0.100 mm
 # corbel: 4928.6 mm filament, 6.2% of it in raised loops; a flow of 1.025 adds 0.45% to the part
 # corbel: 1168 surface moves on 86 layers followed from -0.080 to +0.100 mm of their plane, written as 3041 moves
 ```

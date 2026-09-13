@@ -40,18 +40,22 @@ They are inputs, not expectations. tests/collision.rs runs the binary over them
 and replays a nozzle across the result.
 
 
-baseline.gcode.zst, and the twenty named after the one setting each changes:
-arachne, arachne-thinwall, fuzzy-skin, gapfill-off, inner-outer-inner,
-layer-max, layer-thin, nasty-combo, no-arcs, no-prime-tower, no-zhop,
-outer-first, scarf-seam, seam-back, seam-random, walls-1, walls-3, walls-6,
-zhop-normal, zhop-spiral.
+baseline.gcode.zst, and the twenty-four named after the one setting each
+changes: arachne, arachne-thinwall, fuzzy-skin, gapfill-off,
+infill-solid, infill-solid-1wall, infill-solid-2walls, infill-solid-zigzag,
+inner-outer-inner, layer-max, layer-thin, nasty-combo, no-arcs, no-prime-tower,
+no-zhop, outer-first, scarf-seam, seam-back, seam-random, walls-1, walls-3,
+walls-6, zhop-normal, zhop-spiral.
 
-One plate, sliced twenty-one ways. Every one of them is `complex-figures.3mf`
-— fourteen of the primitives Bambu
-Studio offers from its right-click menu, plus a 3DBenchy and a torture test —
-sliced by Bambu Studio 02.08.02.61 for a **Bambu Lab P1S with a 0.8 mm nozzle
-at 0.4 mm layers**, which is a coarser regime than anything else in this
-directory and exercises the flow ceiling rather than the middle of the range.
+One plate, sliced twenty-eight ways — and **the only fixture set here that can
+be made again.** It is `tests/fixtures/generator/manyparts.3mf`: fourteen parts
+of real modelling, sliced by Bambu Studio 02.08.02.61 for a **Bambu Lab P1S
+with a 0.4 mm nozzle at 0.2 mm layers**. The script that does it sits beside
+the plate, and a plain run of it rewrites exactly these twenty-eight files:
+
+```sh
+tests/fixtures/generator/generate.py "flatpak run com.bambulab.BambuStudio"
+```
 
 `baseline.gcode.zst` is the profile as saved: 2 walls, classic generator,
 `wall_sequence` "inner wall/outer wall", arc fitting on, `z_hop` 0.4 mm Auto
@@ -59,20 +63,72 @@ Lift, aligned seam, printed by layer. **Every other file changes exactly one
 setting**, and the setting is in the name — except `nasty-combo.gcode.zst`,
 which turns on everything awkward at once.
 
-Each was checked to differ from `baseline` before being stored, in the header
-it declares AND in what the binary then does with it. A fixture that does not
-reach the feature it is named for is worse than no fixture, because it reports
-a pass nobody earned: on the first attempt the settings were written into the
-project JSON as numbers where that file stores strings, Bambu Studio silently
-fell back to profile defaults, and six variants were byte-identical to the
-baseline while appearing to have worked.
+Each is checked against the baseline on the way out, twice, which is the rule
+`generate.py` exists to enforce: a fixture that does not reach the feature it
+is named for is worse than no fixture, because it reports a pass nobody earned.
+The G-code must come back naming the new value in its own settings block —
+Bambu Studio drops a number where that file stores strings, and takes a value
+it does not recognise without a word — and what the binary does with it must
+move off the baseline's own counts by more than the slicer's run-to-run noise.
 
-They are windows, not whole plates: layers 30 to 54, with the file's own head
+They are windows, not whole plates: layers 60 to 75, with the file's own head
 kept in front so the start G-code, the settings block and the machine's own
-below-the-bed nozzle wipe are all still there. Whole plates come to 38 MB,
-which the suite cannot afford to run — `--bricks --zaa` over one is 34 seconds
-against a debug build. The window keeps every object present and reaches both
-transforms: 669 loops raised and 1312 surface moves on the baseline.
+below-the-bed nozzle wipe are all still there. Whole plates come to 14.9 MB.
+Layers 60 to 75 keep every object that reaches that high and reach both
+transforms: **788 loops, 325 of them raised, and 452 surface moves** on the
+baseline. The `infill-solid*` four are eight layers rather than sixteen, since
+a plate whose fill is laid solid is half as much G-code again per layer.
+
+The plate earned its keep on the first run. Two faults in this binary, both
+of them present on `main`, neither of them reachable from any other fixture
+here:
+
+- `--bricks` reordered a wall and left a **different `; LINE_WIDTH:` standing
+  over the regions behind it**. The width is modal — a slicer states it once
+  and the regions behind it inherit it — so the sparse infill, which states
+  none of its own, came out under the outer wall's. Measured: **52066 mm of
+  165303 mm, a third of the file's beads, drawn at a width the slicer did not
+  declare for it.**
+- Bambu writes `G1 X.. Y.. E0` part-way round a loop of a wall: the same point
+  as the bead before it, and no filament. Read as a travel it **cut the ring in
+  two**, so the halves were contoured, numbered and raised apart — half a layer
+  of step in the middle of one wall — and the half that was reordered carried
+  the slicer's stationary move with it.
+
+`no-prime-tower.gcode.zst` is the one variant that reaches nothing: this plate
+prints one filament and Bambu builds no tower for it, so the file differs from
+the baseline in its settings block and nowhere else. It is kept because the
+setting is worth pinning where it is stated, and the script marks it out as
+`settings only` when it writes the set.
+
+`infill-solid.gcode.zst`, `-1wall`, `-2walls`, `-zigzag`
+
+The same plate with its fill laid **solid** instead of at 15%: `sparse_infill_density` 100%, and `wall_loops` 0, 1 and 2. Fourteen objects, eight layers each,
+none of them a wall stack for most of its body. They are here because a fill at
+full density is a wall in everything but its label — its strands are laid
+against each other, and with `wall_loops = 0` the outermost of them is the
+part's visible face. `--bricks` used to do nothing at all on one of these.
+
+`infill-solid-zigzag` is the negative control, and is stored so that the
+transform is held to declining it rather than reaching it. `concentric` and
+`zig-zag` are the only two patterns Bambu Studio will lay at full density at
+all — asked for `grid`, `line` or `rectilinear` it exits 238 with
+`doesn't work at 100% density` — and of the two only the concentric one is a
+stack of rings: measured on this plate, a layer of it is 455 runs every one of
+which closes within 0.06 mm, against 46 open runs whose ends are 7 to 35 mm
+apart. `zig-zag` is also **rotated a quarter turn every layer** — layer 62 runs
+at 45° and layer 63 at 135°, where the concentric fill runs at 90° and 0° — so
+a raised strand has nothing at the same place above it and the next layer cuts
+straight through the ridge. `generate.py` marks that variant `expects="declined"`
+and fails the run if any loop is raised on it.
+
+The three concentric ones are the positive cases at the three wall counts. What
+they prove is the plate's own counts — 2 walls of a fourteen-object plate
+cannot raise 1264 loops on their own — and the `plates.rs` test over each pins
+that the run is still sound G-code and still carries every region marker. Over
+their eight layers `infill-solid` reports 3460 loops with 1224 raised,
+`-1wall` 3534 with 1211, `-2walls` 3523 with 1264, against the same plate at
+15% fill reporting 1095 and 475.
 
 Regenerating them, and the traps in doing so, is
 `.github/skills/fixtures-generation/SKILL.md`.
@@ -81,29 +137,41 @@ Two variants are deliberately absent. `print_sequence = by object` and
 `spiral_mode` both need a plate this one is not — sequential printing refuses
 these objects as too tall and too close, and spiral vase refuses more than one
 object. `ironing_type` will not take on this project at any of its four values.
+A tool change is absent too, and cannot be patched in: this plate's process
+profile is written for a P1S, and pointing the machine at a two-nozzle H2D gets
+`process not compatible with printer`, exit -17. Absolute `E` is absent for a
+quieter reason — `use_relative_e_distances = 0` is accepted and echoed back
+while the G-code comes out with `M83` and relative filament anyway.
 
-3DBenchy is by Creative Tools, CC BY-ND 4.0 (unmodified). The remaining
-primitives are Bambu Studio's own built-in shapes.
+The plate is Bambu Studio's own built-in shapes, and it carries a 3DBenchy by
+Creative Tools, CC BY-ND 4.0 (unmodified).
 
 
-support.gcode.zst
 
-A ten-layer window of a real tree-support print, sliced by Bambu Studio for a
-0.4 mm nozzle, kept behind the file's own header and config block and
-compressed with zstd. It carries 51 `; FEATURE: Support` regions and 30 of
-`Support interface`.
+support.gcode.zst, support-grid.gcode.zst
 
-It is not the same plate as the rest, and it could not be: `enable_support` on
-that plate exits -101, because the objects sit close enough that their support
-paths conflict. So the suite had no supports at all until this, and every
-question about what this tool does to material it must not touch went unasked.
-Two defects were sitting in that gap — 5136 wall beads written under the
-support's own `; FEATURE:` marker, and so at its fan speed, and 8902 retractions
-added to a file with 13234.
+Two windows of the plate above with supports switched on: the one region
+nothing else here carries, and the one thing in this tool that may touch
+nothing — material printed to be broken off, one bead wide, tall and unbraced,
+with no wall to raise and nothing above a step to meet.
 
-The window is where it is because the tree supports are there: ten layers with
-supports under an overhang, walls flaring above them, and enough of both
-transforms to matter (379 loops raised, 23 surfaces followed).
+They are the two shapes a wall can meet support in. `support` is the plate's
+own `support_type` of `tree(auto)`, which stands *beside* a wall — 99 support
+regions inside its window, 365 loops and 122 of them raised, in eight layers.
+`support-grid.gcode.zst` is `normal(auto)` in `grid`, which stands *under* the
+walls: 31 support regions and 21 of `Support interface`, and **0 loops raised
+out of 211**, because a wall laid on support is held flat. Both are needed; the
+rule that holds that wall flat is not visible from the tree shape alone.
+
+These are the two fixtures behind the defect history here — 5136 wall beads
+once came out under the support's own `; FEATURE:` marker and so at its fan
+speed, and 8902 retractions were added to a file with 13234. Both were found on
+a real tree-support print that stood here in their place. These two are sliced
+from the plate beside the generator instead, so they can be made again; the
+trouble is that Bambu will not slice supports on that plate as saved — the
+objects sit close enough that their tree supports run into each other, exit -101
+— so `generate.py` arranges it first (`--arrange 1`) and stores the first of
+the two plates that arrangement produces.
 
 
 cone.gcode.zst

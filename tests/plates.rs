@@ -11,6 +11,11 @@
 //! They were verified to differ before being stored: a fixture that does not
 //! reach the feature it is named for is worse than no fixture, because it
 //! reports a pass nobody earned. See `tests/fixtures/SOURCE.txt`.
+//!
+//! The whole set is made again by `tests/fixtures/generator/generate.py` from
+//! the plate beside it, which is what `--variant` there names — so a variant
+//! that stops reaching its feature can be re-sliced rather than pinned as it
+//! was found.
 
 mod nozzle;
 
@@ -341,6 +346,74 @@ fn a_single_wall_with_nothing_behind_it() {
     );
 }
 
+/// A plate whose fill is its whole body — `wall_loops = 0` at 100% density, so
+/// the slicer writes no perimeter region at all and the rings of the fill ARE
+/// the part's visible face.
+///
+/// Bricking used to do nothing on a file like this: the region is labelled
+/// `Sparse infill`, which is not a wall, so nothing was buffered and no loop
+/// was ever raised. The strands of a fill laid against each other are a wall's
+/// loops in everything but their label, and this is what says they are treated
+/// as one: the plate's own counts, which a 14-object plate of walls alone
+/// cannot reach.
+///
+/// Three of them. `infill-solid` has no wall at all, so the fill is the only
+/// stack the file has and its outermost ring is the part's outer face —
+/// raising that would be a half-layer step on the visible surface and would
+/// grow the part by the width the bead gained. `infill-solid-1wall` puts one
+/// wall round it and `infill-solid-2walls` two, which is the case where the
+/// wall's loops and the fill's rings TOUCH: the alternation then has to run
+/// through both as one contour, or the two stacks are numbered apart and take
+/// the same phase at the joint.
+///
+/// The `zig-zag` one is the opposite: the other pattern Bambu will lay at full
+/// density, and the one that must NOT be raised. Its strands are joined at the
+/// ends, so one run is a single serpentine rather than a ring, and the slicer
+/// rotates it 90° every layer — layer 62 runs at 45° and layer 63 at 135° on
+/// this plate, where a concentric fill runs at 90° and 0°. A raised strand
+/// would be crossed at right angles by the layer above over the whole of its
+/// length, so the transform declines it.
+macro_rules! solid_infill {
+    ($($name:ident => $tag:literal,)*) => {
+        $(
+            #[test]
+            fn $name() {
+                bricked($tag);
+            }
+        )*
+    };
+}
+
+solid_infill! {
+    a_fill_with_no_wall_to_hold_it => "infill-solid",
+    a_fill_inside_one_wall => "infill-solid-1wall",
+    a_fill_inside_two_walls => "infill-solid-2walls",
+}
+
+/// A solid fill whose strands are NOT a stack, and must be left alone.
+///
+/// `zig-zag` lays one serpentine per island and the slicer rotates it a
+/// quarter turn every layer, so a strand has nothing at the same place above
+/// it. Raising half of them puts a ridge across the island that the next layer
+/// cuts through, which is a defect this transform exists to avoid rather than
+/// one it may introduce. Measured on this plate: 46 open runs a layer whose
+/// ends are 7 to 35 mm apart, against 455 closed rings on a concentric one.
+#[test]
+fn a_solid_fill_that_does_not_stack_is_left_alone() {
+    let tag = "infill-solid-zigzag";
+    let source = plate(tag);
+    let (gcode, said) = processed(tag, &source, &["--bricks"]);
+    assert_sound(tag, &["--bricks"], &source, &gcode, 0.0, Some(&said));
+    let raised = gcode
+        .lines()
+        .filter(|line| line.contains("corbel brick raised"))
+        .count();
+    assert_eq!(
+        raised, 0,
+        "{tag}: a fill whose strands do not stack has no column to stagger"
+    );
+}
+
 /// One test per plate rather than one loop over all of them, so the suite
 /// spreads them over the cores it has and a failure names the dialect.
 macro_rules! plates {
@@ -404,28 +477,36 @@ surfaces! {
     a_surface_over_every_awkward_setting_at_once => "nasty-combo",
 }
 
-/// A plate with supports under it.
+/// A plate with supports under it — two plates, in fact, and two shapes.
 ///
-/// Not the same plate as the rest: `enable_support` will not slice on that one
-/// — the objects sit too close and their support paths conflict — so this is a
-/// window of a real tree-support print instead. It is the only fixture here
-/// that carries `; FEATURE: Support`, and without it nothing in the suite ever
-/// asked what this tool does to material it must not touch.
+/// `support` is this plate's own `tree(auto)`: the unbraced, one-bead-wide
+/// shape both support defects were found on, and the only fixture here that
+/// carries `; FEATURE: Support` at all. `support-grid` is `normal(auto)` in
+/// `grid`, where the support sits *under* the walls one bead wide instead of
+/// beside them, which is the other half of the same question — 31 support
+/// regions and 21 of `Support interface` inside its window.
+///
+/// Neither is the plate the rest of the set came from: Bambu will not slice
+/// supports on it as saved (the objects' support paths conflict), so the
+/// script arranges the plate first, and the fixtures come from the first of
+/// the two plates that arrangement produces.
 #[test]
 fn supports_are_left_exactly_where_the_slicer_put_them() {
-    let source = plate("support");
-    for args in [
-        ["--bricks"].as_slice(),
-        ["--zaa"].as_slice(),
-        ["--bricks", "--zaa"].as_slice(),
-    ] {
-        let (gcode, said) = processed("support", &source, args);
-        // Only a run without the surface transform can be held to its own
-        // printed claim; the surface transform re-meters what it reshapes.
-        let following = args.contains(&"--zaa");
-        let claim = (!following).then_some(said.as_str());
-        let allowance = if following { SURFACE_CREST } else { 0.0 };
-        assert_sound("support", args, &source, &gcode, allowance, claim);
+    for tag in ["support", "support-grid"] {
+        let source = plate(tag);
+        for args in [
+            ["--bricks"].as_slice(),
+            ["--zaa"].as_slice(),
+            ["--bricks", "--zaa"].as_slice(),
+        ] {
+            let (gcode, said) = processed(tag, &source, args);
+            // Only a run without the surface transform can be held to its own
+            // printed claim; the surface transform re-meters what it reshapes.
+            let following = args.contains(&"--zaa");
+            let claim = (!following).then_some(said.as_str());
+            let allowance = if following { SURFACE_CREST } else { 0.0 };
+            assert_sound(tag, args, &source, &gcode, allowance, claim);
+        }
     }
 }
 

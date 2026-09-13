@@ -1033,9 +1033,47 @@ The triage of that project's issues and pull requests — what is a real defect,
 what was refuted by measurement, and what is still unverified — is in
 [references/upstream-tracker.md](./references/upstream-tracker.md).
 
-A slicer run with `wall_loops = 0` and 100% concentric infill lays a stack of
-nested rings with no perimeter region in the file at all — the geometry of a
-1000-wall slice without the `Top surface` regions that route makes the slicer
-invent. `--bricks` does nothing on it today. The measurements, the two cases
-that must stay unraised, and the change in the order it has to be made are in
+A slicer run with `wall_loops = 0` and 100% infill lays a stack of strands with
+no perimeter region in the file at all — the geometry of a 1000-wall slice
+without the `Top surface` regions that route makes the slicer invent. It is
+bricked, from the outermost strand inwards, and the two cases that must stay
+unraised, the two geometric tests that separate them and the change in the
+order it was made are in
 [references/infill-bricking.md](./references/infill-bricking.md).
+
+**A fill at full density is a wall in everything but its label, and whether it
+is one is MEASURED, never read off the pattern.** `Survey.solid_fill` says only
+that the file states a solid fill, and it is the one thing both passes need to
+agree on before the pass begins — the survey draws those beads into `here`, and
+the rewrite buffers them as loops, so a file one of them counted and the other
+did not would cap a column the other raised. Whether a given strand may take a
+place in the alternation is answered afterwards, per contour, by
+`Pass::settle_fill_contours`:
+
+1. **It must be a ring.** `Pass::closes_on_itself` — its path returns to where
+   it started, within one stated bead width, which is the tolerance
+   `move_walls` already uses and for the same reason. Measured on a real plate,
+   a concentric fill is 455 closed runs a layer and a `zig-zag` one 46 open
+   runs whose ends are 7 to 35 mm apart.
+2. **The rings must nest** — `outermost`, one loop whose extent holds every
+   other's. Nested strands lie one inside the next, so the strand one layer up
+   is the same strand at the same place. `zig-zag` fails this too, and it is
+   the one that matters: the slicer rotates it a quarter turn every layer, so a
+   raised strand is crossed at right angles by the layer above over the whole
+   of its length and the nozzle comes back through the ridge.
+
+What fails either test is demoted to `filler` — no place in the alternation and
+no wall flow — which is what keeps a sparse fill, a serpentine and a lone ring
+out. **Do NOT decide this from `sparse_infill_pattern`:** the pattern names how
+the slicer MEANT to fill the region, and this is about where the strands
+afterwards are. Do NOT raise the outermost ring of a wall-less part either: it
+is the visible face, `Loop::external` is never set on a fill loop, and the
+fallback numbering runs from the far end — so `settle_fill_contours` marks it
+the anchor, which is what keeps both the step off the surface and the wall
+flow's inward move on it. Pinned by
+`brick::tests::a_fill_that_is_the_whole_part_is_bricked_from_its_outermost_ring`,
+`a_solid_fill_that_runs_away_from_itself_is_not_raised`,
+`a_lone_fill_ring_is_left_on_its_plane`,
+`a_wall_and_the_fill_touching_it_alternate_as_one_stack`, and by
+`tests/plates.rs` over `infill-solid`, `infill-solid-1wall`,
+`infill-solid-2walls` and `infill-solid-zigzag`.

@@ -30,6 +30,12 @@ pub struct Settings {
     /// Width the internal perimeters are metered at, in mm, resolved against
     /// the nozzle where the profile states it as a percentage.
     pub wall_width: Option<f64>,
+    /// How much of the interior the fill was asked to cover, exactly as the
+    /// profile stated it. Full density is what says the strands of a fill
+    /// region run beside each other rather than millimetres apart, which is
+    /// the one thing bricking needs to know about an infill region; see
+    /// [`Survey::solid_fill`](crate::scan::Survey::solid_fill).
+    pub fill_density: Option<String>,
     /// Where the slicer will finally put the file. Post-processing scripts are
     /// handed a temporary path, so this is the only name the user recognises.
     pub output_name: Option<String>,
@@ -69,6 +75,7 @@ impl Settings {
                 get(&["perimeter_extrusion_width", "inner_wall_line_width"]).as_deref(),
                 nozzle,
             ),
+            fill_density: get(&["fill_density", "sparse_infill_density"]),
             output_name: get(&["pp_output_name"]),
         }
     }

@@ -1,2 +1,8 @@
 /target
 __pycache__/
+
+# Bambu Studio writes its slice result beside the G-code it was asked for, into
+# whatever `--outputdir` names. A run started from this directory with
+# `--outputdir .` leaves one here; the generator writes its output into
+# `--work` instead, so it never does.
+/result.json

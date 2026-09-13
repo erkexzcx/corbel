@@ -236,6 +236,19 @@ impl Source {
         Survey::read(self.reader()?).map_err(|source| Error::io(&self.path, source))
     }
 
+    /// The same, with the fill density the slicer exported taken into account
+    /// where the file states none of its own.
+    ///
+    /// A slicer exports its whole profile to a post-processing script, and not
+    /// every slicer writes that profile into the G-code it produces — so a run
+    /// driven by one has to be told before the pass begins, since the survey
+    /// draws the cells capping is measured against as it reads. See
+    /// [`Survey::read_with`].
+    pub fn survey_with(&self, fill_density: Option<&str>) -> Result<Survey> {
+        Survey::read_with(self.reader()?, fill_density)
+            .map_err(|source| Error::io(&self.path, source))
+    }
+
     /// A destination that will replace `target` with this file's container
     /// format once the rewrite is complete.
     ///

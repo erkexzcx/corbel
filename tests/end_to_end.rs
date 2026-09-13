@@ -668,7 +668,7 @@ fn verbose_reports_a_summary() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("5 layers"), "{stderr}");
     // Three walls a layer, the visible one included.
-    assert!(stderr.contains("15 perimeter loops"), "{stderr}");
+    assert!(stderr.contains("15 loops"), "{stderr}");
     // One per layer, less the bed layer, which is never raised, and the top
     // one, which caps the wall flat.
     assert!(stderr.contains("3 raised"), "{stderr}");
@@ -1685,7 +1685,7 @@ fn both_transforms_at_once_leave_coherent_gcode() {
     assert!(spent > 0.0);
 
     let report = String::from_utf8_lossy(&output.stderr);
-    assert!(report.contains("perimeter loops"), "{report}");
+    assert!(report.contains(" loops"), "{report}");
     assert!(report.contains("surface moves on"), "{report}");
 }
 

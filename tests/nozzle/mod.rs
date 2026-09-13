@@ -870,7 +870,17 @@ pub fn ledger(gcode: &str) -> Ledger {
             bead_layer = layer;
         }
         if line.draws_in_plane() && delta.is_some_and(|value| value <= 0.0) {
-            let key = format!("{bead_layer}:{:?}:{:?}:{:?}", line.code, line.x, line.y);
+            // A wipe is identified by the LAYER it belongs to and the kind of
+            // move it is, never by the coordinates the slicer wrote on it.
+            // The visible wall is deliberately drawn in by half the width the
+            // flow adds, and a wipe that retraces a bead moves with it: on a
+            // real plate whose outer wall opens with a stationary `E0` at the
+            // seam — Bambu writes one on every loop at 0.08 mm layers — that
+            // line came out 1 to 2 µm from where it went in, which read as a
+            // wipe lost while the wipe was exactly where it should be. Where
+            // it starts is still checked, against the bead it retraces and at
+            // half a bead of tolerance, by `ledger.wipe_starts`.
+            let key = format!("{bead_layer}:{:?}", line.code);
             book.wipes.push(key.clone());
             book.wipe_starts
                 .entry(key)
@@ -1125,6 +1135,7 @@ pub fn faults(before: &Ledger, after: &Ledger, said: Option<&str>) -> Vec<String
 
     for (key, starts) in &before.wipe_starts {
         let Some(wrote) = after.wipe_starts.get(key) else {
+            // Already reported by `lost`, which counts them per layer.
             continue;
         };
         let mut remaining = wrote.clone();

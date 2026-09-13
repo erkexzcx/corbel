@@ -205,6 +205,30 @@ pub struct Survey {
     /// infill leaves no perimeter region in the file at all, while the flat
     /// top that infill builds is 6637 moves of surface for `--zaa` to follow.
     pub surfaces: usize,
+    /// True when the file states a fill that is solid — every strand of it
+    /// laid against the one beside it — so its infill regions are a stack of
+    /// touching loops a stagger can run through.
+    ///
+    /// **Deliberately not a question about the pattern.** A `concentric` fill
+    /// insets the region's own outline again and again until it meets itself
+    /// and a `rectilinear` one lays parallel strands a bead apart, and at full
+    /// density both come out as the same thing: a stack of beads running
+    /// beside each other, the same stack on every layer, each strand the last
+    /// one offset sideways. That is a wall in everything but its label, and
+    /// the rewrite treats it as one — where the strands really do run beside
+    /// each other, which it measures for itself loop by loop rather than
+    /// taking this flag's word for it. What this flag decides is only whether
+    /// they may be *looked for*: a fill at 15% lays its strands millimetres
+    /// apart, and raising half of those stands a bead up beside nothing.
+    ///
+    /// Read from the file's own settings block, which every slicer that
+    /// writes one puts at the head of the file, or from the `SLIC3R_*` the
+    /// slicer exports to a post-processing script — the two are merged before
+    /// the pass begins, since the survey has to know it while it draws the
+    /// cells capping is measured against. A file that states neither states
+    /// nothing to brick from, and is treated as the sparse-filled file it
+    /// looks like.
+    pub solid_fill: bool,
     /// Region markers whose label named nothing this tool knows, in either
     /// dialect.
     ///
@@ -267,7 +291,18 @@ pub struct Survey {
 
 impl Survey {
     pub fn of(source: &str) -> Self {
+        Self::of_with(source, None)
+    }
+
+    /// The same, with the fill density the slicer exported taken into account
+    /// and applied only where the file states none of its own.
+    ///
+    /// The two have to be merged before the pass begins rather than after it:
+    /// the survey draws the cells capping is measured against as it reads, so
+    /// a fill it does not know is solid is left out of every one of them.
+    pub fn of_with(source: &str, fill_density: Option<&str>) -> Self {
         let mut scan = Scan::default();
+        scan.note_exported_fill(fill_density);
         for raw in source.lines() {
             scan.feed(raw);
         }
@@ -276,7 +311,14 @@ impl Survey {
 
     /// Surveys a stream, reading it once and keeping none of it.
     pub fn read<R: BufRead>(reader: R) -> io::Result<Self> {
+        Self::read_with(reader, None)
+    }
+
+    /// The same, with the slicer's own exported fill density available to a
+    /// file that states none. See [`Survey::of_with`].
+    pub fn read_with<R: BufRead>(reader: R, fill_density: Option<&str>) -> io::Result<Self> {
         let mut scan = Scan::default();
+        scan.note_exported_fill(fill_density);
         let mut lines = Lines::new(reader);
         // True while a line too long to be held whole is arriving in pieces.
         // A piece is not a line: a command is a few dozen bytes and a marker
@@ -455,6 +497,16 @@ struct Scan {
     skin_width: Option<String>,
     wall_width: Option<String>,
     nozzle: Option<String>,
+    /// The fill density exactly as the settings block or the slicer's own
+    /// environment stated it. That is what says whether the strands of a fill
+    /// region run beside each other or millimetres apart; see
+    /// [`Survey::solid_fill`].
+    infill_density: Option<String>,
+    /// True while that says the fill is solid. Settled as it is read, so it
+    /// is known before the first bead of a file whose settings block sits at
+    /// its head — which is every slicer that writes one — and from the start
+    /// where the slicer exported it.
+    solid_fill: bool,
     /// Distinct upward Z steps and how often each was seen, so the commonest
     /// one can stand in for a layer height the file never states.
     z_steps: Vec<(i64, usize)>,
@@ -582,6 +634,41 @@ impl Scan {
         }
     }
 
+    /// Settles whether the file's fill is one a stagger may be looked for in;
+    /// see [`Survey::solid_fill`].
+    fn settle_infill(&mut self) {
+        self.solid_fill = self.infill_density.as_deref().is_some_and(is_solid_density);
+    }
+
+    /// Takes the fill density a slicer exported to a post-processing script,
+    /// for a file that states none of its own.
+    ///
+    /// Applied first and replaced by anything the file itself states: the
+    /// settings block at the head of a sliced file is what that file was
+    /// actually sliced with, and the environment describes the profile the
+    /// slicer has loaded now, which a user may have edited since.
+    fn note_exported_fill(&mut self, stated: Option<&str>) {
+        let stated = stated.map(str::trim).filter(|stated| !stated.is_empty());
+        if let Some(stated) = stated {
+            self.infill_density = Some(stated.to_owned());
+            self.settle_infill();
+        }
+    }
+
+    /// True where the region in force is a fill the rewrite bricks: the file
+    /// states a solid fill, and the slicer is labelling its strands
+    /// [`Feature::SparseInfill`].
+    ///
+    /// Whether a given strand really may be raised is the rewrite's own
+    /// question and it answers it geometrically — a strand is bricked only
+    /// where it runs beside another loop, which is the same test that groups
+    /// a wall — but the survey has to know the file holds a candidate fill at
+    /// all, because it draws the cells capping is measured against and a
+    /// strand that is raised must be capped where its column ends.
+    fn a_bricked_fill(&self) -> bool {
+        self.solid_fill && self.feature == Feature::SparseInfill
+    }
+
     fn feed(&mut self, raw: &str) {
         // The plane is read now: a wall has to be traced to work out what, if
         // anything, stands on it a layer later.
@@ -683,6 +770,9 @@ impl Scan {
                     }
                 } else if key.eq_ignore_ascii_case("nozzle_diameter") {
                     self.nozzle.get_or_insert_with(|| value.to_owned());
+                } else if is_infill_density(key) {
+                    self.infill_density = Some(value.to_owned());
+                    self.settle_infill();
                 } else if key.eq_ignore_ascii_case("wall_sequence")
                     || key.eq_ignore_ascii_case("external_perimeters_first")
                 {
@@ -779,15 +869,20 @@ impl Scan {
         // so an object topped by one has its walls end on that layer rather
         // than on the one below — and the column under it is covered by a bead
         // this transform meters against the raise, not capped as though the
-        // part stopped there.
-        if extrudes && matches!(self.feature, Feature::InternalPerimeter | Feature::ThinWall) {
+        // part stopped there. A solid concentric fill is the same stack of
+        // rings, so an object whose walls end where its fill does dates its
+        // top the same way.
+        if extrudes
+            && (matches!(self.feature, Feature::InternalPerimeter | Feature::ThinWall)
+                || self.a_bricked_fill())
+        {
             self.last_wall_layer = self.open_layer;
         }
         if let Some(rate) = line.f.filter(|rate| *rate > 0.0) {
             self.feed = Some(rate);
         }
         self.observe_melt(delta, from, to, arc, extrudes);
-        if self.feature == Feature::InternalPerimeter && extrudes {
+        if extrudes && (self.feature == Feature::InternalPerimeter || self.a_bricked_fill()) {
             if self.open_layer.is_some() {
                 self.here.draw(from, to, arc);
             }
@@ -1223,6 +1318,7 @@ impl Scan {
             arc_extrusions: self.arc_extrusions,
             perimeters: self.perimeters,
             surfaces: self.surfaces,
+            solid_fill: self.solid_fill,
             unknown_regions: self.unknown_regions,
             unknown_region: self.unknown_region,
             object_starts: {
@@ -1323,6 +1419,37 @@ fn is_wall_width(key: &str) -> bool {
     ["perimeter_extrusion_width", "inner_wall_line_width"]
         .iter()
         .any(|known| key.eq_ignore_ascii_case(known))
+}
+
+/// Settings keys naming how much of the interior the fill was asked to cover.
+///
+/// `fill_density` is PrusaSlicer's and `sparse_infill_density` Orca's and
+/// Bambu's, and it is the whole of the question: what pattern produced the
+/// fill does not matter, because the rewrite measures for itself whether the
+/// strands really run beside each other. Only a fill laid at full density is
+/// one whose strands touch on a slicer that lays them; anything under it
+/// leaves a gap, and half of a spaced stack raised is a bead standing up
+/// beside nothing.
+fn is_infill_density(key: &str) -> bool {
+    ["fill_density", "sparse_infill_density"]
+        .iter()
+        .any(|known| key.eq_ignore_ascii_case(known))
+}
+
+/// True where a stated fill density leaves no gap between neighbouring rings.
+///
+/// Slicers write it as a percentage or as a share, and one per extruder where
+/// a profile covers several, so only the first is read. Anything under full is
+/// ring beside ring with a gap between them, and raising half of a spaced
+/// stack stands a bead up beside nothing.
+fn is_solid_density(stated: &str) -> bool {
+    stated.split(',').next().is_some_and(|first| {
+        let first = first.trim();
+        let share = first.strip_suffix('%').unwrap_or(first).trim();
+        share.parse::<f64>().is_ok_and(|share| {
+            (share - 100.0).abs() < f64::EPSILON || (share - 1.0).abs() < f64::EPSILON
+        })
+    })
 }
 
 /// A width from a settings block, in mm.

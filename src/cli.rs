@@ -44,9 +44,10 @@ pub struct Cli {
     #[arg(long)]
     pub force: bool,
 
-    /// Raise alternate internal perimeter loops by half a layer, so the seams
-    /// between them stagger and no longer line up into a channel through the
-    /// wall. Combines with --zaa.
+    /// Raise alternate loops by half a layer, so the seams between them
+    /// stagger and no longer line up into a channel through the wall — the
+    /// internal perimeters of every wall, and the strands of a fill laid solid
+    /// enough for them to run against each other. Combines with --zaa.
     #[arg(long, help_heading = BRICKS)]
     pub bricks: bool,
 
