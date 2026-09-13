@@ -70,7 +70,7 @@ fn run(cli: &Cli) -> Result<()> {
     }
     if let Some(warning) = unrecognised_regions(&survey) {
         eprintln!("corbel: warning: {warning}");
-    } else if let Some(warning) = nothing_to_work_on(&survey) {
+    } else if let Some(warning) = nothing_to_work_on(&survey, bricks, contours) {
         eprintln!("corbel: warning: {warning}");
     }
 
@@ -267,13 +267,56 @@ fn warn_slicer_settings(slicer: &slicer::Settings, bricks: bool) {
 /// already be on the bed, and a file rewritten byte for byte prints exactly as
 /// it was sliced. A slicer swallows what a post-processing script prints, so
 /// it is said whether or not `--verbose` was asked for.
-fn nothing_to_work_on(survey: &Survey) -> Option<&'static str> {
-    (survey.perimeters == 0).then_some(
-        "no perimeter regions were recognised in this file, so neither \
-         transform has anything to work on and it comes out unchanged; the \
-         region markers looked for are ';TYPE:' (PrusaSlicer, SuperSlicer, \
-         Cura) and '; FEATURE:' (OrcaSlicer, Bambu Studio)",
-    )
+/// What a file with nothing for the named transforms to do has to be told.
+///
+/// The two transforms find their work through different markers — bricking
+/// raises perimeter loops and nothing else, the surface transform reshapes a
+/// `Top surface` or an ironing pass — so a file can hold plenty for one of
+/// them and nothing at all for the other. A slice with no walls is exactly
+/// that: `wall_loops = 0` with 100% concentric infill leaves the file with no
+/// perimeter region in it, while the flat top that infill builds is 6637 moves
+/// of surface for `--zaa` to follow. Said as one sentence about "neither
+/// transform", a `--zaa` run was told its file came out unchanged while it
+/// went on to write 8189 moves.
+///
+/// Zero perimeters is also what a file this tool recognises nothing in looks
+/// like — an unknown slicer, or one an earlier post-processor stripped the
+/// markers out of. Both transforms find nothing there, and that is the case
+/// worth naming the markers for.
+fn nothing_to_work_on(survey: &Survey, bricks: bool, contours: bool) -> Option<String> {
+    let starved: Vec<&str> = [
+        (bricks && survey.perimeters == 0).then_some(
+            "--bricks has nothing to raise: this file holds no perimeter region, \
+             and bricking only staggers perimeter loops against each other — a \
+             slice with `wall_loops = 0` is laid entirely as infill, which is \
+             never raised",
+        ),
+        (contours && survey.surfaces == 0).then_some(
+            "--zaa has nothing to follow: this file holds no `Top surface` and \
+             no ironing pass",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if starved.is_empty() {
+        return None;
+    }
+    let mut said = starved.join("; ");
+    if starved.len() == usize::from(bricks) + usize::from(contours) {
+        // Every transform this run named has nothing, which is also what a
+        // file this tool recognises none of looks like — so say that, and the
+        // markers it went looking for.
+        said.push_str(
+            "; nothing this run asked for has anything to work on, so the file \
+             comes out unchanged, whichever of the region markers it states — \
+             the ones looked for are ';TYPE:' (PrusaSlicer, SuperSlicer, Cura) \
+             and '; FEATURE:' (OrcaSlicer, Bambu Studio)",
+        );
+    } else {
+        said.push_str("; the transform that could work on this file has, so it has been rewritten");
+    }
+    Some(said)
 }
 
 /// What a file whose region markers name something unknown has to be told.
@@ -444,7 +487,8 @@ mod tests {
     #[test]
     fn a_file_with_nothing_to_work_on_warns_and_still_succeeds() {
         let gcode = "M83\n;LAYER_CHANGE\nG1 Z0.2\nG1 X0 Y0 F9000\nG1 X10 Y0 E0.5\n";
-        let warning = nothing_to_work_on(&Survey::of(gcode)).expect("a file with no regions");
+        let warning =
+            nothing_to_work_on(&Survey::of(gcode), true, true).expect("a file with no regions");
         assert!(warning.contains(";TYPE:"), "{warning}");
         assert!(warning.contains("; FEATURE:"), "{warning}");
 
@@ -460,15 +504,55 @@ mod tests {
         assert!(outcome.is_ok(), "{outcome:?}");
     }
 
-    /// A file whose walls it does recognise has nothing to say.
+    /// A file whose walls it does recognise has nothing to say to the
+    /// transform that wants walls. The surface transform wants a different
+    /// marker, and a wall-only file has none of those — which is worth saying
+    /// only when it was the one asked for.
     #[test]
     fn a_file_whose_walls_are_recognised_is_not_warned_about() {
         let survey = Survey::of(
             "M83\n;LAYER_CHANGE\nG1 Z0.2\n\
              ;TYPE:Perimeter\nG1 X0 Y0 F9000\nG1 X10 Y0 E0.5\n",
         );
-        assert!(nothing_to_work_on(&survey).is_none());
+        assert_eq!(survey.perimeters, 1);
+        assert_eq!(survey.surfaces, 0);
+        assert!(nothing_to_work_on(&survey, true, false).is_none());
         assert!(unrecognised_regions(&survey).is_none());
+
+        let warning = nothing_to_work_on(&survey, false, true).expect("--zaa has no surface");
+        assert!(warning.contains("--zaa"), "{warning}");
+    }
+
+    /// A slice with no walls at all has nothing for bricking and plenty for the
+    /// surface transform, so a warning about "neither transform" is a warning
+    /// about the wrong one: measured on a `wall_loops = 0`, 100% concentric
+    /// infill slice, `--zaa` was told the file came out unchanged and then
+    /// wrote 8189 moves.
+    #[test]
+    fn a_file_with_no_walls_warns_only_about_bricking() {
+        let survey = Survey::of(
+            "M83\n;LAYER_CHANGE\nG1 Z0.2\n\
+             ; FEATURE: Top surface\nG1 X0 Y0 E0.5\nG1 X10 Y0 E0.5\n",
+        );
+        assert_eq!(survey.perimeters, 0);
+        assert_eq!(survey.surfaces, 1);
+
+        let warning = nothing_to_work_on(&survey, true, true).expect("bricking has nothing");
+        assert!(warning.contains("--bricks"), "{warning}");
+        assert!(
+            !warning.contains("unchanged"),
+            "the surface transform still writes this file: {warning}"
+        );
+        assert!(nothing_to_work_on(&survey, false, true).is_none());
+        assert!(nothing_to_work_on(&survey, true, false).is_some());
+
+        // The surface transform's own empty case is still reported.
+        let infill = Survey::of(
+            "M83\n;LAYER_CHANGE\nG1 Z0.2\n\
+             ; FEATURE: Sparse infill\nG1 X0 Y0 E0.5\nG1 X10 Y0 E0.5\n",
+        );
+        let warning = nothing_to_work_on(&infill, false, true).expect("--zaa has nothing");
+        assert!(warning.contains("--zaa"), "{warning}");
     }
 
     /// A file whose region markers are all labels this tool has never met is
@@ -490,7 +574,7 @@ mod tests {
         // The general warning fits this file too — it has no recognised
         // perimeter either — and must not be printed beside this one. The
         // specific one wins because it can quote what the file actually says.
-        assert!(nothing_to_work_on(&survey).is_some());
+        assert!(nothing_to_work_on(&survey, true, true).is_some());
 
         let path = std::env::temp_dir().join(format!(
             "corbel-unknown-regions-{}.gcode",

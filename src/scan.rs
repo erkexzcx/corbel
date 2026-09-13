@@ -196,6 +196,15 @@ pub struct Survey {
     /// out of. Both transforms find their work through those markers, so a
     /// file with none is rewritten to no effect.
     pub perimeters: usize,
+    /// Region markers that named a `Top surface` or an ironing pass.
+    ///
+    /// The other half of the same question: bricking finds its work through
+    /// the perimeter markers and the surface transform through these, so a
+    /// file can hold plenty for one and nothing at all for the other. A slice
+    /// with no walls is exactly that — `wall_loops = 0` and 100% concentric
+    /// infill leaves no perimeter region in the file at all, while the flat
+    /// top that infill builds is 6637 moves of surface for `--zaa` to follow.
+    pub surfaces: usize,
     /// Region markers whose label named nothing this tool knows, in either
     /// dialect.
     ///
@@ -467,6 +476,7 @@ struct Scan {
     contoured: bool,
     arc_extrusions: usize,
     perimeters: usize,
+    surfaces: usize,
     unknown_regions: usize,
     unknown_region: Option<String>,
     feature: Feature,
@@ -610,6 +620,9 @@ impl Scan {
                 self.supporting = marker.to_ascii_lowercase().contains("support");
                 if feature.is_perimeter() {
                     self.perimeters += 1;
+                }
+                if feature.is_surface() {
+                    self.surfaces += 1;
                 }
                 // Only a label that classified as nothing can be one this
                 // tool has never met, so the cheap test runs first and the
@@ -1209,6 +1222,7 @@ impl Scan {
             contoured: self.contoured,
             arc_extrusions: self.arc_extrusions,
             perimeters: self.perimeters,
+            surfaces: self.surfaces,
             unknown_regions: self.unknown_regions,
             unknown_region: self.unknown_region,
             object_starts: {

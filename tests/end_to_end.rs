@@ -774,7 +774,7 @@ fn the_slicer_environment_states_the_width_too() {
         sample_gcode()
     ));
     let output = run_with_env(
-        &["--verbose", path.to_str().unwrap()],
+        &["--bricks", "--verbose", path.to_str().unwrap()],
         &[
             ("SLIC3R_NOZZLE_DIAMETER", "0.4"),
             ("SLIC3R_PERIMETER_EXTRUSION_WIDTH", "87.5%"),
@@ -802,7 +802,8 @@ fn a_layer_more_than_half_the_nozzle_is_warned_about() {
     // The same file at a layer the nozzle can clear says nothing.
     let quiet = Sandbox::new("thin-layer");
     let path = quiet.with_gcode(&format!("; nozzle_diameter = 0.4\n{}", sample_gcode()));
-    let output = run(&[path.to_str().unwrap()]);
+    // Walls only, so name the transform this sample has walls for.
+    let output = run(&["--bricks", path.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("warning"), "{stderr}");
 }
@@ -961,7 +962,12 @@ fn the_slicer_environment_supplies_the_layer_height() {
     let path = sandbox.with_gcode(&sample_gcode().replace("; layer_height = 0.2\n", ""));
     let file = path.to_str().unwrap();
 
-    let output = run_with_env(&["--verbose", file], &[("SLIC3R_LAYER_HEIGHT", "0.3")]);
+    // Walls only: `sample_gcode` states no `Top surface` region, so a run
+    // that asks for the surface transform is told it has nothing to follow.
+    let output = run_with_env(
+        &["--bricks", "--verbose", file],
+        &[("SLIC3R_LAYER_HEIGHT", "0.3")],
+    );
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(report.contains("raised by 0.150 mm"), "{report}");
@@ -979,7 +985,12 @@ fn a_varied_layer_height_is_measured_rather_than_taken_from_the_slicer() {
     let path = sandbox.with_gcode(&gcode_at(&planes));
     let file = path.to_str().unwrap();
 
-    let output = run_with_env(&["--verbose", file], &[("SLIC3R_LAYER_HEIGHT", "0.3")]);
+    // Walls only: `sample_gcode` states no `Top surface` region, so a run
+    // that asks for the surface transform is told it has nothing to follow.
+    let output = run_with_env(
+        &["--bricks", "--verbose", file],
+        &[("SLIC3R_LAYER_HEIGHT", "0.3")],
+    );
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
     assert!(report.contains("varied the layer height"), "{report}");
@@ -1073,7 +1084,7 @@ fn a_well_configured_slicer_draws_no_warnings() {
     let path = sandbox.with_gcode(&sample_gcode());
 
     let output = run_with_env(
-        &[path.to_str().unwrap()],
+        &["--bricks", path.to_str().unwrap()],
         &[
             ("SLIC3R_EXTERNAL_PERIMETERS_FIRST", "1"),
             ("SLIC3R_PERIMETERS", "3"),
