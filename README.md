@@ -17,6 +17,18 @@ corbel --bricks --zaa
 
 ---
 
+## 📖 Contents
+
+- [Install](#install)
+- [Use](#%EF%B8%8F-use)
+- [BrickLayers](#-bricklayers)
+  - [How much flow it adds](#-how-much-flow-it-adds)
+- [Z anti-aliasing](#-z-anti-aliasing)
+- [Recommendations](#-recommendations)
+- [Credits](#-credits)
+
+---
+
 ##  Install
 
 **One-liner.** Downloads the latest release into `~/corbel` (`%USERPROFILE%\corbel` on Windows), checks the published SHA-256 sums, and prints the line to paste into your slicer. Run it again to update in place.
@@ -129,6 +141,16 @@ So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle,
   <source media="(prefers-color-scheme: dark)" srcset="img/contour-dark.png">
   <img alt="A shallow slope's cross-section in two steps: as sliced, every bead of a course is laid at one height and the model's surface cuts straight through them; followed, each bead sits at the height the surface really is and is metered for the gap under it, so the tops of the beads land on that line and consecutive treads join." src="img/contour-light.png">
 </picture>
+
+---
+
+## 💡 Recommendations
+
+**1. Keep the default 2 walls, and use 100% Concentric infill.**
+
+A 1000-wall slice makes the slicer insert intermediate surface layers mid-object, which breaks the steady stack bricking needs to stagger. **100% Concentric infill** gives the same strength as those 1000 walls would. The **Top shell layers** and **Bottom shell layers** count is worth setting to **1 or 2** — a compromise for a stronger, yet still great looking part, because shell layers likely aren't bricked at all, being surfaces rather than perimeters. Leave the shell layer pattern at its default **Monotonic** or **Rectilinear**: both give better looking surfaces than concentric infill.
+
+**2. Prefer variable layer height over `--zaa`.** Adaptive slicing gives smoother, better-looking parts.
 
 ---
 
