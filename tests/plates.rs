@@ -173,7 +173,7 @@ fn assert_sound(
                 .iter()
                 .max_by(|left, right| left.depth().total_cmp(&right.depth()))
                 .map_or(String::new(), |plunge| format!(
-                    "\n    line {}: material at {:.3} while the nozzle is at {:.3}, {}",
+                    "\n    line {}: material at {:.3} while the nozzle is at {:.3}, {}\n      {}",
                     plunge.line,
                     plunge.top,
                     plunge.at.2,
@@ -181,7 +181,12 @@ fn assert_sound(
                         "laying a bead"
                     } else {
                         "travelling"
-                    }
+                    },
+                    gcode
+                        .lines()
+                        .nth(plunge.line.saturating_sub(1))
+                        .unwrap_or("")
+                        .trim()
                 ))
         ));
     }
