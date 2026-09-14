@@ -917,6 +917,15 @@ pub fn ledger(gcode: &str) -> Ledger {
             && line.z.is_some()
             && line.x.is_none()
             && line.y.is_none()
+            // A line naming an arc centre is not a height of its own: a
+            // slicer's Z-hop is written as a helix — `G3 Z5.414 I-1.217
+            // J-.019 P1` — and the nozzle sweeps through it while it rises,
+            // so there is no stop for material to escape from. Read as one,
+            // every layer boundary of every Bambu file counted, and the
+            // quantity stopped saying anything about what this pass wrote.
+            && line.i.is_none()
+            && line.j.is_none()
+            && line.r.is_none()
             && delta.is_none()
             && withdrawn <= 1e-9
         {
@@ -1442,4 +1451,29 @@ fn lost(before: &[String], after: &[String]) -> Option<(String, usize, usize)> {
         .filter(|(_, was, now)| now < was)
         .min_by_key(|(what, _, _)| what.to_string())
         .map(|(what, was, now)| (what.to_owned(), was, now))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A slicer's Z-hop is a helix, and a helix is not a height of its own.
+    ///
+    /// `G3 Z5.414 I-1.217 J-.019 P1 F30000` is how Bambu Studio writes the hop
+    /// at every layer boundary, and the nozzle sweeps through it while it
+    /// rises, so there is no stop for material to escape from. Read as one,
+    /// every layer boundary of every Bambu plate counted as a primed stop and
+    /// the count stopped being a statement about what this pass wrote: on a
+    /// user's 48-layer bar the run was charged two stops it had not made, and
+    /// the line it was measured against is the file's own.
+    ///
+    /// A bare height with a full nozzle still counts, which is the defect the
+    /// quantity exists for.
+    #[test]
+    fn a_helical_hop_is_not_a_primed_stop_but_a_bare_height_is() {
+        let hop = "; CHANGE_LAYER\nG1 X1 Y1 F30000\nG3 Z0.6 I-1 J0 P1 F30000\nG1 X9 Y9 F30000\nG1 E1 F1800\n";
+        assert_eq!(ledger(hop).primed_stops, 0);
+        let bare = "; CHANGE_LAYER\nG1 X1 Y1 F30000\nG1 Z0.4\nG1 X9 Y9 F30000\nG1 E1 F1800\n";
+        assert_eq!(ledger(bare).primed_stops, 1);
+    }
 }

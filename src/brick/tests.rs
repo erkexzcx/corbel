@@ -5474,7 +5474,7 @@ fn a_ridden_approach_to_a_full_circle_keeps_the_next_travel_retracted() {
     pass.buffer(Line::parse("G1 X20 Y0 F9000"), (0.0, 0.0));
     pass.buffer(Line::parse("G2 I-5 J0 E1 F600"), (20.0, 0.0));
     pass.ride(0, 0.3, true, &[None, None]).unwrap();
-    pass.replay(1, 1.0, &[None, None]).unwrap();
+    pass.replay(1, 1.0, &[None, None], None).unwrap();
     pass.was_at = (0.0, 0.0);
     pass.at = (0.0, 0.0);
     pass.emit(Line::parse("G1 X0 Y0 F9000"), 1.0).unwrap();
@@ -5699,7 +5699,7 @@ fn replay_gives_an_owed_prime_back_at_the_bead_not_the_wipe() {
         marker: None,
         width: None,
     });
-    pass.replay(0, 1.0, &[None]).unwrap();
+    pass.replay(0, 1.0, &[None], None).unwrap();
 
     let withdrawn = pass.withdrawn;
     drop(pass);
@@ -5751,7 +5751,7 @@ fn replay_books_the_filament_it_actually_writes() {
         resets_origin: false,
         width: None,
     });
-    pass.replay(0, 1.5, &[None]).unwrap();
+    pass.replay(0, 1.5, &[None], None).unwrap();
 
     // 0.5 mm of bead at factor 1.5 refills the nozzle by 0.75 mm, leaving
     // only 0.05 of the original 0.8 pulled back.
@@ -5806,9 +5806,9 @@ fn a_zero_prime_still_answers_the_retraction_so_the_bead_is_not_filled() {
     let prime = buffer(&mut pass, "G1 E0.00000", false, 0.0, (0.0, 0.0));
     let bead = buffer(&mut pass, "G1 X1.0 Y0.0 E0.01", true, 0.01, (1.0, 0.0));
 
-    pass.replay(wipe, 1.0, &[None, None, None]).unwrap();
-    pass.replay(prime, 1.0, &[None, None, None]).unwrap();
-    pass.replay(bead, 1.0, &[None, None, None]).unwrap();
+    pass.replay(wipe, 1.0, &[None, None, None], None).unwrap();
+    pass.replay(prime, 1.0, &[None, None, None], None).unwrap();
+    pass.replay(bead, 1.0, &[None, None, None], None).unwrap();
 
     drop(pass);
     let out = String::from_utf8(out).unwrap();
@@ -5862,8 +5862,8 @@ fn an_intentionally_withdrawn_bead_is_preserved_regardless_of_length() {
     let wipe = buffer(&mut pass, "G1 X0.0 Y0.0 E-0.8", true, -0.8, (0.0, 0.0));
     let bead = buffer(&mut pass, "G1 X1.0 Y0.0 E0.01", true, 0.01, (1.0, 0.0));
 
-    pass.replay(wipe, 1.0, &[None, None]).unwrap();
-    pass.replay(bead, 1.0, &[None, None]).unwrap();
+    pass.replay(wipe, 1.0, &[None, None], None).unwrap();
+    pass.replay(bead, 1.0, &[None, None], None).unwrap();
 
     drop(pass);
     let out = String::from_utf8(out).unwrap();
@@ -5874,8 +5874,8 @@ fn an_intentionally_withdrawn_bead_is_preserved_regardless_of_length() {
     pass.extruder.set_mode(Code::RelativeE);
     let wipe = buffer(&mut pass, "G1 X0.0 Y0.0 E-0.8", true, -0.8, (0.0, 0.0));
     let bead = buffer(&mut pass, "G1 X1.0 Y0.0 E0.3", true, 0.3, (1.0, 0.0));
-    pass.replay(wipe, 1.0, &[None, None]).unwrap();
-    pass.replay(bead, 1.0, &[None, None]).unwrap();
+    pass.replay(wipe, 1.0, &[None, None], None).unwrap();
+    pass.replay(bead, 1.0, &[None, None], None).unwrap();
     drop(pass);
     let out = String::from_utf8(out).unwrap();
     assert!(!out.contains("corbel brick prime"), "{out}");
@@ -5917,7 +5917,7 @@ fn a_prime_answers_the_actual_withdrawal() {
         resets_origin: false,
         width: None,
     });
-    pass.replay(index, 1.0, &[None]).unwrap();
+    pass.replay(index, 1.0, &[None], None).unwrap();
 
     assert!(
         pass.withdrawn.abs() < 1e-9,
@@ -5940,8 +5940,8 @@ fn a_stacked_pair_of_wipes_writes_only_one_retraction() {
     for raw in ["G1 X1 E-.8", "G1 E.8", "G1 X2 E.1", "G1 X3 E-.8"] {
         pass.buffer(Line::parse(raw), (0.0, 0.0));
     }
-    pass.replay(0, 1.0, &[None; 4]).unwrap();
-    pass.replay(3, 1.0, &[None; 4]).unwrap();
+    pass.replay(0, 1.0, &[None; 4], None).unwrap();
+    pass.replay(3, 1.0, &[None; 4], None).unwrap();
 
     assert!(
         (pass.withdrawn - 0.8).abs() < 1e-9,
@@ -5979,7 +5979,7 @@ fn reordered_primes_balance_without_double_priming_or_starving_small_beads() {
         }
         pass.unprime(-0.8).unwrap();
         for index in [2, 3, 4, 0, 1, 5, 6] {
-            pass.replay(index, 1.0, &[None; 7]).unwrap();
+            pass.replay(index, 1.0, &[None; 7], None).unwrap();
         }
         assert!(pass.withdrawn < 1e-9);
         drop(pass);
@@ -6022,7 +6022,7 @@ fn a_height_stop_keeps_its_pull_until_after_the_slicers_prime() {
     pass.buffer(Line::parse("G1 E.8"), (0.0, 0.0));
     pass.unprime(-0.8).unwrap();
     pass.stopped = Some(0.8);
-    pass.replay(0, 1.0, &[None]).unwrap();
+    pass.replay(0, 1.0, &[None], None).unwrap();
     assert_eq!(pass.withdrawn, 0.8);
     pass.move_z(0.3, true).unwrap();
     let charge = pass.stopped.take().unwrap();
@@ -6293,5 +6293,160 @@ fn a_reordered_travel_runs_at_the_file_s_acceleration_not_the_approach_s() {
         out.matches("M204 S250").count(),
         5,
         "the approach acceleration was dropped:\n{out}"
+    );
+}
+
+/// Journeys across the plate: moves that lay nothing and carry the nozzle
+/// more than `far` mm. What a nozzle strings over, and what an island
+/// written twice in one layer costs in travels.
+fn journeys(text: &str, far: f64) -> usize {
+    let mut modal = Modal::new();
+    let mut count = 0;
+    for raw in text.lines() {
+        let line = Line::parse(raw);
+        let from = modal.position();
+        modal.apply(&line);
+        // A bead and a wipe name filament; a journey is the move that names
+        // none.
+        if line.e.is_some() {
+            continue;
+        }
+        let (x, y, _) = modal.position();
+        count += usize::from((x - from.0).hypot(y - from.1) > far);
+    }
+    count
+}
+
+/// Two islands a plate apart are finished one after the other, never toured.
+///
+/// A raised loop waits for the end of its layer, and while that wait was
+/// ordered by height across the whole layer every island queued into one
+/// list: the nozzle laid the flat loops of BOTH islands, then went back for
+/// the raised ones, so each island was visited twice a layer and the gap
+/// between them crossed twice as often as the slicer crossed it, retraction
+/// and prime included. Measured on the two private slices this was found on,
+/// whose islands stand 72 to 83 mm apart, journeys across that gap went from
+/// the slicer's own 28 and 27 to 51 and 51, and the distance they covered from
+/// 3.51 m to 6.28 m and from 3.15 m to 6.47 m.
+///
+/// Height is owed only between loops that run beside each other, so the wait
+/// is ordered stack by stack and the island the nozzle is standing in is
+/// finished before the next one is started. The slicer's own file opens on the
+/// first island and ends on the second, so it never has to come back to the
+/// first one; writing an island's raised loops at the end of its layer costs
+/// one such return, which is the allowance below. A tour costs one on every
+/// layer instead.
+#[test]
+fn two_islands_a_plate_apart_are_not_toured_twice_a_layer() {
+    let island = |origin: f64, tag: &str| {
+        format!(
+            ";TYPE:Perimeter\n{};TYPE:External perimeter\n{}",
+            wall_of(2, &format!("{tag}i"), origin + 0.90, 8.20, 0.5),
+            wall_of(1, &format!("{tag}o"), origin, 10.0, 0.5),
+        )
+    };
+    let source = middle_layer(&format!("{}{}", island(0.0, "A"), island(40.0, "B")));
+    let out = run(&source, &Config::default());
+    assert!(
+        out.contains("corbel brick raised"),
+        "nothing was raised, so this fixture proves nothing:\n{out}"
+    );
+    let before = journeys(&source, 20.0);
+    let after = journeys(&out, 20.0);
+    assert!(
+        after <= before + 1,
+        "the held loops toured the islands: {after} journeys across the gap against the slicer's {before}:\n{out}"
+    );
+}
+/// A strand the layer above holds over only part of its length lays beads at
+/// TWO heights, so the raise it took says nothing about what the nozzle can
+/// plow — its flat beads can be, by a raised bead laid beside them first.
+/// Ordered by the raise alone that is exactly what happened: measured on a
+/// user's 0-wall slice, **104 beads were laid 117 µm under material already
+/// standing within the nozzle's reach**, against none in the file the slicer
+/// wrote.
+///
+/// Here `across` is covered end to end and is raised end to end; `along` is
+/// covered only over its far fifth, so the rest of it — including the end
+/// that passes 0.3 mm from `across`, well inside the nozzle's reach — is laid
+/// on the plane. The two do not run beside each other over half of either, so
+/// they are contours of their own and both take the raise.
+#[test]
+fn a_strand_with_flat_beads_is_laid_before_the_raised_one_beside_it() {
+    let strand = |tag: Option<&str>, from: (f64, f64), to: (f64, f64)| {
+        let mut text = format!("G1 X{:.3} Y{:.3} F9000\n", from.0, from.1);
+        for step in 1..=20 {
+            let share = f64::from(step) / 20.0;
+            let x = from.0 + (to.0 - from.0) * share;
+            let y = from.1 + (to.1 - from.1) * share;
+            let mark = tag.map_or(String::new(), |tag| format!(" ; {tag}{step}"));
+            text.push_str(&format!("G1 X{x:.3} Y{y:.3} E0.05{mark}\n"));
+        }
+        text
+    };
+    let whole = |tag: Option<&str>| {
+        format!(
+            ";TYPE:Perimeter\n{}{}",
+            strand(tag, (2.0, 5.0), (12.0, 5.0)),
+            strand(tag, (6.0, 5.3), (6.0, 15.3))
+        )
+    };
+    // The layer above covers the crossing strand whole and only the far fifth
+    // of the one along it, which is what leaves that strand with beads at both
+    // heights.
+    let cover = format!(
+        ";TYPE:Perimeter\n{}{}",
+        strand(None, (2.0, 5.0), (12.0, 5.0)),
+        strand(None, (6.0, 13.3), (6.0, 15.3))
+    );
+    let source = relative(&format!(
+        "{}{}{}{}{}{}{}{}{}{}",
+        layer(0.2),
+        whole(None),
+        layer(0.4),
+        whole(None),
+        layer(0.6),
+        whole(None),
+        layer(0.8),
+        whole(Some("bead")),
+        layer(1.0),
+        cover,
+    ));
+    let out = run(&source, &Config::default());
+    assert!(
+        out.contains("corbel brick raised"),
+        "nothing was raised, so this fixture proves nothing:\n{out}"
+    );
+    let mut nozzle = 0.0_f64;
+    let mut raised = Vec::new();
+    let mut plowed = Vec::new();
+    for line in out.lines() {
+        let parsed = Line::parse(line);
+        if let Some(z) = parsed.z.filter(|_| parsed.is_move()) {
+            nozzle = z;
+        }
+        let Some((body, tag)) = line.rsplit_once("; ") else {
+            continue;
+        };
+        if tag.starts_with(BRICK_STAMP) || body.trim().is_empty() {
+            continue;
+        }
+        // The plane this layer's beads are metered against; anything above it
+        // is a raise this pass added.
+        if nozzle > 0.8 + 1e-9 {
+            raised.push(tag.to_owned());
+        } else if !raised.is_empty() {
+            plowed.push(tag.to_owned());
+        }
+    }
+    assert!(
+        !raised.is_empty(),
+        "no bead was raised on the layer under test:\n{out}"
+    );
+    assert!(
+        plowed.is_empty(),
+        "{} beads were laid on the plane after {} raised ones beside them: {plowed:?}\n{out}",
+        plowed.len(),
+        raised.len(),
     );
 }

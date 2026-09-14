@@ -557,6 +557,18 @@ struct Moved {
     ratio: f64,
 }
 
+/// A stack of one layer's held loops: the extent they cover — `None` where
+/// nothing about them could be measured — and the loops themselves, lowest
+/// first.
+///
+/// A stack is what the height owed between loops is owed WITHIN: everything in
+/// one of these runs beside something else in it, or is inside its extent, so
+/// the order among them decides whether a nozzle plows what it has just laid.
+/// Two stacks owe each other nothing.
+///
+/// See [`Pass::held_stacks`].
+type Stack = (Option<[f64; 4]>, Vec<(usize, usize)>);
+
 /// A region's raised loops, held back until the end of the layer they belong
 /// to.
 ///
@@ -579,6 +591,7 @@ struct Held {
     arena: Vec<u8>,
     buffer: Vec<Buffered>,
     cells: Vec<u32>,
+    column: Vec<u8>,
     loops: Vec<Loop>,
     /// The plane they belong to, since they are written after the regions that
     /// followed them and a plane is read off the layer rather than the stream.
@@ -735,6 +748,56 @@ fn holds(outer: [f64; 4], inner: [f64; 4]) -> bool {
     outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3]
 }
 
+/// How far apart two extents are, negative where they overlap.
+///
+/// The cheap rejection every grouping in this module starts with: a loop whose
+/// extent is further than [`MAX_LOOP_GAP`] from another's cannot run beside it
+/// however its path wanders between the two corners.
+fn apart(left: [f64; 4], right: [f64; 4]) -> f64 {
+    (left[0] - right[2])
+        .max(right[0] - left[2])
+        .max(left[1] - right[3])
+        .max(right[1] - left[3])
+}
+
+/// How far `point` is from an extent, zero where it stands inside it.
+fn from_extent(point: (f64, f64), extent: [f64; 4]) -> f64 {
+    let dx = (extent[0] - point.0).max(point.0 - extent[2]).max(0.0);
+    let dy = (extent[1] - point.1).max(point.1 - extent[3]).max(0.0);
+    dx.hypot(dy)
+}
+
+/// The extent holding both, and the one that measured anything where only one
+/// of them did.
+fn cover(had: Option<[f64; 4]>, now: Option<[f64; 4]>) -> Option<[f64; 4]> {
+    match (had, now) {
+        (Some(had), Some(now)) => Some([
+            had[0].min(now[0]),
+            had[1].min(now[1]),
+            had[2].max(now[2]),
+            had[3].max(now[3]),
+        ]),
+        (had, now) => had.or(now),
+    }
+}
+
+/// The group `at` belongs to, with the path walked so far compressed behind it.
+fn find(parent: &mut [usize], mut at: usize) -> usize {
+    while parent[at] != at {
+        parent[at] = parent[parent[at]];
+        at = parent[at];
+    }
+    at
+}
+
+/// Puts two groups in one.
+fn union(parent: &mut [usize], left: usize, right: usize) {
+    let (left, right) = (find(parent, left), find(parent, right));
+    if left != right {
+        parent[right] = left;
+    }
+}
+
 /// One perimeter loop, as index ranges into the buffer. `lead` covers the
 /// travel that reaches the loop, `body` the extrusions themselves.
 #[derive(Clone, Copy)]
@@ -795,9 +858,14 @@ struct Loop {
     /// [`Pass::anchor_the_fill`].
     fill: bool,
     raised: bool,
-    /// True where nothing stands on this loop on the next layer, so it has to
-    /// finish flat whatever the parity says.
+    /// True where nothing on this loop is raised, whatever its parity said:
+    /// the order and the hold read it as "written with the flat ones".
     capped: bool,
+    /// True where at least one BEAD of this loop is laid on the plane, which
+    /// includes every strand the layer above holds over only part of its
+    /// length. Such a strand lays beads at two heights, so the raise it takes
+    /// does not say what the nozzle can plow: its flat beads can.
+    grounded: bool,
     /// Layers this loop's own column has stood for. Zero where the column
     /// begins on this layer, so its first bead climbs from the plane rather
     /// than being raised to an offset nothing under it earned.
@@ -812,6 +880,20 @@ struct Loop {
     /// already makes, so a travel can be tested against what is really in its
     /// way without walking a loop's path a second time.
     cells: (usize, usize),
+    /// Range of `Pass.column` holding one byte per buffered line from `body`
+    /// to `end`: `1` where that line is a bead the layer above holds and the
+    /// alternation raises, `0` everywhere else — a line that lays no bead, a
+    /// bead the layer above closes over where the strand runs out, a bead
+    /// beside support, or a bead of a strand the phase left flat. Read as
+    /// `column[at - body]`.
+    ///
+    /// A strand is one place in the alternation, but not one column along its
+    /// whole length: where a shoulder, a shelf or a skin closes the part over
+    /// part of it, the beads under that part have nothing above them and are
+    /// laid on their plane — and every bead that does carry a column is raised
+    /// as the alternation says, so a strand running out from under a surface
+    /// keeps its interlock rather than going flat end to end.
+    column: (usize, usize),
 }
 
 struct Pass<'a, W: Write> {
@@ -843,6 +925,12 @@ struct Pass<'a, W: Write> {
     /// The cells of the region's raised loops, one run per loop. Cleared with
     /// the region, so nothing larger than one region is ever held.
     raised_cells: Vec<u32>,
+    /// One byte per buffered line of the region, saying whether the line is a
+    /// bead with a column over it and under it; see [`Loop::column`].
+    column: Vec<u8>,
+    /// The same for the loop being marked, before it is given its place in
+    /// `column`. Reused so a layer costs no allocation per loop.
+    flags: Vec<u8>,
     /// Where the nozzle really stands, which is not where the buffer says once
     /// the loops have been reordered.
     at_now: (f64, f64),
@@ -940,6 +1028,15 @@ struct Pass<'a, W: Write> {
     z_feedrate: f64,
     /// How far the file itself says a travel has to be to be worth retracting.
     hop_travel: Option<f64>,
+    /// How far the file lifts the nozzle to travel, for a journey this pass
+    /// created; see [`Pass::journey_lift`].
+    travel_lift: Option<f64>,
+    /// True while the loops held to the end of a layer are being written. They
+    /// are reached by travels the slicer never planned, which is what
+    /// [`Pass::journey_lift`] has to lift over, and a held loop's lead opens a
+    /// buffer of its own so there is no line in front of it to measure that
+    /// against.
+    holding_back: bool,
     /// Feedrate the OUTPUT stream is really left in, which the height moves
     /// and retractions this pass inserts change as much as the file's own
     /// lines do.
@@ -1017,6 +1114,8 @@ impl<'a, W: Write> Pass<'a, W> {
             laid: Cells::on(footprint::Grid::default()),
             laid_top: f64::NEG_INFINITY,
             raised_cells: Vec::new(),
+            column: Vec::new(),
+            flags: Vec::new(),
             at_now: (0.0, 0.0),
             held: Vec::new(),
             boundary: Vec::new(),
@@ -1058,6 +1157,8 @@ impl<'a, W: Write> Pass<'a, W> {
             nozzle_z: None,
             z_feedrate: survey.z_feedrate.unwrap_or(FALLBACK_Z_FEEDRATE),
             hop_travel: survey.hop_at(0),
+            travel_lift: survey.lift_at(0),
+            holding_back: false,
             retract_charge: survey.retract_at(0),
             feedrate: None,
             wanted_feed: None,
@@ -1214,6 +1315,7 @@ impl<'a, W: Write> Pass<'a, W> {
             self.tool = tool;
             self.melt_rate = self.survey.melt_at(tool);
             self.hop_travel = self.survey.hop_at(tool);
+            self.travel_lift = self.survey.lift_at(tool);
             self.retract_charge = self.survey.retract_at(tool);
             // The change parks the old nozzle and primes the new one, so
             // nothing this pass believes about the old tool's charge describes
@@ -1713,11 +1815,11 @@ impl<'a, W: Write> Pass<'a, W> {
                 let mut current = self.loops[0];
                 current.filler = true;
                 self.next_ground.add(from, self.at, self.buffer[0].arc, 0.0);
-                if !self.split_bead(current, 0, &[None])? {
-                    self.replay(0, factor, &[None])?;
+                if !self.split_bead(current, 0, &[None], 0.0, None)? {
+                    self.replay(0, factor, &[None], None)?;
                 }
             } else {
-                self.replay(0, 1.0, &[None])?;
+                self.replay(0, 1.0, &[None], None)?;
             }
             self.loops.clear();
             self.buffer.clear();
@@ -1879,10 +1981,12 @@ impl<'a, W: Write> Pass<'a, W> {
             fill: self.bricked_fill(),
             raised: false,
             capped: false,
+            grounded: false,
             steps: 0,
             outline: None,
             points: 0,
             cells: (0, 0),
+            column: (0, 0),
         });
         self.travelled = false;
     }
@@ -1964,7 +2068,7 @@ impl<'a, W: Write> Pass<'a, W> {
 
         let head = self.region_head();
         for index in 0..head {
-            self.replay(index, 1.0, &moved)?;
+            self.replay(index, 1.0, &moved, None)?;
         }
         if head > 0 {
             self.at_now = self.buffer[head - 1].at;
@@ -2028,7 +2132,7 @@ impl<'a, W: Write> Pass<'a, W> {
             // Past the last bead the flow no longer applies: what is left is
             // the retraction and wipe that leave the loop, and scaling those
             // pulls back a length the priming move will not put back.
-            self.replay(at, 1.0, &moved)?;
+            self.replay(at, 1.0, &moved, None)?;
         }
         if tail.end > tail.start {
             self.at_now = self.buffer[tail.end - 1].at;
@@ -2102,6 +2206,7 @@ impl<'a, W: Write> Pass<'a, W> {
             arena: Vec::new(),
             buffer: Vec::new(),
             cells: Vec::new(),
+            column: Vec::new(),
             loops: Vec::with_capacity(waiting.len()),
             plane,
             rate: None,
@@ -2126,6 +2231,9 @@ impl<'a, W: Write> Pass<'a, W> {
             let (from, to) = current.cells;
             copy.cells = (held.cells.len(), held.cells.len() + (to - from));
             held.cells.extend_from_slice(&self.raised_cells[from..to]);
+            let (from, to) = current.column;
+            copy.column = (held.column.len(), held.column.len() + (to - from));
+            held.column.extend_from_slice(&self.column[from..to]);
             held.loops.push(copy);
         }
         held
@@ -2133,75 +2241,98 @@ impl<'a, W: Write> Pass<'a, W> {
 
     /// Writes the loops this layer held back, at the plane they belong to.
     ///
-    /// Ordered by height across every region that held any, for the reason
-    /// [`Pass::order`] gives: a settled column and one still climbing are a
-    /// quarter of a layer apart, and two regions of a layer can stand beside
-    /// each other. Nothing is written to bring the nozzle back down — these
-    /// are the last beads on their layer, and the layer change that follows
-    /// commands the next plane itself.
+    /// Ordered by height within each stack, and stack by stack from wherever
+    /// the nozzle stands, for the reason [`Pass::order`] gives: a settled
+    /// column and one still climbing are a quarter of a layer apart, and two
+    /// regions of a layer can stand beside each other. Nothing is written to
+    /// bring the nozzle back down — these are the last beads on their layer,
+    /// and the layer change that follows commands the next plane itself.
+    ///
+    /// Height is owed only BETWEEN loops that run beside each other, which is
+    /// what makes a stack the unit of the order; see [`Pass::held_stacks`].
     fn write_held(&mut self) -> io::Result<()> {
         if self.held.is_empty() {
             return Ok(());
         }
         let mut regions = std::mem::take(&mut self.held);
-        let mut plan: Vec<(usize, usize)> = Vec::new();
-        for (at, held) in regions.iter().enumerate() {
-            plan.extend((0..held.loops.len()).map(|loop_| (at, loop_)));
-        }
-        plan.sort_by(|left, right| {
-            self.rise_of(regions[left.0].loops[left.1])
-                .total_cmp(&self.rise_of(regions[right.0].loops[right.1]))
-        });
+        let mut stacks = self.held_stacks(&regions);
 
         let arena = std::mem::take(&mut self.arena);
         let buffer = std::mem::take(&mut self.buffer);
         let cells = std::mem::take(&mut self.raised_cells);
+        let column = std::mem::take(&mut self.column);
+        let holding = std::mem::replace(&mut self.holding_back, true);
         let mut wrote = Ok(());
-        for (at, loop_) in plan {
-            let current = regions[at].loops[loop_];
-            let plane = regions[at].plane;
-            std::mem::swap(&mut self.arena, &mut regions[at].arena);
-            std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
-            std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
-            let moved = vec![None; self.buffer.len()];
-            // A held lead opens with a travel that names no rate of its own,
-            // and the rate it was read under left the stream the moment the
-            // region was flushed. Put it back, and the travel settles to it
-            // lazily exactly as any other replayed move would.
-            if let Some(rate) = regions[at].rate {
-                self.wanted_feed = Some(rate);
-            }
-            // Reached by a travel the slicer never planned. The hop it did
-            // plan was a few millimetres of the same wall, so it left the
-            // nozzle full; across the plate that same nozzle strings the whole
-            // way. `replay` gives the pull back the moment the travel ends.
-            // Gated on the file's own minimum travel, like every other pull:
-            // a held loop written beside a region that happens to end within
-            // a millimetre of it is no journey, and a retraction is not free
-            // — it costs a stop, a gap where the bead restarts and a bite out
-            // of the filament. Measured on a user's tree-support slice, 252
-            // of 422 held writes travelled under 1 mm and pulled for it.
-            if self.withdrawn <= 0.0
-                && self
-                    .hop_travel
-                    .is_some_and(|far| self.hop(current.lead, self.wrote_at) > far)
-                && let Some(charge) = self.retract_charge
-            {
-                wrote = self.unprime(-charge);
-            }
-            if wrote.is_ok() {
-                wrote = self.write_loop(current, plane, &moved);
-            }
-            std::mem::swap(&mut self.arena, &mut regions[at].arena);
-            std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
-            std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
-            if wrote.is_err() {
+        'stacks: while wrote.is_ok() {
+            // The stack the nozzle is standing in, or the nearest one to it.
+            // No stack owes another an order, so any of them may be written
+            // next — and taking one that is half the plate away leaves the
+            // beads of the one under the nozzle for a journey back. A stack
+            // with nothing measured cannot be placed at all, so it is taken
+            // first rather than toured to last.
+            let standing = self.wrote_at;
+            let Some(nearest) = stacks
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    let reach =
+                        |stack: &Stack| stack.0.map_or(0.0, |extent| from_extent(standing, extent));
+                    reach(left).total_cmp(&reach(right))
+                })
+                .map(|(at, _)| at)
+            else {
                 break;
+            };
+            for (at, loop_) in stacks.swap_remove(nearest).1 {
+                let current = regions[at].loops[loop_];
+                let plane = regions[at].plane;
+                std::mem::swap(&mut self.arena, &mut regions[at].arena);
+                std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
+                std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
+                std::mem::swap(&mut self.column, &mut regions[at].column);
+                let moved = vec![None; self.buffer.len()];
+                // A held lead opens with a travel that names no rate of its own,
+                // and the rate it was read under left the stream the moment the
+                // region was flushed. Put it back, and the travel settles to it
+                // lazily exactly as any other replayed move would.
+                if let Some(rate) = regions[at].rate {
+                    self.wanted_feed = Some(rate);
+                }
+                // Reached by a travel the slicer never planned. The hop it did
+                // plan was a few millimetres of the same wall, so it left the
+                // nozzle full; across the plate that same nozzle strings the whole
+                // way. `replay` gives the pull back the moment the travel ends.
+                // Gated on the file's own minimum travel, like every other pull:
+                // a held loop written beside a region that happens to end within
+                // a millimetre of it is no journey, and a retraction is not free
+                // — it costs a stop, a gap where the bead restarts and a bite out
+                // of the filament. Measured on a user's tree-support slice, 252
+                // of 422 held writes travelled under 1 mm and pulled for it.
+                if self.withdrawn <= 0.0
+                    && self
+                        .hop_travel
+                        .is_some_and(|far| self.hop(current.lead, self.wrote_at) > far)
+                    && let Some(charge) = self.retract_charge
+                {
+                    wrote = self.unprime(-charge);
+                }
+                if wrote.is_ok() {
+                    wrote = self.write_loop(current, plane, &moved);
+                }
+                std::mem::swap(&mut self.arena, &mut regions[at].arena);
+                std::mem::swap(&mut self.buffer, &mut regions[at].buffer);
+                std::mem::swap(&mut self.raised_cells, &mut regions[at].cells);
+                std::mem::swap(&mut self.column, &mut regions[at].column);
+                if wrote.is_err() {
+                    break 'stacks;
+                }
             }
         }
         self.arena = arena;
         self.buffer = buffer;
         self.raised_cells = cells;
+        self.column = column;
+        self.holding_back = holding;
         // These loops were written inside whatever region the file had reached
         // by the end of the layer, under their own `; FEATURE:`. A marker is
         // modal, so that region has to be put back or the beads the slicer
@@ -2215,6 +2346,90 @@ impl<'a, W: Write> Pass<'a, W> {
             }
         }
         wrote
+    }
+
+    /// The held loops of a layer, grouped into the stacks the nozzle should
+    /// visit one after another, each of them lowest first.
+    ///
+    /// Two loops owe each other an order only where they run beside each
+    /// other: a bead laid lower than one already standing within the nozzle's
+    /// own reach is plowed by its underside, and [`MAX_LOOP_GAP`] is five
+    /// times that reach, so two loops further apart than that may be laid in
+    /// any order at all. A contour is such a group already — its loops were
+    /// measured against each other when it was built — and two contours are
+    /// merged here where their extents come within the gap, which keeps a
+    /// hole's wall inside an island's in the stack the island's own wall is in.
+    ///
+    /// Sorting the whole layer by height instead puts every stack in one
+    /// queue, and the nozzle then tours them: a raised loop waits for the end
+    /// of the layer, so each stack is written twice, once with the flat loops
+    /// of every stack and once with the raised ones. Measured on the two
+    /// private slices this was found on, whose islands stand 72 to 83 mm
+    /// apart, journeys across that gap went from the slicer's own 28 and 27
+    /// to 51 and 51, and the distance they covered from 3.51 m to 6.28 m and
+    /// from 3.15 m to 6.47 m — a second tour of each island, every layer, with
+    /// the retraction and the prime that reaches each of them.
+    fn held_stacks(&self, regions: &[Held]) -> Vec<Stack> {
+        // One slot per (region, contour), and the loops in the order they were
+        // read, so a layer with nothing to merge orders exactly as it did when
+        // the plan was one list.
+        let mut slots: Vec<(usize, usize)> = Vec::new();
+        let mut extents: Vec<Option<[f64; 4]>> = Vec::new();
+        let mut items: Vec<(usize, usize, usize)> = Vec::new();
+        for (at, held) in regions.iter().enumerate() {
+            for (index, current) in held.loops.iter().enumerate() {
+                let key = (at, current.contour);
+                let slot = match slots.iter().position(|had| *had == key) {
+                    Some(slot) => slot,
+                    None => {
+                        slots.push(key);
+                        extents.push(None);
+                        slots.len() - 1
+                    }
+                };
+                extents[slot] = cover(extents[slot], current.outline);
+                items.push((at, index, slot));
+            }
+        }
+
+        let mut parent: Vec<usize> = (0..slots.len()).collect();
+        for left in 0..slots.len() {
+            for right in left + 1..slots.len() {
+                let (Some(one), Some(other)) = (extents[left], extents[right]) else {
+                    continue;
+                };
+                if apart(one, other) <= MAX_LOOP_GAP {
+                    union(&mut parent, left, right);
+                }
+            }
+        }
+
+        let mut stacks: Vec<Stack> = Vec::new();
+        let mut roots: Vec<usize> = Vec::new();
+        for (at, index, slot) in items {
+            let root = find(&mut parent, slot);
+            let stack = match roots.iter().position(|had| *had == root) {
+                Some(stack) => stack,
+                None => {
+                    roots.push(root);
+                    stacks.push((extents[root], Vec::new()));
+                    stacks.len() - 1
+                }
+            };
+            stacks[stack].0 = cover(stacks[stack].0, extents[slot]);
+            stacks[stack].1.push((at, index));
+        }
+        for (_, plan) in &mut stacks {
+            plan.sort_by(|left, right| {
+                let height = |at: &(usize, usize)| {
+                    let current = regions[at.0].loops[at.1];
+                    (self.lowest_of(current), self.rise_of(current))
+                };
+                let (left, right) = (height(left), height(right));
+                left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1))
+            });
+        }
+        stacks
     }
 
     /// The input bead's filament throughput, capped by its tool's melt limit.
@@ -2283,13 +2498,32 @@ impl<'a, W: Write> Pass<'a, W> {
 
     /// Writes one loop: the travel that reaches it, the height it is printed
     /// at, and its beads at the flow its own geometry asks for.
+    ///
+    /// The height is not one number for the whole strand. A bead with a column
+    /// over it and under it is raised as the alternation says; a bead under a
+    /// surface, or one whose own column starts here, is laid on the plane —
+    /// see [`Pass::rise_at_bead`]. Where a strand steps between the two the
+    /// height is put ON the bead that takes it: a height written as a move of
+    /// its own stops the toolhead dead over the seam with a full nozzle.
     fn write_loop(&mut self, current: Loop, plane: f64, moved: &[Option<Moved>]) -> io::Result<()> {
+        if std::env::var_os("CORBEL_MARK").is_some() && self.layer == 8 {
+            eprintln!(
+                "WRITE at={:?} contour={} rise={:.3} marker={:?}",
+                self.buffer[current.body].at,
+                current.contour,
+                self.rise_of(current),
+                String::from_utf8_lossy(&self.markers[current.marker]).trim(),
+            );
+        }
         // A loop with nothing standing on it stays on the plane however the
         // parity fell: raising it would leave a bead half a layer proud of
         // whatever the slicer prints over it next, into a gap it metered for a
         // whole layer. `extrusion_factor` meters the half gap the column below
         // already filled.
-        let offset = self.rise_of(current);
+        let first = (current.body..current.beads.max(current.body))
+            .find(|&at| self.buffer[at].extrudes)
+            .unwrap_or(current.body);
+        let offset = self.rise_at_bead(current, first);
         let raise = offset > 0.0;
         let target = plane + offset;
         // A height that rides a travel arrives half way along it, which is no
@@ -2298,7 +2532,11 @@ impl<'a, W: Write> Pass<'a, W> {
         // the travel crosses there is nothing to do; otherwise the nozzle goes
         // up first and only comes down once the travel is over.
         let (laid, over_support) = self.clearance(current.lead, current.body, self.at_now);
-        let laid = laid.into_iter().chain(current.approach_z).reduce(f64::max);
+        let laid = laid
+            .into_iter()
+            .chain(current.approach_z)
+            .chain(self.journey_lift(current, plane))
+            .reduce(f64::max);
         let standing = self.nozzle_z.unwrap_or(target);
         // The ride carries the descent on the travel, so both ends of it have
         // to clear a raised bead — and the loop's own height has to clear
@@ -2367,14 +2605,31 @@ impl<'a, W: Write> Pass<'a, W> {
                 continue;
             }
             let steers = self.buffer[at].steers;
+            // A lead may not take the nozzle BELOW what this pass has already
+            // raised on this layer while it is still crossing it. The slicer's
+            // own descent was written for a nozzle standing where it hopped
+            // from, and the reorder can leave it standing on a raised bead
+            // instead: measured on the `layer-max` plate, a 100 mm travel
+            // commanded its hopped height over ground where beads stood 20 um
+            // higher, and the nozzle was 4 um under them before the descent
+            // was 4 um old. The height goes ON the move, and the loop's own
+            // raise or descent settles it once the lead is over.
+            //
+            // Only a line this pass has not moved: a moved line is written at
+            // the place the visible wall was taken to, and a height written on
+            // it would put it back where the slicer had it.
+            let floor = laid.filter(|clear| {
+                let line = self.buffer[at];
+                moved[at].is_none() && line.places && line.z.is_some_and(|at| at < *clear)
+            });
             match carrier {
                 Some(at_) if at_ == at => self.ride(at, target, raise, moved)?,
-                _ => self.replay(at, 1.0, moved)?,
+                _ => self.replay(at, 1.0, moved, floor)?,
             }
             seen_steers |= steers;
             if steers && !held_accel.is_empty() {
                 for held in held_accel.drain(..) {
-                    self.replay(held, 1.0, moved)?;
+                    self.replay(held, 1.0, moved, None)?;
                 }
             }
         }
@@ -2399,15 +2654,76 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(charge) = self.stopped.take() {
             self.unprime(charge)?;
         }
-        if raise {
-            let half = self.height() / 2.0;
-            self.raise = Some(match self.raise {
-                Some((low, high)) => (low.min(half), high.max(half)),
-                None => (half, half),
-            });
-        }
+        // What the nozzle is at for the beads, which is the lead's height until
+        // a bead of its own takes another. Not assumed to be the loop's own
+        // height: a carrier refused for a hop the slicer made on purpose leaves
+        // its descent where it was, and the first bead then has to take the
+        // height on its own move rather than inherit one that never came.
+        let mut written = self.nozzle_z.map_or(offset, |at| at - plane);
+        let mut any_raised = false;
+        let mut top = f64::NEG_INFINITY;
+        // The height the tail has to clear, where it retraces beads this
+        // strand raised on its way round, and whether that has been asked.
+        let mut tail_floor: Option<f64> = None;
+        let mut tail_cleared = false;
         for at in current.body..current.end {
-            if self.buffer[at].extrudes && self.split_bead(current, at, moved)? {
+            let bead = self.buffer[at].extrudes && at < current.beads;
+            let bead_rise = if bead {
+                self.rise_at_bead(current, at)
+            } else {
+                0.0
+            };
+            let raised = bead && bead_rise > 0.0;
+            // The height this bead takes, where it is not the one the nozzle
+            // already stands at.
+            let mut step =
+                (bead && (bead_rise - written).abs() > f64::EPSILON).then_some(plane + bead_rise);
+            // The bead a strand ends on is in something's way the moment it is
+            // laid, its own tail included. A strand the layer above closes
+            // over partway along is raised where the surface holds it and flat
+            // where it does not, and the slicer's wipe runs INTO the seam,
+            // where the two meet: at the flat height the nozzle's underside
+            // drags through the raised arc it has just laid. Measured on the
+            // `layer-max` plate, whose fill strand is raised at both corners
+            // and flat along the sides between them — the wipe ends 0.06 mm
+            // from a bead standing a whole 0.140 mm proud of it.
+            if !bead && at >= current.beads && !tail_cleared {
+                tail_cleared = true;
+                if any_raised {
+                    let (from, to) = current.cells;
+                    let Self {
+                        laid,
+                        raised_cells,
+                        laid_top,
+                        ..
+                    } = self;
+                    laid.absorb(&raised_cells[from..to]);
+                    laid.settle();
+                    *laid_top = (*laid_top).max(top);
+                }
+                tail_floor = self
+                    .clearance(at, current.end, self.at_now)
+                    .0
+                    .filter(|clear| self.nozzle_z.is_none_or(|now| now < *clear));
+            }
+            // Taken on the tail's first move that goes somewhere, so the rise
+            // is on a move the slicer was already making — and it arrives
+            // before the seam the move ends at, which is the one place the
+            // strand is raised over.
+            if tail_floor.is_some() && !bead && self.buffer[at].places {
+                step = tail_floor.take();
+            }
+            if bead && self.split_bead(current, at, moved, bead_rise, step)? {
+                written = bead_rise;
+                any_raised |= raised;
+                top = top.max(plane + bead_rise);
+                if raised {
+                    let half = bead_rise;
+                    self.raise = Some(match self.raise {
+                        Some((low, high)) => (low.min(half), high.max(half)),
+                        None => (half, half),
+                    });
+                }
                 continue;
             }
             // Past the last bead the flow no longer applies: what is left is
@@ -2422,11 +2738,11 @@ impl<'a, W: Write> Pass<'a, W> {
             // retraction was dropped: measured on a real plate, 44951 of
             // 52498 gone and the part 12.46% heavier, with the nozzle
             // travelling primed the whole way.
-            let factor = if self.buffer[at].extrudes && at < current.beads {
-                let geometry = self.bead_geometry(current, at);
+            let factor = if bead {
+                let geometry = self.bead_geometry(at, bead_rise);
                 let factor = self.extrusion_factor(current, geometry);
-                if raise || factor != 1.0 {
-                    self.meter(at, at + 1, factor, geometry, raise);
+                if raised || factor != 1.0 {
+                    self.meter(at, at + 1, factor, geometry, raised);
                 }
                 factor
             } else {
@@ -2438,29 +2754,43 @@ impl<'a, W: Write> Pass<'a, W> {
             // bead it has just left standing proud; held at the raise, the
             // next travel puts it back where it belongs.
             match self.buffer[at].z {
-                Some(z) if raise && z < target => self.ride(at, target, raise, moved)?,
-                _ => self.replay(at, factor, moved)?,
+                Some(z) if raised && z < plane + bead_rise => {
+                    self.ride(at, plane + bead_rise, raised, moved)?
+                }
+                _ => self.replay(at, factor, moved, step)?,
+            }
+            if bead {
+                written = bead_rise;
+            }
+            if raised {
+                any_raised = true;
+                top = top.max(plane + bead_rise);
+                let half = bead_rise;
+                self.raise = Some(match self.raise {
+                    Some((low, high)) => (low.min(half), high.max(half)),
+                    None => (half, half),
+                });
             }
         }
         if current.end > current.lead {
             self.at_now = self.buffer[current.end - 1].at;
         }
         // Only now is the bead really in anything's way.
-        if raise {
+        if any_raised && !tail_cleared {
             let (from, to) = current.cells;
             let Self {
                 laid, raised_cells, ..
             } = self;
             laid.absorb(&raised_cells[from..to]);
             laid.settle();
-            self.laid_top = self.laid_top.max(target);
+            self.laid_top = self.laid_top.max(top);
         }
         // Gap fill rides in the buffer to keep the wall around it whole, but
         // it is not one of the wall's loops and counting it would put beads in
         // the report that nothing was ever going to raise.
         self.loops_seen += usize::from(!current.filler);
-        self.raised += usize::from(raise);
-        self.capped += usize::from(current.raised && current.capped);
+        self.raised += usize::from(any_raised);
+        self.capped += usize::from(current.raised && !any_raised);
         Ok(())
     }
 
@@ -2486,18 +2816,26 @@ impl<'a, W: Write> Pass<'a, W> {
     /// beside it is plowed exactly as a raised one laid before a flat one is.
     /// Lowest first covers all of them.
     ///
-    /// It is the whole region rather than each contour in turn, because two
-    /// contours of one region can run beside each other — a hole's wall inside
-    /// an island's — and one climbing while the other has settled puts the
-    /// same quarter-layer step between them. The sort is stable, so loops at
-    /// the same height keep the order the slicer wrote them in and each
-    /// contour is still walked in one direction; a region is visited once per
-    /// height it holds, and there are at most three.
+    /// Height is only owed BETWEEN loops that run beside each other, and the
+    /// slicer's own grouping says which those are: one contour, or two whose
+    /// extents come within [`MAX_LOOP_GAP`] — a hole's wall inside an island's
+    /// is such a pair. Everything else may be laid in any order, so it is laid
+    /// in the order it was read. Sorting the HEIGHT first across the whole
+    /// region instead shuffles every wall in the layer together, and a layer
+    /// whose regions are all perimeters is one region: measured on a user's
+    /// plate, two features 100 mm apart, it sent the nozzle back and forth
+    /// across the whole gap — **88 journeys over 40 mm**, each carrying the
+    /// slicer's retract and its prime, which is what grew the blobs in the
+    /// space between them.
     fn order(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.loops.len()).collect();
         order.sort_by(|left, right| {
-            self.rise_of(self.loops[*left])
-                .total_cmp(&self.rise_of(self.loops[*right]))
+            let height = |at: &usize| {
+                let current = self.loops[*at];
+                (self.lowest_of(current), self.rise_of(current))
+            };
+            let (left, right) = (height(left), height(right));
+            left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1))
         });
         order
     }
@@ -2998,11 +3336,7 @@ impl<'a, W: Write> Pass<'a, W> {
         let (Some(before), Some(now)) = (previous.outline, current.outline) else {
             return false;
         };
-        let apart = (before[0] - now[2])
-            .max(now[0] - before[2])
-            .max(before[1] - now[3])
-            .max(now[1] - before[3]);
-        if apart > MAX_LOOP_GAP {
+        if apart(before, now) > MAX_LOOP_GAP {
             return false;
         }
 
@@ -3274,7 +3608,64 @@ impl<'a, W: Write> Pass<'a, W> {
         }
     }
 
-    fn replay(&mut self, index: usize, factor: f64, moved: &[Option<Moved>]) -> io::Result<()> {
+    /// The height a loop's lead has to clear the layer by, where the reorder
+    /// turned the slicer's hop between two loops of one island into a journey
+    /// across the plate, or `None` where the lead already lifts or the travel
+    /// is no journey.
+    ///
+    /// The slicer lifts before it crosses a part and puts the nozzle back down
+    /// on the far side; a travel that is a journey only because this pass
+    /// moved the loop has the lead of the short hop it used to be, which names
+    /// no lift at all. It then crosses both islands at bead height. Measured
+    /// on a user's slice, a **102 mm crossing ran 0.040 mm over the layer**
+    /// — the height of the raised beads it passed over — where the slicer's own
+    /// crossings of the same gap ran 0.320 and 0.400 mm over it, and the blobs
+    /// were where the nozzle changed islands.
+    ///
+    /// Gated like every pull this pass adds: on the file's own
+    /// `retraction_minimum_travel`, measured from where the nozzle really
+    /// stands. The slicer's word on how far is far enough to be worth closing
+    /// is also its word on how far is worth lifting for. A lead that already
+    /// commands a height above the lift is the slicer's own hop, replayed, and
+    /// is left alone.
+    fn journey_lift(&self, current: Loop, plane: f64) -> Option<f64> {
+        let lift = plane + self.travel_lift?;
+        let commanded = self.buffer[current.lead..current.body]
+            .iter()
+            .filter_map(|buffered| buffered.z)
+            .reduce(f64::max);
+        if commanded.is_some_and(|had| had >= lift) {
+            return None;
+        }
+        let journey = self.hop(current.lead, self.wrote_at);
+        let far = self.hop_travel?;
+        (journey > far && self.displaced_lead(current)).then_some(lift)
+    }
+
+    /// True where the nozzle does not stand where the slicer left it for this
+    /// loop, so its lead is a travel this pass created rather than one the
+    /// slicer planned.
+    ///
+    /// A held loop is displaced by construction — holding it to the end of the
+    /// layer is what moved it — and it opens a buffer of its own, so there is
+    /// no line in front of its lead to measure against.
+    fn displaced_lead(&self, current: Loop) -> bool {
+        match current.lead {
+            0 => self.holding_back,
+            from => {
+                let planned = self.buffer[from - 1].at;
+                (planned.0 - self.wrote_at.0).hypot(planned.1 - self.wrote_at.1) > f64::EPSILON
+            }
+        }
+    }
+
+    fn replay(
+        &mut self,
+        index: usize,
+        factor: f64,
+        moved: &[Option<Moved>],
+        step: Option<f64>,
+    ) -> io::Result<()> {
         let buffered = self.buffer[index];
         if buffered.extrudes {
             self.settle_plane()?;
@@ -3296,7 +3687,18 @@ impl<'a, W: Write> Pass<'a, W> {
         // taking the ratio off a write that then does not happen meters a bead
         // for a path nothing drew. A line naming neither coordinate is the one
         // case `Line::write_moved` refuses.
-        let to = moved[index].filter(|_| buffered.places);
+        //
+        // A height this line is taking is written ON it, which is why a bead
+        // with no displacement of its own is written as though it had one:
+        // the same move, a `Z` word further.
+        let to = match step {
+            Some(_) => buffered.places.then_some(Moved {
+                to: written(buffered.at),
+                centre: None,
+                ratio: 1.0,
+            }),
+            None => moved[index].filter(|_| buffered.places),
+        };
         let ratio = to.map_or(1.0, |moved| moved.ratio);
         let written_delta = buffered.delta.map(|delta| {
             let scaled = delta * factor * ratio;
@@ -3347,6 +3749,9 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(z) = buffered.z {
             self.nozzle_z = Some(z);
         }
+        if let Some(z) = step {
+            self.nozzle_z = Some(z);
+        }
         if let Some(rate) = buffered.f {
             self.wanted_feed = Some(rate);
         }
@@ -3379,7 +3784,7 @@ impl<'a, W: Write> Pass<'a, W> {
         if let Some(moved) = to {
             let text = repaired(raw);
             let line = Line::parse_bytes(&text, raw);
-            if line.write_moved_at(out, moved.to, moved.centre, value, None, slowed)? {
+            if line.write_moved_at(out, moved.to, moved.centre, value, step, slowed)? {
                 return out.write_all(b"\n");
             }
         }
@@ -3584,13 +3989,18 @@ impl<'a, W: Write> Pass<'a, W> {
         ((height - self.ground(from, to, arc)) / height).max(0.0)
     }
 
-    fn bead_geometry(&self, current: Loop, index: usize) -> f64 {
+    /// The gap one bead crosses, as a multiple of the layer height.
+    ///
+    /// `offset` is the height THIS bead is written at, which is the loop's
+    /// only where the bead carries a column of its own: a strand running out
+    /// from under a surface is raised on the beads that have something over
+    /// them and laid on the plane on the beads that have not.
+    fn bead_geometry(&self, index: usize, offset: f64) -> f64 {
         let from = index
             .checked_sub(1)
             .map_or(self.entry, |previous| self.buffer[previous].at);
         let buffered = self.buffer[index];
         let below = self.ground(from, buffered.at, buffered.arc);
-        let offset = self.rise_of(current);
         if offset == below {
             return 1.0;
         }
@@ -3603,6 +4013,8 @@ impl<'a, W: Write> Pass<'a, W> {
         current: Loop,
         index: usize,
         moved: &[Option<Moved>],
+        offset: f64,
+        step: Option<f64>,
     ) -> io::Result<bool> {
         let buffered = self.buffer[index];
         let from = index.checked_sub(1).map_or(self.entry, |previous| {
@@ -3689,7 +4101,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 ..arc
             });
             let height = self.height();
-            let geometry = ((height + self.rise_of(current) - below) / height).max(0.0);
+            let geometry = ((height + offset - below) / height).max(0.0);
             let factor = self.extrusion_factor(current, geometry);
             let stock = delta * ratio * (share - start) * factor;
             self.meter(
@@ -3697,7 +4109,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 index + 1,
                 factor * (share - start),
                 geometry * (share - start),
-                self.rise_of(current) > 0.0,
+                offset > 0.0,
             );
             let reading = self.extruder.is_absolute();
             self.extruder.set_mode(e_mode(buffered.absolute));
@@ -3733,14 +4145,26 @@ impl<'a, W: Write> Pass<'a, W> {
                     .unwrap_or(bytes.len())]
             };
             let text = repaired(raw);
+            // A height this bead is taking rides the first piece of it: a
+            // height written as a move of its own stops the toolhead dead over
+            // the seam, and the pieces behind the first are on a plane the
+            // nozzle has already reached.
             Line::parse_bytes(&text, raw).write_segment_at(
                 &mut self.out,
-                previous,
-                destination,
-                piece_arc,
-                value,
-                rate,
+                crate::gcode::Piece {
+                    from: previous,
+                    to: destination,
+                    arc: piece_arc,
+                    e: value,
+                    f: rate,
+                    z: if start == 0.0 { step } else { None },
+                },
             )?;
+            if start == 0.0
+                && let Some(z) = step
+            {
+                self.nozzle_z = Some(z);
+            }
             self.out.write_all(b"\n")?;
             self.pulled(self.withdrawn - stock);
             self.filament += stock;
@@ -3770,6 +4194,43 @@ impl<'a, W: Write> Pass<'a, W> {
             self.offset(current.steps, current.capped)
         } else {
             0.0
+        }
+    }
+
+    /// The lowest height this loop lays a bead at, above its layer's plane.
+    ///
+    /// What the order is for is the nozzle's underside: a bead at the plane
+    /// laid beside one already standing proud is plowed. A strand the layer
+    /// above holds over only part of its length lays beads at BOTH heights,
+    /// so the raise it took says nothing about what can be plowed — measured
+    /// on a user's 0-wall slice, two such strands written raise-first laid
+    /// **104 beads 117 µm under material already within the nozzle's reach**,
+    /// against none in the file the slicer wrote. Ordered by the lowest bead
+    /// each of them really lays, the flat ones go down first, which is the
+    /// rule the order always meant.
+    fn lowest_of(&self, current: Loop) -> f64 {
+        match current.grounded {
+            true => 0.0,
+            false => self.rise_of(current),
+        }
+    }
+
+    /// How far above its layer's plane this bead of this loop is written.
+    ///
+    /// The loop is one place in the alternation, but a column is only as long
+    /// as the material standing over it: where a shoulder, a shelf or a skin
+    /// closes the part over part of the strand, the beads under that part have
+    /// nothing above them and stay on the plane, while every bead that does
+    /// carry a column is raised as the alternation says. Measured on a user's
+    /// 0-wall bar, whose fill runs under a solid skin for part of every layer
+    /// around the middle of the print: reading the strand as one column left
+    /// **76 of its 1228 strands flat end to end**, where the only beads that
+    /// had to be flat were the ones under the skin.
+    fn rise_at_bead(&self, current: Loop, at: usize) -> f64 {
+        let (base, _) = current.column;
+        match self.column.get(base + at.saturating_sub(current.body)) {
+            Some(0) | None => 0.0,
+            Some(_) => self.rise_of(current),
         }
     }
 
@@ -3899,12 +4360,15 @@ impl<'a, W: Write> Pass<'a, W> {
             .filter(|cells| !cells.is_empty())
             .map(|cells| cells.dilated(2));
         let mut path = std::mem::take(&mut self.path);
+        let mut flags = std::mem::take(&mut self.flags);
 
         for index in 0..self.loops.len() {
+            flags.clear();
             let (share, points, traced) = self.shares(
                 [above, here, below, beside.as_ref()],
                 self.loops[index],
                 &mut path,
+                &mut flags,
             );
             // A walk that could not be completed says nothing about what is
             // over this loop or under it, and every one of the answers below
@@ -3915,34 +4379,115 @@ impl<'a, W: Write> Pass<'a, W> {
             // Nothing of it is recorded in `next_ground` either, so the layer
             // above measures nothing standing here — which is exactly what
             // will have been printed.
-            if traced == Trace::Refused {
+            let whole = traced == Trace::Whole;
+            let over = |set: usize| points > 0 && share[set] as f64 > points as f64 * CAP_SHARE;
+            if whole {
+                // What is left to decide for the LOOP: how old its column is.
+                // Whether it has one anywhere is its own beads' answer below.
+                self.loops[index].steps = match (over(1), over(2)) {
+                    (true, _) => 0,
+                    (_, true) => 1,
+                    _ => object,
+                };
+            } else {
                 self.warn_about_the_trace();
                 self.loops[index].raised = false;
-                self.loops[index].capped = false;
                 self.loops[index].steps = object;
+            }
+            // Whether a bead is raised is the bead's own answer, and what
+            // bounds it is where the STRAND's column ends. A strand the layer
+            // above closes over partway along is not one column with a flat
+            // end: it is a column for as long as the surface holds it and
+            // layer plane under the surface, and the bead's own cells say
+            // which. Measured on a user's 0-wall bar, whose fill runs under a
+            // solid skin for part of every layer in the middle of the print:
+            // read as one answer for the whole strand, **76 of its 1228
+            // strands** were laid flat end to end where only the beads under
+            // the skin had to be. Support beside a bead overrides both, since
+            // a raise there stands proud into material the slicer prints to
+            // break off. See [`Loop::column`].
+            //
+            // A strand the phase left flat raises nothing whatever its cells
+            // say: an overhang-only loop, or one the alternation never chose.
+            // Flags on such a strand are not merely decorative — `capped` is
+            // what tells the order and the hold that nothing on this loop is
+            // raised, and a loop held as raised and then written flat is laid
+            // after the raised strands beside it, which is the plow the hold
+            // exists to prevent.
+            let phase = whole && !tops && self.loops[index].raised;
+            let ends = phase && over(0);
+            for flag in flags.iter_mut() {
+                *flag = u8::from(
+                    phase
+                        && match *flag {
+                            // Not a bead at all, or one the layer above
+                            // holds nothing over while the strand ends there.
+                            0 | 3 => false,
+                            2 => !ends,
+                            _ => true,
+                        },
+                );
+            }
+            let start = self.column.len();
+            self.column.extend_from_slice(&flags);
+            self.loops[index].column = (start, self.column.len());
+            // A strand with nothing raised on it at all is what the order and
+            // the hold read: a strand whose beads are on both sides of the
+            // line is one the layer has no room to place, so it is written
+            // where its flat beads belong — with the flat ones, before
+            // anything is raised beside them.
+            self.loops[index].capped = flags.iter().all(|flag| *flag == 0);
+            // A strand that lays any bead on the plane can be plowed by the
+            // nozzle laying a raised one beside it, so the order has to see
+            // the lowest height it really reaches and not the raise it took.
+            let body = self.loops[index].body;
+            self.loops[index].grounded = (body..self.loops[index].end)
+                .any(|at| self.buffer[at].extrudes && flags[at - body] == 0);
+            if !whole {
                 continue;
             }
-            let over = |set: usize| points > 0 && share[set] as f64 > points as f64 * CAP_SHARE;
-            self.loops[index].capped = tops || over(0) || share[3] > 0;
-            self.loops[index].steps = match (over(1), over(2)) {
-                (true, _) => 0,
-                (_, true) => 1,
-                _ => object,
-            };
             let current = self.loops[index];
             let mut next_ground = std::mem::take(&mut self.next_ground);
-            let rise = self.rise_of(current);
-            self.trace(current, |from, to, arc| {
-                next_ground.add(from, to, arc, rise)
-            });
-            self.next_ground = next_ground;
-            if self.rise_of(current) > 0.0 {
-                let start = self.raised_cells.len();
-                self.raised_cells.extend_from_slice(&path);
-                self.loops[index].cells = (start, self.raised_cells.len());
+            // The ground this layer leaves for the next one is what each bead
+            // was REALLY written at, bead by bead: a strand held flat over
+            // part of its length leaves nothing standing there, and the layer
+            // above then measures the plane under it rather than a raise that
+            // was never laid.
+            let mut at = current.lead;
+            let mut from = match current.lead {
+                0 => self.entry,
+                lead => self.buffer[lead - 1].at,
+            };
+            let cells = self.raised_cells.len();
+            while at < current.end {
+                let buffered = self.buffer[at];
+                // Read the bead's own answer, not the strand's: a bead the
+                // strand runs out on was written on the plane, so nothing
+                // stands there for the layer above to measure.
+                let rise = if buffered.extrudes {
+                    let rise = self.rise_at_bead(current, at);
+                    next_ground.add(from, buffered.at, buffered.arc, rise);
+                    rise
+                } else {
+                    0.0
+                };
+                if rise > 0.0 {
+                    footprint::cells(
+                        footprint::Grid::default(),
+                        from,
+                        buffered.at,
+                        buffered.arc,
+                        |cell| self.raised_cells.push(cell),
+                    );
+                }
+                from = buffered.at;
+                at += 1;
             }
+            self.loops[index].cells = (cells, self.raised_cells.len());
+            self.next_ground = next_ground;
         }
         self.path = path;
+        self.flags = flags;
     }
 
     /// Says once that a loop's path could not be walked. The user's print is
@@ -3958,26 +4503,15 @@ impl<'a, W: Write> Pass<'a, W> {
         );
     }
 
-    /// Walks the moves that lay a loop's beads, as `(from, to, arc)`.
-    ///
-    /// A loop starts where the one before it finished, and the first loop of a
-    /// region starts where the nozzle stood when the region opened.
-    fn trace(&self, current: Loop, mut visit: impl FnMut((f64, f64), (f64, f64), Option<Arc>)) {
-        let mut from = match current.lead {
-            0 => self.entry,
-            lead => self.buffer[lead - 1].at,
-        };
-        for index in current.lead..current.end {
-            let buffered = self.buffer[index];
-            if buffered.extrudes {
-                visit(from, buffered.at, buffered.arc);
-            }
-            from = buffered.at;
-        }
-    }
-
     /// How much of a loop's path falls in each of the given sets, how much
     /// path there was, and the cells it went through, left in `path`.
+    ///
+    /// One byte per buffered line from the loop's `lead` to its `end` is left
+    /// in `column`, set where that line is a bead with a column standing over
+    /// it AND under it — see [`Loop::column`]. It is decided HERE, in the walk
+    /// the shares are already made of: the answer is one the same cells give,
+    /// and walking the path a second time for it costs more than the whole
+    /// question is worth.
     ///
     /// [`Trace::Refused`] where the walk could not be completed — a move no
     /// printer makes, which no answer can be read off. The counts that come
@@ -3987,21 +4521,71 @@ impl<'a, W: Write> Pass<'a, W> {
         sets: [Option<&Cells>; 4],
         current: Loop,
         path: &mut Vec<u32>,
+        column: &mut Vec<u8>,
     ) -> ([usize; 4], usize, Trace) {
         let mut found = [0usize; 4];
         let mut traced = Trace::Whole;
         path.clear();
-        self.trace(current, |from, to, arc| {
-            let walk = footprint::cells(footprint::Grid::default(), from, to, arc, |cell| {
-                path.push(cell);
-                for (at, set) in sets.iter().enumerate() {
-                    found[at] += usize::from(set.is_some_and(|cells| cells.has(cell)));
+        let mut from = match current.lead {
+            0 => self.entry,
+            lead => self.buffer[lead - 1].at,
+        };
+        for index in current.lead..current.end {
+            let buffered = self.buffer[index];
+            if !buffered.extrudes {
+                if index >= current.body {
+                    column.push(0);
                 }
+                from = buffered.at;
+                continue;
+            }
+            // A bead keeps its raise unless the layer above holds nothing over
+            // most of it — the same share the loop-level rule takes, applied
+            // to the bead's own cells. A wall that drifts a hundredth of a
+            // millimetre crosses a cell boundary and leaves a sliver of itself
+            // uncovered; read strictly, every bead along that edge would be
+            // held flat and the column would lose its interlock one bead per
+            // layer. Read as a share, only a bead the surface really covers
+            // gives up its raise.
+            let (mut cells, mut uncovered) = (0usize, 0usize);
+            let mut beside_support = false;
+            let walk = footprint::cells(
+                footprint::Grid::default(),
+                from,
+                buffered.at,
+                buffered.arc,
+                |cell| {
+                    path.push(cell);
+                    for (at, set) in sets.iter().enumerate() {
+                        found[at] += usize::from(set.is_some_and(|cells| cells.has(cell)));
+                    }
+                    let held = |set: usize| sets[set].is_some_and(|cells| cells.has(cell));
+                    // Set 0 is what the layer above does NOT hold and set 3 is
+                    // support — one bead wide and printed to be broken off.
+                    // Whether this bead's column STARTS here is not asked
+                    // here: that is the loop's own answer, taken over the
+                    // whole of it, because the first layer of a column is one
+                    // the ramp climbs from rather than one to hold flat.
+                    cells += 1;
+                    uncovered += usize::from(held(0));
+                    beside_support |= held(3);
+                },
+            );
+            let standing = uncovered as f64 <= cells as f64 * CAP_SHARE;
+            // Three answers, because the caller has to tell them apart: 1
+            // where the layer above holds the bead, 2 where it holds nothing
+            // over it — a raise there is the strand's own question — and 3
+            // where support stands beside it, which is never a raise.
+            column.push(match (standing, beside_support) {
+                (_, true) => 3,
+                (true, false) => 1,
+                (false, false) => 2,
             });
             if walk == Trace::Refused {
                 traced = Trace::Refused;
             }
-        });
+            from = buffered.at;
+        }
         (found, path.len(), traced)
     }
 

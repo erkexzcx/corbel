@@ -45,6 +45,23 @@ Measured with the marking in place on the user's 48-layer 0-wall slice: **0 of t
 4. **`assign_contours` marks each island's outermost ring** as the visible one, before it groups anything; see above.
 5. **`Pass::settle_fill_contours`** then runs between `assign_contours` and `number_loops` and applies the two tests above, demoting what fails them to `filler` so it takes no place in the alternation and no wall flow.
 
+## A strand is bricked bead by bead
+
+The raise is not one answer for a strand. A strand the layer above closes over partway along is a column where the surface holds it and layer plane where it does not, and only the bead's own cells say which. `Pass::shares` writes one byte per buffered line (`Loop::column`): `1` where the layer above holds the bead, `2` where it holds nothing over it, `3` where support stands beside it, `0` where the line is not a bead. What stays loop-wide is where the strand's column ends (`over(0)`, the `CAP_SHARE` rule that was there before), the support beside it, the ramp and the phase.
+
+Two traps, both caught by the plates' nozzle ledger:
+
+- **A non-bead line must map to no raise.** Folding the `0` a comment gets into the same arm as a covered bead made every `; LINE_WIDTH:` and `G1 F` line of a strand "raised", so a loop with nothing raised on it read as raised: held to the end of the layer, then written flat after the raised strands beside it. On `nasty-combo` that was a 140 µm crest under a wipe.
+- **The flags follow the phase.** A loop the alternation left flat — overhang-only, or phase zero — raises nothing whatever its cells say. Without the gate a loop is held as raised on its flags and written flat, which is the same plow from the other side.
+
+`Loop::capped` is now "nothing on this loop is raised", which is what the order and the hold read.
+
+Measured on the user's 48-layer bar (`--bricks --zaa`), against the build before this change: `Sparse infill` **+533 mm** of strand raised (L11 16.3% → 20.5%; L10/16/24 +28/+2/+27 mm), every other region identical to the millimetre, filament +0.5 mm of 8808, `invariant` 0 raised external extrusions, `nozzle` 0 faults. Pinned by `a_strand_the_surface_ends_on_is_bricked_only_where_the_surface_holds_it`, which fails with the rule put back to one answer per loop.
+
+**A mixed strand's tail retraces its own raised arc at the flat height.** A strand raised at one end and flat at the other carries both heights on one ring, and the slicer's wipe runs back along the wall into the seam where they meet — measured on the `layer-max` plate, a wipe ending 0.06 mm from a bead standing a whole 0.140 mm proud of it. `Pass::write_loop` puts the height on the first tail move that goes somewhere, reaches it before the seam that move ends at, and never writes a `G1 Z` of its own for it. Pinned by `plates::a_layer_deeper_than_two_thirds_of_the_nozzle` and `every_awkward_setting_at_once`, both of which fail without it.
+
+**The first bead's height is what the nozzle is at, not what the lead was meant to leave it at.** The number the beads are metered against starts from `self.nozzle_z`, so a lead whose carrier was refused for a hop the slicer made on purpose — the descent then replays as written — still puts the first bead on its own move instead of inheriting a height that never came.
+
 ## What tells you it worked
 
 - On the 0-wall slice: 3460 loops and **1235** raised over an 8-layer window, where before it was 0 and 0 — and the outermost strand of every layer still sits exactly on its plane, which `audit.py invariant` reports as 0 of 5348 external extrusions raised.
@@ -58,7 +75,22 @@ The holder therefore has to be the ring **BESIDE** the loop: `outer.fill && hold
 - On the `zig-zag` plate: **0 raised**, and the run fails if any loop is.
 - On the other thirty-one fixtures: byte-identical output, established by building the same tree with the gate forced off and diffing every one.
 
-## What the first attempt at this measured
+## What a raised fill strand metered wrong
+
+Bricking a fill puts raised and flat beads of the same layer side by side, a bead apart, and the slicer re-insets a concentric fill from layer to layer — so a bead written over that ground crosses the raised strands at an angle and its gap walks from a whole layer to half of one along its own length. `Ground::profile` folded each such walk into ONE piece, metered by the piece's mean, because the fold only watched the step from the running mean; a piece could therefore span a whole `level` of ground. Measured with `audit-extrusion gap` on the user's 0-wall bar, `--bricks --zaa`, against the pre-bricking build:
+
+- `SparseInfill`: **54.11 mm** of the layer's fill path over its own gap and 7.48 mm under it, where the same file bricked nothing and read 0.00 and 0.00. Max area ratio **1.555** — a raised bead's `1.5 × 1.037`, raise times the wall flow, written over ground that is half a layer lower.
+- `SolidInfill`: 5.80 mm over, 0.00 before.
+- The layers that carry it are the ones where the fill changes pattern: L5, L13, L17, L23, L38, L39, L45 on that file, three-millimetre beads with `over` up to 0.32.
+
+The fold now also cuts a piece whose own span of ground would exceed **half** the level (`Ground::merge`), which halves the walk the mean can be out by. On the same file that is **0.09 mm** over and 0.10 mm under, `SolidInfill` 0.085 mm, for **+7.9%** bead moves and 1.14% of them under 50 µm against the input's 0.04% — the move profile `SPLIT_SHARE` itself was chosen for. Pinned by `brick::ground::tests::a_walking_ground_is_written_in_pieces_that_stay_on_it` (fails with the bound at `level`) and `a_walk_narrower_than_a_step_is_left_whole`.
+
+**A folded piece must be told how far it may walk, not only where it steps.** The first attempt at the fill bricking's metering was the threshold `SEAM_SHARE`, and this is the same mistake one level down: what a piece is metered by is a MEAN, so what bounds its error is the ground's RANGE under it and nothing else.
+
+## A helical hop is not a primed stop
+
+Bambu writes the layer-boundary hop as `G3 Z5.414 I-1.217 J-.019 P1 F30000` — a helix, naming only Z and an arc centre. `nozzle::ledger` read every Z-only line with a full nozzle as "a height change written as a move of its own", which that is not: the nozzle sweeps through an arc. Every layer boundary of every Bambu file counted, so the fault read `3 against 1` on a file whose pass had added none of them, and the input's own count of 1 was the same misreading. The rule now excludes a line naming an arc centre (`I`/`J`/`R`) and still counts a bare `G1 Z` with a full nozzle, which is the defect it was written for; pinned by `nozzle::tests::a_helical_hop_is_not_a_primed_stop_but_a_bare_height_is`. The pass's own charge accounting is still what decides whether the nozzle is empty when it reaches one.
+
 
 Built and reverted. Every step above was written and two things came out of it that changed the shape of the work.
 
@@ -66,3 +98,24 @@ Built and reverted. Every step above was written and two things came out of it t
 
 **Widening the wall's buffer is wrong anyway.** With the gate half-open the suite went from 623 green to 5 failures, all in `tests/plates.rs`, all on fixtures that have walls AND infill: granting infill a place in the same buffer changes files that lay both, because a buffered loop is reordered and re-metered wherever it sits. The answer was not to widen `continues` for every infill region but to gate the whole thing on the file stating a solid fill, so no sparse-filled file is touched at all.
 
+
+## The held loops are no longer a second tour of every feature
+
+`flush` holds every raised loop back and `write_held` lays them at the end of the layer. The wait is load-bearing — an island's walls and its infill interleave, so a loop released at the next region still has infill laid over it — but ordering the whole batch by `rise_of` alone made the held pass a second tour of every feature, each displaced lead a journey with a retract and a prime.
+
+Measured on the two private slices this was found on, `--bricks` only, whose two islands stand 72 to 83 mm apart (one 1000-wall slice, one 0-wall at 100% concentric fill; journeys across the gap, and the distance they cover):
+
+| | slicer's own | ordered by rise alone | ordered by stack |
+|---|---|---|---|
+| 1000 walls | 28 / 3.51 m | 51 / 6.28 m | 33 / 3.92 m |
+| concentric fill | 27 / 3.15 m | 51 / 6.47 m | 29 / 3.09 m |
+
+The height is owed only BETWEEN loops that run beside each other, so the wait is now ordered in two steps: `Pass::held_stacks` groups the held loops into stacks — a contour, or several whose extents come within `MAX_LOOP_GAP`, which is five times the nozzle's own reach — and `write_held` visits them from wherever the nozzle stands, lowest first within each stack. Nothing a stack owes another is an order, so any of them may be written next, and taking one half a plate away leaves the beads under the nozzle for a journey back.
+
+**Every flat loop is still written before any raised one.** That rule is what keeps `tests/collision.rs` green, and this changes only the order among the held loops, never which loops are held. Pinned by `brick::tests::two_islands_a_plate_apart_are_not_toured_twice_a_layer`: journeys over 20 mm on a synthetic two-island file are 15 against the slicer's 9 with one queue, and 10 with stacks.
+
+**A reordered wait can leave the nozzle standing on a raise, and the slicer's own descent then drags it through one.** A lead's descent was written for a nozzle standing where it hopped from; after the reorder it can be standing on a raised bead of the same layer instead. Measured on the `layer-max` plate: a travel plus its loop's descent, 4 um under beads standing 20 um higher, once the ordering changed. A line that would take the nozzle below what this pass has already raised in this layer, while the lead crosses it, now carries that height instead and the loop's own raise or descent settles it once the lead is over. Pinned by `plates::a_layer_deeper_than_two_thirds_of_the_nozzle`, which fails without it.
+
+**A strand the surface holds over only part of its length is ordered by its FLAT beads.** On layer 14 of that slice the layer above's strands cross this one's instead of nesting over them, so the per-bead coverage answer alternates along a strand and the strand comes out with beads at two heights. Sorted by `rise_of`, such a strand is written as though it were raised end to end — and its flat beads then go down beside a neighbour that is already standing proud: **104 beads laid 117 um under material within the nozzle's reach**, against none in the file the slicer wrote. `Loop::grounded` and `Pass::lowest_of` sort by the lowest bead a strand really lays, which takes that to **0** with every raised loop kept (1103).
+
+Flattening the short raised runs was the first attempt and it is wrong twice over: the plow is BETWEEN two strands, not within one, so it stayed at 104 — and it cost 57 of the 1103 raised loops. The shape looks like the one `zaa` answers with `follow_notches` and `unjab`; it is not, and a fix aimed there removes interlock without touching the defect.

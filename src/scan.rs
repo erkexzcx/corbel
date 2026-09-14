@@ -171,6 +171,11 @@ pub struct Survey {
     /// How much filament the slicer pulls back for a travel, in mm, per
     /// filament slot.
     pub retract_length: Vec<Option<f64>>,
+    /// How far the slicer lifts the nozzle to travel, in mm, per filament
+    /// slot. Reordering turns a hop the slicer wrote between two loops of one
+    /// island into a journey across the plate, and the slicer's own lift is
+    /// what that journey has to clear the layer by.
+    pub travel_lift: Vec<Option<f64>>,
     /// The fastest each filament slot is asked to melt, in mm of filament a
     /// second, indexed by the tool that selects it.
     ///
@@ -413,6 +418,19 @@ impl Survey {
             })
     }
 
+    /// How far `tool` lifts the nozzle to travel, with the same single-slot
+    /// fallback as [`melt_at`](Self::melt_at).
+    pub fn lift_at(&self, tool: usize) -> Option<f64> {
+        self.travel_lift
+            .get(tool)
+            .copied()
+            .flatten()
+            .or_else(|| match self.travel_lift.len() {
+                1 => self.travel_lift[0],
+                _ => None,
+            })
+    }
+
     /// Where `layer`'s walls have nothing above them, or `None` where the file
     /// gave the survey no way to tell.
     pub fn uncovered(&self, layer: usize) -> Option<&Cells> {
@@ -512,6 +530,7 @@ struct Scan {
     z_steps: Vec<(i64, usize)>,
     z_feedrate: Option<f64>,
     hop_travel: Vec<Option<f64>>,
+    travel_lift: Vec<Option<f64>>,
     retract_length: Vec<Option<f64>>,
     /// The rate every move is read at, since `F` is modal.
     feed: Option<f64>,
@@ -735,6 +754,22 @@ impl Scan {
                             .map(|piece| match piece.trim().parse::<f64>() {
                                 Ok(far) if (0.0..1000.0).contains(&far) => Some(far),
                                 _ => None,
+                            })
+                            .collect();
+                    }
+                } else if key.eq_ignore_ascii_case("z_hop")
+                    || key.eq_ignore_ascii_case("retract_lift")
+                {
+                    if self.travel_lift.is_empty() {
+                        self.travel_lift = value
+                            .split(',')
+                            .map(|piece| {
+                                piece
+                                    .trim()
+                                    .parse::<f64>()
+                                    .ok()
+                                    .filter(|lift| *lift > 0.0)
+                                    .filter(is_a_height)
                             })
                             .collect();
                     }
@@ -1311,6 +1346,7 @@ impl Scan {
             nozzle,
             z_feedrate: self.z_feedrate,
             hop_travel: self.hop_travel,
+            travel_lift: self.travel_lift,
             retract_length: self.retract_length,
             melt_rate,
             bricked: self.bricked,

@@ -287,6 +287,19 @@ pub struct Line<'a> {
     has_xy: bool,
 }
 
+/// The numbers a piece of a bead may have to state, each where it differs
+/// from what the line already carries: the span it covers, the filament laid
+/// along it, the rate it runs at and the height it takes.
+#[derive(Clone, Copy, Debug)]
+pub struct Piece {
+    pub from: (f64, f64),
+    pub to: (f64, f64),
+    pub arc: Option<crate::geometry::Arc>,
+    pub e: f64,
+    pub f: Option<f64>,
+    pub z: Option<f64>,
+}
+
 impl<'a> Line<'a> {
     /// Reads every word.
     ///
@@ -700,15 +713,15 @@ impl<'a> Line<'a> {
         Ok(true)
     }
 
-    pub fn write_segment_at<W: Write>(
-        &self,
-        out: &mut W,
-        from: (f64, f64),
-        to: (f64, f64),
-        arc: Option<crate::geometry::Arc>,
-        e: f64,
-        f: Option<f64>,
-    ) -> io::Result<()> {
+    pub fn write_segment_at<W: Write>(&self, out: &mut W, piece: Piece) -> io::Result<()> {
+        let Piece {
+            from,
+            to,
+            arc,
+            e,
+            f,
+            z,
+        } = piece;
         let mut append = Vec::new();
         if self.x_span.is_none() {
             append.push((b'X', to.0));
@@ -735,7 +748,7 @@ impl<'a> Line<'a> {
                 radius
             });
         }
-        line.write_moved_at(out, to, arc.map(|arc| (arc.i, arc.j)), Some(e), None, f)?;
+        line.write_moved_at(out, to, arc.map(|arc| (arc.i, arc.j)), Some(e), z, f)?;
         Ok(())
     }
 
@@ -1784,8 +1797,18 @@ mod tests {
             j: 0.0,
             clockwise: false,
         };
-        line.write_segment_at(&mut out, (7.0, 0.0), to, Some(arc), 0.2, None)
-            .unwrap();
+        line.write_segment_at(
+            &mut out,
+            Piece {
+                from: (7.0, 0.0),
+                to,
+                arc: Some(arc),
+                e: 0.2,
+                f: None,
+                z: None,
+            },
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         let piece = Line::parse(&text);
         assert!(piece.r.unwrap() > 0.0, "{text}");
@@ -1836,8 +1859,18 @@ mod tests {
         let text = repaired(raw);
         let line = Line::parse_bytes(&text, raw);
         let mut out = Vec::new();
-        line.write_segment_at(&mut out, (79.945, 77.673), (80.0, 78.0), None, 0.4, None)
-            .expect("the split writes");
+        line.write_segment_at(
+            &mut out,
+            Piece {
+                from: (79.945, 77.673),
+                to: (80.0, 78.0),
+                arc: None,
+                e: 0.4,
+                f: None,
+                z: None,
+            },
+        )
+        .expect("the split writes");
         assert!(
             out.windows(4).any(|window| window == b"Caf\xe9"),
             "the comment kept its own byte: {:?}",

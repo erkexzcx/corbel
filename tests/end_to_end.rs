@@ -970,7 +970,12 @@ fn the_slicer_environment_supplies_the_layer_height() {
     );
     assert!(output.status.success(), "{output:?}");
     let report = String::from_utf8_lossy(&output.stderr);
-    assert!(report.contains("raised by 0.150 mm"), "{report}");
+    // Half of the exported 0.3 for a settled column, and half of that for a
+    // strand one layer up its own ramp: a strand part-way up is raised too, by
+    // the height its own age asks for, wherever the layer above still holds
+    // it. Without the environment the file's own Z steps measure 0.2, so a
+    // 0.150 in the report can only have come from the slicer's setting.
+    assert!(report.contains("raised by 0.075 to 0.150 mm"), "{report}");
     assert!(!report.contains("warning"), "{report}");
 }
 
