@@ -2532,11 +2532,26 @@ impl<'a, W: Write> Pass<'a, W> {
         // the travel crosses there is nothing to do; otherwise the nozzle goes
         // up first and only comes down once the travel is over.
         let (laid, over_support) = self.clearance(current.lead, current.body, self.at_now);
-        let laid = laid
+        // Only a travel that really runs over material already standing on
+        // this layer is worth lifting for. Gating on the travel's LENGTH
+        // instead lifts for every hop the reorder lengthens past the file's
+        // minimum travel, and a lift is a `G1 Z` of its own — a dead stop.
+        // Measured on a user's slice, that put **184 stops on an island the
+        // slicer made 17 on**, and the end of the part it stood on came out
+        // worse than before the lift existed, while the end whose travels
+        // really do cross the part came out better.
+        //
+        // A travel that crosses no raised bead can still be laid over the
+        // layer: a loop written below what this layer has already put down
+        // skims it for the whole journey, which is the island crossing that
+        // has no raise under it.
+        let crosses = laid.is_some() || target < self.laid_top;
+        let lift = crosses
+            .then(|| self.journey_lift(current, plane))
+            .flatten()
             .into_iter()
-            .chain(current.approach_z)
-            .chain(self.journey_lift(current, plane))
-            .reduce(f64::max);
+            .chain(current.approach_z);
+        let laid = laid.into_iter().chain(lift).reduce(f64::max);
         let standing = self.nozzle_z.unwrap_or(target);
         // The ride carries the descent on the travel, so both ends of it have
         // to clear a raised bead — and the loop's own height has to clear
@@ -3610,24 +3625,22 @@ impl<'a, W: Write> Pass<'a, W> {
 
     /// The height a loop's lead has to clear the layer by, where the reorder
     /// turned the slicer's hop between two loops of one island into a journey
-    /// across the plate, or `None` where the lead already lifts or the travel
-    /// is no journey.
+    /// across the plate, or `None` where the lead already lifts or the nozzle
+    /// stands where the slicer left it.
     ///
     /// The slicer lifts before it crosses a part and puts the nozzle back down
     /// on the far side; a travel that is a journey only because this pass
     /// moved the loop has the lead of the short hop it used to be, which names
-    /// no lift at all. It then crosses both islands at bead height. Measured
+    /// no lift at all. It then crosses the part at bead height. Measured
     /// on a user's slice, a **102 mm crossing ran 0.040 mm over the layer**
     /// — the height of the raised beads it passed over — where the slicer's own
     /// crossings of the same gap ran 0.320 and 0.400 mm over it, and the blobs
     /// were where the nozzle changed islands.
     ///
-    /// Gated like every pull this pass adds: on the file's own
-    /// `retraction_minimum_travel`, measured from where the nozzle really
-    /// stands. The slicer's word on how far is far enough to be worth closing
-    /// is also its word on how far is worth lifting for. A lead that already
-    /// commands a height above the lift is the slicer's own hop, replayed, and
-    /// is left alone.
+    /// The caller asks this only of a travel that really runs over a bead this
+    /// pass raised, because a lift is a `G1 Z` of its own and so a dead stop.
+    /// A lead that already commands a height above the lift is the slicer's
+    /// own hop, replayed, and is left alone.
     fn journey_lift(&self, current: Loop, plane: f64) -> Option<f64> {
         let lift = plane + self.travel_lift?;
         let commanded = self.buffer[current.lead..current.body]
@@ -3637,9 +3650,7 @@ impl<'a, W: Write> Pass<'a, W> {
         if commanded.is_some_and(|had| had >= lift) {
             return None;
         }
-        let journey = self.hop(current.lead, self.wrote_at);
-        let far = self.hop_travel?;
-        (journey > far && self.displaced_lead(current)).then_some(lift)
+        self.displaced_lead(current).then_some(lift)
     }
 
     /// True where the nozzle does not stand where the slicer left it for this

@@ -217,23 +217,29 @@ in the way.
   3.09 m. Pinned by
   `brick::tests::two_islands_a_plate_apart_are_not_toured_twice_a_layer`.
 - **A journey the reorder created must clear the layer by the file's own
-  lift.** The slicer lifts before it crosses a part and puts the nozzle down on
-  the far side; a travel that is a journey only because this pass moved the
-  loop still has the lead of the short hop it used to be, which names no lift
-  at all. Measured on a user's slice, a **102 mm island crossing ran 0.040 mm
-  over the layer** — the height of the raised beads it passed over — where the
-  slicer's own crossings of the same gap ran 0.320 and 0.400 mm over it, and
-  the blobs were where the nozzle changed islands. `Survey.travel_lift` reads
+  lift, and what earns one is what the travel CROSSES, never how long it is.**
+  The slicer lifts before it crosses a part and puts the nozzle down on the far
+  side; a travel that is a journey only because this pass moved the loop still
+  has the lead of the short hop it used to be, which names no lift at all.
+  Measured on a user's slice, a **102 mm island crossing ran 0.040 mm over the
+  layer** — the height of the raised beads it passed over — where the slicer's
+  own crossings of the same gap ran 0.320 and 0.400 mm over it, and the blobs
+  were where the nozzle changed islands. `Survey.travel_lift` reads
   `z_hop`/`retract_lift` per slot and `Pass::journey_lift` folds it into the
   floor the lead has to clear, so the sequence comes out as the slicer's own:
-  retract, lift, travel, descend, prime. Gated like every pull this pass adds
-  — on the file's own `retraction_minimum_travel`, from where the nozzle really
-  stands — and NEVER on a loop the slicer placed itself: a lead that already
-  commands a height above the lift is the slicer's own hop, replayed, and
-  `Pass.holding_back` is what says a lead with no line in front of it is a held
-  loop rather than a region's first. Inferring that from `lead == 0` instead
-  put a lift in front of every region's first loop and stamped 40 raises into
-  a plate that bricks nothing
+  retract, lift, travel, descend, prime. Do NOT gate it on the file's
+  `retraction_minimum_travel` as every pull is gated: a lift is a `G1 Z` of its
+  own and so a DEAD STOP, and on the same slice the length gate put **184 stops
+  on an island the slicer made 17 on** — the user printed it and that end came
+  out worse than with no lift at all, while the end whose travels really do
+  cross the part came out better. The gate is `clearance`'s own answer plus
+  "below what this layer has already laid", which leaves 38 stops there and
+  takes the low crossings from 25 to 3. It NEVER fires on a loop the slicer
+  placed itself: a lead that already commands a height above the lift is the
+  slicer's own hop, replayed, and `Pass.holding_back` is what says a lead with
+  no line in front of it is a held loop rather than a region's first. Inferring
+  that from `lead == 0` instead put a lift in front of every region's first
+  loop and stamped 40 raises into a plate that bricks nothing
   (`plates::a_solid_fill_that_does_not_stack_is_left_alone`).
 - **The order is by the LOWEST height a strand lays, not by the raise it
   took.** What the order is for is the nozzle's underside: a bead at the plane
