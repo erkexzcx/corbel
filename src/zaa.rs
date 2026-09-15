@@ -596,7 +596,9 @@ impl<W: Write, R: BufRead> Pass<W, R> {
         // predicate exists to catch and what the survey already counts as a
         // bead. Asking the other way makes the two passes disagree about what
         // was printed, and this one then leaves the bead exactly as sliced.
-        let lays = line.draws_in_plane() && delta.is_some_and(|delta| delta > 0.0);
+        let lays = line.draws_in_plane()
+            && !line.is_travel_prime()
+            && delta.is_some_and(|delta| delta > 0.0);
         if !lays {
             return self.hold(line, delta);
         }

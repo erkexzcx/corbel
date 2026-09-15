@@ -55,6 +55,12 @@ const EPSILON: f64 = 1e-6;
 /// reached, so this bounds the replay by geometry rather than by file size.
 const CAPACITY: usize = 1 << 20;
 
+/// How far a non-drawing move has to run to be a journey rather than a hop.
+///
+/// The yardstick the blob reports used: an island crossing, and the scale at
+/// which a reorder's surplus travel shows up as a count instead of a length.
+pub const JOURNEY: f64 = 40.0;
+
 /// The smallest footprint a real nozzle can be claimed to have, and the widest
 /// bead the file says it lays.
 #[derive(Clone, Copy, Debug)]
@@ -379,7 +385,9 @@ pub fn inspect_as(gcode: &str, nozzle: Nozzle) -> Report {
         let delta = line.e.filter(|_| line.draws()).map(|e| extruder.observe(e));
         // A retraction and its prime name no coordinate; a bead's own filament
         // is not a prime and must not cancel one.
-        if let Some(value) = delta.filter(|_| line.x.is_none() && line.y.is_none()) {
+        if let Some(value) =
+            delta.filter(|_| (line.x.is_none() && line.y.is_none()) || line.is_travel_prime())
+        {
             withdrawn = (withdrawn - value).max(0.0);
         }
         if delta.is_some_and(|value| value < 0.0) {
@@ -412,7 +420,9 @@ pub fn inspect_as(gcode: &str, nozzle: Nozzle) -> Report {
             continue;
         }
         report.moves += 1;
-        let lays = line.draws_in_plane() && delta.is_some_and(|value| value > 0.0);
+        let lays = line.draws_in_plane()
+            && !line.is_travel_prime()
+            && delta.is_some_and(|value| value > 0.0);
         report.beads += usize::from(lays);
 
         path.clear();
@@ -733,6 +743,24 @@ pub struct Ledger {
     /// the plate, which is where stringing comes from. The retraction COUNT is
     /// untouched by that, which is why counting them cannot see it.
     pub primed_travel: f64,
+    /// Stationary primes: a positive `E` written where the nozzle moves
+    /// nowhere, keyed by the region in force.
+    ///
+    /// This is the blob the defect was. A reorder that turns a short hop into
+    /// a journey earns a retraction, and the prime that answers it is written
+    /// where the nozzle happens to stand — at the seam of a loop the slicer
+    /// had no reason to stop at. Neither a retraction count nor
+    /// [`Ledger::primed_travel`] can see it: the input retracts too, and a
+    /// retraction makes primed travel FALL. So what is counted here is what
+    /// the user sees: filament dumped with the toolhead standing still.
+    pub primes: HashMap<String, usize>,
+    /// The filament those stationary primes lay down, in mm, so a longer
+    /// prime cannot hide behind a count.
+    pub prime_mm: HashMap<String, f64>,
+    /// Every non-drawing XY move, in mm.
+    pub travel: f64,
+    /// Non-drawing moves longer than [`JOURNEY`], whole file.
+    pub journeys: usize,
     /// Height changes written as a move of their own while primed, which stop
     /// the toolhead dead with a full nozzle over the seam.
     pub primed_stops: usize,
@@ -791,6 +819,10 @@ pub fn ledger(gcode: &str) -> Ledger {
         backwards: Vec::new(),
         widths: HashMap::new(),
         primed_travel: 0.0,
+        primes: HashMap::new(),
+        prime_mm: HashMap::new(),
+        travel: 0.0,
+        journeys: 0,
         primed_stops: 0,
         regions: HashMap::new(),
         jabs: 0,
@@ -866,7 +898,10 @@ pub fn ledger(gcode: &str) -> Ledger {
         }
         let from = modal.position();
         let delta = line.e.filter(|_| line.draws()).map(|e| extruder.observe(e));
-        if line.draws_in_plane() && delta.is_some_and(|value| value > 0.0) {
+        let travel_prime = line.is_travel_prime();
+        let before_withdrawal = withdrawn;
+        let lays = line.draws_in_plane() && !travel_prime && delta.is_some_and(|value| value > 0.0);
+        if lays {
             bead_layer = layer;
         }
         if line.draws_in_plane() && delta.is_some_and(|value| value <= 0.0) {
@@ -894,8 +929,16 @@ pub fn ledger(gcode: &str) -> Ledger {
         // named on a line that also names a coordinate. Counting only the bare
         // ones reads a wiped nozzle as a full one.
         if let Some(value) = delta {
+            // A prime is filament put in where the nozzle goes nowhere: no
+            // `X`, no `Y`, no `Z`, just `E`. A bead carries positive `E` too,
+            // and a hop names a height, so both are excluded by that alone.
+            if layer > 0 && value > 0.0 && line.x.is_none() && line.y.is_none() && line.z.is_none()
+            {
+                *book.primes.entry(region.clone()).or_default() += 1;
+                *book.prime_mm.entry(region.clone()).or_default() += value;
+            }
             if layer > 0 && value > 0.0 {
-                if line.draws_in_plane() {
+                if line.draws_in_plane() && !travel_prime {
                     book.dry_bead = book.dry_bead.max(value.min(withdrawn));
                 } else {
                     book.excess_prime = book.excess_prime.max(value - withdrawn);
@@ -952,7 +995,7 @@ pub fn ledger(gcode: &str) -> Ledger {
         if line.draws() {
             let fell = line.z.is_some_and(|z| z < from.2 - 1e-9);
             let steers = line.x.is_some() || line.y.is_some();
-            let draws = delta.is_some_and(|value| value > 0.0);
+            let draws = !travel_prime && delta.is_some_and(|value| value > 0.0);
             match (fell, steers, draws) {
                 (true, false, false) => dropped = Some(from.2),
                 (_, true, false) if dropped.is_some() => {
@@ -966,10 +1009,10 @@ pub fn ledger(gcode: &str) -> Ledger {
         // Only along an unbroken run of bead. A height change either side of
         // a travel is the nozzle lifting and coming back down, which is not a
         // crest and leaves nothing behind.
-        if !(line.draws_in_plane() && delta.is_some_and(|value| value > 0.0)) {
+        if !lays {
             crest.clear();
         }
-        if line.draws_in_plane() && delta.is_some_and(|value| value > 0.0) {
+        if lays {
             let run = (to.0 - from.0).hypot(to.1 - from.1);
             crest.push((to.2, run));
             if crest.len() == 3 {
@@ -985,6 +1028,7 @@ pub fn ledger(gcode: &str) -> Ledger {
         }
         if supporting
             && (line.x.is_some() || line.y.is_some())
+            && !travel_prime
             && delta.is_some_and(|value| value > 0.0)
         {
             // A micron is finer than any printer resolves and far finer than
@@ -996,7 +1040,7 @@ pub fn ledger(gcode: &str) -> Ledger {
                 (to.2 * 1000.0).round() as i64,
             ));
         }
-        if line.draws_in_plane() && delta.is_some_and(|value| value > 0.0) {
+        if lays {
             while book.drawn.len() <= layer {
                 book.drawn.push(0.0);
             }
@@ -1025,8 +1069,21 @@ pub fn ledger(gcode: &str) -> Ledger {
                     }
                 }
             }
-        } else if (line.x.is_some() || line.y.is_some()) && withdrawn <= 1e-9 {
-            book.primed_travel += (to.0 - from.0).hypot(to.1 - from.1);
+        } else if line.x.is_some() || line.y.is_some() {
+            let span = (to.0 - from.0).hypot(to.1 - from.1);
+            book.travel += span;
+            book.journeys += usize::from(span > JOURNEY);
+            if travel_prime {
+                let recovery = delta.unwrap_or_default();
+                let charged = if recovery > 0.0 {
+                    (1.0 - before_withdrawal / recovery).clamp(0.0, 1.0)
+                } else {
+                    f64::from(before_withdrawal <= 1e-9)
+                };
+                book.primed_travel += span * charged;
+            } else if withdrawn <= 1e-9 {
+                book.primed_travel += span;
+            }
         }
     }
     book
@@ -1457,6 +1514,34 @@ fn lost(before: &[String], after: &[String]) -> Option<(String, usize, usize)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_travel_prime_restores_only_the_withdrawal_and_still_counts_as_travel() {
+        let before = "M83\n; CHANGE_LAYER\nG1 X0 Y0 F9000\nG1 E-0.8 F1800\n\
+                      G1 X2 Y0 F4500\nG1 E0.8 F1800\nG1 X12 Y0 E1 F600\n";
+        let after = before.replace(
+            "G1 X2 Y0 F4500\nG1 E0.8 F1800",
+            "G1 X2 Y0 E0.8 F4500 ; corbel brick travel prime",
+        );
+        let original = ledger(before);
+        let changed = ledger(&after);
+        assert!(faults(&original, &changed, None).is_empty());
+        assert_eq!(changed.drawn, original.drawn);
+        assert_eq!(changed.travel, original.travel);
+        assert_eq!(changed.primed_travel, 0.0);
+        assert_eq!(changed.primes.values().sum::<usize>(), 0);
+        assert_eq!(changed.dry_bead, 0.0);
+        assert_eq!(changed.excess_prime, 0.0);
+        let excess = ledger(&after.replace("X2 Y0 E0.8", "X2 Y0 E1.6"));
+        assert!((excess.excess_prime - 0.8).abs() < 1e-9);
+        assert!((excess.primed_travel - 1.0).abs() < 1e-9);
+        assert!(!faults(&original, &excess, None).is_empty());
+        let dry = ledger(&after.replace("X2 Y0 E0.8", "X2 Y0 E0.4"));
+        assert!((dry.dry_bead - 0.4).abs() < 1e-9);
+        assert!(!faults(&original, &dry, None).is_empty());
+        let unmarked = ledger(&after.replace(" ; corbel brick travel prime", ""));
+        assert!((unmarked.dry_bead - 0.8).abs() < 1e-9);
+    }
+
     /// A slicer's Z-hop is a helix, and a helix is not a height of its own.
     ///
     /// `G3 Z5.414 I-1.217 J-.019 P1 F30000` is how Bambu Studio writes the hop
@@ -1475,5 +1560,45 @@ mod tests {
         assert_eq!(ledger(hop).primed_stops, 0);
         let bare = "; CHANGE_LAYER\nG1 X1 Y1 F30000\nG1 Z0.4\nG1 X9 Y9 F30000\nG1 E1 F1800\n";
         assert_eq!(ledger(bare).primed_stops, 1);
+    }
+
+    /// A prime is filament put in with the nozzle standing still, and that is
+    /// the blob a reorder leaves at a seam.
+    ///
+    /// It has to follow the region in force — the report that found the
+    /// defect attributes each cycle to the bead it precedes — and it must not
+    /// be fooled by a bead, which also names positive `E` but moves, nor by a
+    /// height the nozzle rises through, which moves on `Z` alone.
+    #[test]
+    fn a_prime_that_goes_nowhere_is_counted_where_the_nozzle_never_moved() {
+        let text = "M83\n; CHANGE_LAYER\nG1 X1 Y1 F9000\n; FEATURE: Sparse infill\n\
+                    G1 E0.8 F1800\nG1 X5 Y5 E0.5\nG1 Z0.6\nG1 E0.4\n\
+                    ; FEATURE: Top surface\nG1 E0.2 F1800\n";
+        let book = ledger(text);
+        assert_eq!(book.primes.get("sparse infill"), Some(&2));
+        assert_eq!(book.primes.get("top surface"), Some(&1));
+        let millimetres = book.prime_mm.get("sparse infill").copied().unwrap_or(0.0);
+        assert!((millimetres - 1.2).abs() < 1e-9, "{millimetres}");
+        // The bead moves, so it is not a prime; the height move names `Z`, so
+        // the `E` on it is a hop and not a prime either.
+        assert_eq!(book.primes.values().sum::<usize>(), 3);
+    }
+
+    /// Travel is counted whether or not the nozzle is primed, and a journey is
+    /// a travel past the yardstick's own distance.
+    #[test]
+    fn travel_is_counted_whether_or_not_the_nozzle_is_primed() {
+        let text = "M83\n; CHANGE_LAYER\nG1 X0 Y0 F9000\nG1 X10 Y0 F9000\nG1 E0.8 F1800\n\
+                    G1 X10 Y60 F9000\nG1 E-0.8 F1800\nG1 X10 Y70 F9000\n";
+        let book = ledger(text);
+        assert!((book.travel - 80.0).abs() < 1e-9, "{}", book.travel);
+        assert_eq!(book.journeys, 1);
+        // The first 10 mm and the 60 mm hop run with a full nozzle; the last
+        // 10 mm runs after the retraction and is not primed travel.
+        assert!(
+            (book.primed_travel - 70.0).abs() < 1e-9,
+            "{}",
+            book.primed_travel
+        );
     }
 }

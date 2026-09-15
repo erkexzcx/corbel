@@ -239,7 +239,7 @@ fn beads_in(text: &str) -> Vec<Bead> {
             continue;
         };
         let delta = extruder.observe(value);
-        if !started || delta <= 0.0 || !line.draws_in_plane() {
+        if !started || delta <= 0.0 || !line.draws_in_plane() || line.is_travel_prime() {
             interrupted |= line.draws_in_plane();
             continue;
         }
@@ -496,10 +496,16 @@ fn travels_in(text: &str) -> Vec<Travel> {
         if let Some(delta) = delta {
             withdrawn = (withdrawn - delta).max(0.0);
         }
-        if line.draws_in_plane() && delta.is_some_and(|value| value > 0.0) {
+        if line.draws_in_plane()
+            && !line.is_travel_prime()
+            && delta.is_some_and(|value| value > 0.0)
+        {
             bead_layer = layer;
         }
-        if !started || !line.draws_in_plane() || delta.is_some_and(|value| value > 0.0) {
+        if !started
+            || !line.draws_in_plane()
+            || (!line.is_travel_prime() && delta.is_some_and(|value| value > 0.0))
+        {
             continue;
         }
         let arc = line.arc_between((from.0, from.1), (to.0, to.1));
@@ -699,6 +705,16 @@ fn main() -> std::io::Result<()> {
             "Excess prime: {:.5} mm; dry bead: {:.5} mm; primed travel: {:.3} mm",
             after.excess_prime, after.dry_bead, after.primed_travel
         );
+        let mut regions: Vec<_> = before.primes.keys().chain(after.primes.keys()).collect();
+        regions.sort();
+        regions.dedup();
+        for region in regions {
+            println!(
+                "Stationary primes ({region}): {} -> {}",
+                before.primes.get(region).unwrap_or(&0),
+                after.primes.get(region).unwrap_or(&0)
+            );
+        }
         for fault in &faults {
             println!("{fault}");
         }

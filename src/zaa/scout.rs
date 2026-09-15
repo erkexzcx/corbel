@@ -173,7 +173,11 @@ impl Trace {
         let to = moved.map_or(from, |(x, y, _)| (x, y));
         self.at = to;
         let delta = line.e.map_or(0.0, |e| self.extruder.observe(e));
-        if delta > 0.0 && self.feature.builds_the_part() && self.open.is_some() {
+        if delta > 0.0
+            && !line.is_travel_prime()
+            && self.feature.builds_the_part()
+            && self.open.is_some()
+        {
             // An arc states a centre relative to where it began, or a radius
             // and nothing else, so where it began is what turns either into a
             // curve. A chord in place of the curve puts the outline inside the
@@ -232,6 +236,27 @@ mod tests {
             io::Cursor::new(format!("M83\n{source}").into_bytes()),
             Grid::default(),
         )
+    }
+
+    #[test]
+    fn a_travel_prime_draws_no_footprint_in_either_reader() {
+        let source = "M83\n;LAYER_CHANGE\nG1 Z0.2\n;TYPE:Perimeter\n\
+                      G1 X-20 Y0\nG1 E-0.8\nG1 X0 Y0 E0.8 ; corbel brick travel prime\n\
+                      G1 X10 Y0 E0.5\n;LAYER_CHANGE\n";
+        let mut scout = scout_of(source);
+        let [_, here, _] = scout.around(0).unwrap();
+        let here = here.unwrap();
+        assert!(here.holds(5.0, 0.0));
+        assert!(!here.holds(-10.0, 0.0));
+        let survey = crate::scan::Survey::of(source);
+        assert_eq!(survey.footprint, Some([0.0, 0.0, 10.0, 0.0]));
+        let unmarked = source.replace(" ; corbel brick travel prime", "");
+        let mut scout = scout_of(&unmarked);
+        assert!(scout.around(0).unwrap()[1].unwrap().holds(-10.0, 0.0));
+        assert_eq!(
+            crate::scan::Survey::of(&unmarked).footprint.unwrap()[0],
+            -20.0
+        );
     }
 
     #[test]

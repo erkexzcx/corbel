@@ -713,6 +713,29 @@ impl<'a> Line<'a> {
         Ok(true)
     }
 
+    pub fn is_travel_prime(&self) -> bool {
+        self.comment().is_some_and(|comment| {
+            comment
+                .trim_start()
+                .starts_with("corbel brick travel prime")
+        })
+    }
+
+    pub fn write_travel_prime<W: Write>(
+        &self,
+        out: &mut W,
+        to: (f64, f64),
+        e: f64,
+        z: Option<f64>,
+        f: f64,
+    ) -> io::Result<()> {
+        let mut bytes = Vec::new();
+        rewrite(&mut bytes, self.origin, &[], &[(b'E', 0.0)])?;
+        let text = repaired(&bytes);
+        Line::parse_bytes(&text, &bytes).write_moved_at(out, to, None, Some(e), z, Some(f))?;
+        Ok(())
+    }
+
     pub fn write_segment_at<W: Write>(&self, out: &mut W, piece: Piece) -> io::Result<()> {
         let Piece {
             from,

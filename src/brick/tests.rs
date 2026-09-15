@@ -5439,6 +5439,38 @@ fn a_held_loop_reached_within_a_millimetre_is_not_retracted_for() {
 }
 
 #[test]
+fn an_added_prime_can_finish_on_the_approach_without_exceeding_retract_speed() {
+    let survey = Survey::of("; layer_height = 0.2\nM83\n");
+    let config = plain();
+    for mode in [Code::RelativeE, Code::AbsoluteE] {
+        let mut pass = Pass::new(Vec::new(), &config, &survey);
+        pass.extruder.set_mode(mode);
+        pass.extruder.set_position(10.0);
+        pass.at = (2.0, 0.0);
+        pass.buffer(Line::parse("N7 G1 X2 Y0 F9000*0"), (0.0, 0.0));
+        pass.withdrawn = 0.8;
+        pass.retract_feed = Some(1800.0);
+        assert!(pass.recharge_travel(0, Some(0.4), &[None]).unwrap());
+        assert_eq!(pass.withdrawn, 0.0);
+        assert_eq!(pass.nozzle_z, Some(0.4));
+        assert_eq!(pass.wanted_feed, Some(9000.0));
+        let output = String::from_utf8(pass.out).unwrap();
+        let line = Line::parse(output.trim());
+        assert_eq!(
+            line.e,
+            Some(if mode == Code::AbsoluteE { 10.8 } else { 0.8 })
+        );
+        assert_eq!(line.f, Some(4500.0));
+        assert_eq!(line.x, Some(2.0));
+        assert!(line.is_travel_prime());
+        let (body, tail) = output.split_once('*').unwrap();
+        let checksum: u8 = tail.split_whitespace().next().unwrap().parse().unwrap();
+        assert_eq!(checksum, body.bytes().fold(0, |sum, byte| sum ^ byte));
+        assert_eq!(output.lines().count(), 1);
+    }
+}
+
+#[test]
 fn a_height_carried_by_a_reordered_travel_still_retracts() {
     let survey = Survey::of(
         "; layer_height = 0.2\n; retraction_length = 0.8\n; retraction_minimum_travel = 1\nM83\n",

@@ -395,6 +395,31 @@ solid_infill! {
     a_fill_inside_two_walls => "infill-solid-2walls",
 }
 
+#[test]
+fn concentric_bricks_restore_the_nozzle_on_approach_instead_of_stopping_at_each_seam() {
+    let source = plate("infill-solid");
+    let before = nozzle::ledger(&source);
+    for args in [&["--bricks"][..], &["--bricks", "--zaa"][..]] {
+        let (gcode, _) = processed("infill-primes", &source, args);
+        let after = nozzle::ledger(&gcode);
+        assert!(nozzle::faults(&before, &after, None).is_empty());
+        let stationary = gcode
+            .lines()
+            .filter(|line| line.contains("corbel brick prime"))
+            .count();
+        let travelling = gcode
+            .lines()
+            .filter(|line| line.contains("corbel brick travel prime"))
+            .count();
+        assert!(
+            travelling > stationary * 4,
+            "{args:?}: {travelling} travelling, {stationary} stationary"
+        );
+        assert!(gcode.contains("corbel brick raised"));
+        assert!(after.primed_travel <= before.primed_travel);
+    }
+}
+
 /// A solid fill whose strands are NOT a stack, and must be left alone.
 ///
 /// `zig-zag` lays one serpentine per island and the slicer rotates it a
