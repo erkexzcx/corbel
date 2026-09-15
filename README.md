@@ -43,7 +43,7 @@ irm https://raw.githubusercontent.com/erkexzcx/corbel/main/deploy.ps1 | iex
 
 > 🛡️ **Windows: "An Application Control policy has blocked this file".** These builds are unsigned, and [Smart App Control](https://support.microsoft.com/en-us/topic/what-is-smart-app-control-285ea03d-fa88-4d56-882e-6698afdb7003) blocks anything unsigned. Turn it off in **Windows Security → App & browser control → Smart App Control settings**.
 
-**By hand.** Take your platform's file from the [latest release](https://github.com/erkexzcx/corbel/releases/latest) — Linux, macOS and Windows, x86-64 and arm64 — rename it to `corbel` and `chmod +x` it. **From source**, needs only [Rust](https://rustup.rs):
+**By hand.** Take your platform's file from the [latest release](https://github.com/erkexzcx/corbel/releases/latest) — Linux, macOS and Windows, x86-64 and arm64 — rename it to `corbel` and `chmod +x` it. The Linux builds need glibc 2.17 or newer, so any distro from 2013 on runs them; on a musl distro such as Alpine, build from source. **From source**, needs only [Rust](https://rustup.rs):
 
 ```sh
 git clone https://github.com/erkexzcx/corbel.git

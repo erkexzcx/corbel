@@ -45,18 +45,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Zig links these and carries its own libc and macOS SDK, so no Apple host.
-          - target: x86_64-unknown-linux-musl
+          # Zig links these and carries its own glibc stubs and macOS SDK, so no Apple host.
+          # Linux ships linked against glibc, not musl: bricking makes about 11.7 million
+          # allocator calls per 4 MB of G-code, and musl's allocator and plain mem* routines
+          # cost 44% more on `--bricks` (2.52 s against 1.75 s) and 31% on both transforms
+          # for the same work at the same fat-LTO profile. `.2.17` is the glibc floor Zig
+          # keeps stubs for, so the binary still runs on any distro from 2013 on.
+          - target: x86_64-unknown-linux-gnu
             os_name: linux
             arch: amd64
             container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
             cargo_command: zigbuild
+            glibc: '2.17'
             suffix: ''
-          - target: aarch64-unknown-linux-musl
+          - target: aarch64-unknown-linux-gnu
             os_name: linux
             arch: arm64
             container: ghcr.io/rust-cross/cargo-zigbuild:0.23.0
             cargo_command: zigbuild
+            glibc: '2.17'
             suffix: ''
           - target: aarch64-apple-darwin
             os_name: darwin
@@ -110,6 +117,8 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           CARGO_COMMAND: ${{ matrix.cargo_command }}
+          # Empty on the Apple and Windows targets, which take no glibc floor.
+          GLIBC: ${{ matrix.glibc }}
           TAG_NAME: ${{ github.event.release.tag_name }}
           # Accepts Microsoft's licence for the CRT and SDK headers cargo-xwin downloads.
           XWIN_ACCEPT_LICENSE: '1'
@@ -117,7 +126,11 @@ jobs:
           # The published tag is the only version this project has; a build from source
           # has no release behind it and reports "dev" instead.
           export CORBEL_VERSION="${TAG_NAME#v}"
-          cargo ${CARGO_COMMAND} --release --locked --offline --target "${TARGET}"
+          # A `-gnu` target carries its glibc floor as a suffix — cargo-zigbuild reads
+          # `x86_64-unknown-linux-gnu.2.17` and links against Zig's stubs for that version,
+          # while cargo still builds into `target/x86_64-unknown-linux-gnu/`, which is where
+          # the asset is copied from below.
+          cargo ${CARGO_COMMAND} --release --locked --offline --target "${TARGET}${GLIBC:+.${GLIBC}}"
 
       - name: Name release asset
         id: asset
