@@ -385,9 +385,7 @@ pub fn inspect_as(gcode: &str, nozzle: Nozzle) -> Report {
         let delta = line.e.filter(|_| line.draws()).map(|e| extruder.observe(e));
         // A retraction and its prime name no coordinate; a bead's own filament
         // is not a prime and must not cancel one.
-        if let Some(value) =
-            delta.filter(|_| (line.x.is_none() && line.y.is_none()) || line.is_travel_prime())
-        {
+        if let Some(value) = delta.filter(|_| line.x.is_none() && line.y.is_none()) {
             withdrawn = (withdrawn - value).max(0.0);
         }
         if delta.is_some_and(|value| value < 0.0) {
@@ -420,9 +418,7 @@ pub fn inspect_as(gcode: &str, nozzle: Nozzle) -> Report {
             continue;
         }
         report.moves += 1;
-        let lays = line.draws_in_plane()
-            && !line.is_travel_prime()
-            && delta.is_some_and(|value| value > 0.0);
+        let lays = line.draws_in_plane() && delta.is_some_and(|value| value > 0.0);
         report.beads += usize::from(lays);
 
         path.clear();
@@ -898,9 +894,7 @@ pub fn ledger(gcode: &str) -> Ledger {
         }
         let from = modal.position();
         let delta = line.e.filter(|_| line.draws()).map(|e| extruder.observe(e));
-        let travel_prime = line.is_travel_prime();
-        let before_withdrawal = withdrawn;
-        let lays = line.draws_in_plane() && !travel_prime && delta.is_some_and(|value| value > 0.0);
+        let lays = line.draws_in_plane() && delta.is_some_and(|value| value > 0.0);
         if lays {
             bead_layer = layer;
         }
@@ -938,7 +932,7 @@ pub fn ledger(gcode: &str) -> Ledger {
                 *book.prime_mm.entry(region.clone()).or_default() += value;
             }
             if layer > 0 && value > 0.0 {
-                if line.draws_in_plane() && !travel_prime {
+                if line.draws_in_plane() {
                     book.dry_bead = book.dry_bead.max(value.min(withdrawn));
                 } else {
                     book.excess_prime = book.excess_prime.max(value - withdrawn);
@@ -995,7 +989,7 @@ pub fn ledger(gcode: &str) -> Ledger {
         if line.draws() {
             let fell = line.z.is_some_and(|z| z < from.2 - 1e-9);
             let steers = line.x.is_some() || line.y.is_some();
-            let draws = !travel_prime && delta.is_some_and(|value| value > 0.0);
+            let draws = delta.is_some_and(|value| value > 0.0);
             match (fell, steers, draws) {
                 (true, false, false) => dropped = Some(from.2),
                 (_, true, false) if dropped.is_some() => {
@@ -1028,7 +1022,6 @@ pub fn ledger(gcode: &str) -> Ledger {
         }
         if supporting
             && (line.x.is_some() || line.y.is_some())
-            && !travel_prime
             && delta.is_some_and(|value| value > 0.0)
         {
             // A micron is finer than any printer resolves and far finer than
@@ -1073,15 +1066,7 @@ pub fn ledger(gcode: &str) -> Ledger {
             let span = (to.0 - from.0).hypot(to.1 - from.1);
             book.travel += span;
             book.journeys += usize::from(span > JOURNEY);
-            if travel_prime {
-                let recovery = delta.unwrap_or_default();
-                let charged = if recovery > 0.0 {
-                    (1.0 - before_withdrawal / recovery).clamp(0.0, 1.0)
-                } else {
-                    f64::from(before_withdrawal <= 1e-9)
-                };
-                book.primed_travel += span * charged;
-            } else if withdrawn <= 1e-9 {
+            if withdrawn <= 1e-9 {
                 book.primed_travel += span;
             }
         }
@@ -1515,7 +1500,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_travel_prime_restores_only_the_withdrawal_and_still_counts_as_travel() {
+    fn a_travel_prime_annotation_cannot_hide_a_drawn_crossing() {
         let before = "M83\n; CHANGE_LAYER\nG1 X0 Y0 F9000\nG1 E-0.8 F1800\n\
                       G1 X2 Y0 F4500\nG1 E0.8 F1800\nG1 X12 Y0 E1 F600\n";
         let after = before.replace(
@@ -1524,21 +1509,11 @@ mod tests {
         );
         let original = ledger(before);
         let changed = ledger(&after);
-        assert!(faults(&original, &changed, None).is_empty());
-        assert_eq!(changed.drawn, original.drawn);
-        assert_eq!(changed.travel, original.travel);
-        assert_eq!(changed.primed_travel, 0.0);
-        assert_eq!(changed.primes.values().sum::<usize>(), 0);
-        assert_eq!(changed.dry_bead, 0.0);
-        assert_eq!(changed.excess_prime, 0.0);
-        let excess = ledger(&after.replace("X2 Y0 E0.8", "X2 Y0 E1.6"));
-        assert!((excess.excess_prime - 0.8).abs() < 1e-9);
-        assert!((excess.primed_travel - 1.0).abs() < 1e-9);
-        assert!(!faults(&original, &excess, None).is_empty());
-        let dry = ledger(&after.replace("X2 Y0 E0.8", "X2 Y0 E0.4"));
-        assert!((dry.dry_bead - 0.4).abs() < 1e-9);
-        assert!(!faults(&original, &dry, None).is_empty());
+        assert!(!faults(&original, &changed, None).is_empty());
+        assert_eq!(changed.drawn[1], original.drawn[1] + 2.0);
+        assert!((changed.dry_bead - 0.8).abs() < 1e-9);
         let unmarked = ledger(&after.replace(" ; corbel brick travel prime", ""));
+        assert_eq!(changed.drawn, unmarked.drawn);
         assert!((unmarked.dry_bead - 0.8).abs() < 1e-9);
     }
 

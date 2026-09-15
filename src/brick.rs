@@ -1037,6 +1037,7 @@ struct Pass<'a, W: Write> {
     /// buffer of its own so there is no line in front of it to measure that
     /// against.
     holding_back: bool,
+    local_hop: bool,
     /// Feedrate the OUTPUT stream is really left in, which the height moves
     /// and retractions this pass inserts change as much as the file's own
     /// lines do.
@@ -1159,6 +1160,7 @@ impl<'a, W: Write> Pass<'a, W> {
             hop_travel: survey.hop_at(0),
             travel_lift: survey.lift_at(0),
             holding_back: false,
+            local_hop: false,
             retract_charge: survey.retract_at(0),
             feedrate: None,
             wanted_feed: None,
@@ -2309,6 +2311,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 // of the filament. Measured on a user's tree-support slice, 252
                 // of 422 held writes travelled under 1 mm and pulled for it.
                 if self.withdrawn <= 0.0
+                    && !self.local_fill_hop(current, &moved)
                     && self
                         .hop_travel
                         .is_some_and(|far| self.hop(current.lead, self.wrote_at) > far)
@@ -2506,6 +2509,7 @@ impl<'a, W: Write> Pass<'a, W> {
     /// height is put ON the bead that takes it: a height written as a move of
     /// its own stops the toolhead dead over the seam with a full nozzle.
     fn write_loop(&mut self, current: Loop, plane: f64, moved: &[Option<Moved>]) -> io::Result<()> {
+        self.local_hop = self.local_fill_hop(current, moved);
         if std::env::var_os("CORBEL_MARK").is_some() && self.layer == 8 {
             eprintln!(
                 "WRITE at={:?} contour={} rise={:.3} marker={:?}",
@@ -2637,16 +2641,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 let line = self.buffer[at];
                 moved[at].is_none() && line.places && line.z.is_some_and(|at| at < *clear)
             });
-            let recharge = current.fill
-                && self.buffer[first].withdrawn <= 0.0
-                && self.buffer[at + 1..current.body]
-                    .iter()
-                    .all(|line| !line.positions && !line.delta.is_some_and(|delta| delta < 0.0))
-                && (carrier == Some(at) || self.buffer[at].z.or(self.nozzle_z) == Some(target));
-            let recharged = recharge
-                && self.recharge_travel(at, (carrier == Some(at)).then_some(target), moved)?;
             match carrier {
-                _ if recharged => {}
                 Some(at_) if at_ == at => self.ride(at, target, raise, moved)?,
                 _ => self.replay(at, 1.0, moved, floor)?,
             }
@@ -2657,6 +2652,7 @@ impl<'a, W: Write> Pass<'a, W> {
                 }
             }
         }
+        self.local_hop = false;
         // A slicer states the width once for a whole region and this pass
         // writes that region's loops in another order, so every loop after the
         // first inherits whatever the region before it declared. Measured on a
@@ -4642,71 +4638,38 @@ impl<'a, W: Write> Pass<'a, W> {
         self.withdrawn = amount.max(0.0);
     }
 
-    /// Recover an added withdrawal on the final approach, not at a stationary seam.
-    /// The E rate is bounded by the file's retraction speed; no bead is consumed.
-    fn recharge_travel(
-        &mut self,
-        index: usize,
-        z: Option<f64>,
-        moved: &[Option<Moved>],
-    ) -> io::Result<bool> {
-        let buffered = self.buffer[index];
-        if !buffered.carries || !buffered.steers || buffered.curved || buffered.withdrawn > 0.0 {
-            return Ok(false);
+    /// A skipped ring costs two pitches diagonally, plus the accepted seam gap.
+    /// Only a fully covered fill approach may retain the slicer's full nozzle.
+    fn local_fill_hop(&self, current: Loop, moved: &[Option<Moved>]) -> bool {
+        if !current.fill || self.buffer[current.body].withdrawn > 0.0 {
+            return false;
         }
-        self.retract_for(index)?;
-        if self.withdrawn <= 0.0 || self.stopped.is_some() {
-            return Ok(false);
-        }
-        let destination = written(moved[index].map_or(buffered.at, |point| point.to));
-        let start = self.output_at.unwrap_or(self.wrote_at);
-        let distance = (destination.0 - start.0).hypot(destination.1 - start.1);
-        let Some(asked) = buffered.f.or(self.wanted_feed) else {
-            return Ok(false);
-        };
-        if distance <= 0.0 || !distance.is_finite() {
-            return Ok(false);
-        }
-        let charge = self.withdrawn;
-        let rate = asked.min(self.retract_feed.unwrap_or(1800.0) * distance / charge);
-        let reading = self.extruder.is_absolute();
-        self.extruder.set_mode(e_mode(buffered.absolute));
-        let value = self.extruder.advance(charge);
-        self.extruder.set_mode(e_mode(reading));
-        let raw = &self.arena[buffered.start..buffered.end];
-        let comment = raw
+        let lead = &self.buffer[current.lead..current.body];
+        if lead
             .iter()
-            .position(|byte| *byte == b';')
-            .unwrap_or(raw.len());
-        let text = repaired(&raw[..comment]);
-        Line::parse_bytes(&text, &raw[..comment]).write_travel_prime(
-            &mut self.out,
-            destination,
-            value,
-            z,
-            rate,
-        )?;
-        write!(self.out, " ; {BRICK_STAMP}travel prime")?;
-        if comment < raw.len() {
-            self.out.write_all(b" ")?;
-            self.out.write_all(&raw[comment..])?;
+            .any(|line| line.z.is_some() || line.delta.is_some_and(|delta| delta != 0.0))
+        {
+            return false;
         }
-        self.out.write_all(b"\n")?;
-        self.pulled(0.0);
-        self.feedrate = Some(rate);
-        self.wanted_feed = Some(asked);
-        self.wrote_at = buffered.at;
-        self.output_at = Some(destination);
-        if let Some(z) = z.or(buffered.z) {
-            self.nozzle_z = Some(z);
-            self.owed_plane = None;
+        let mut moves = lead.iter().enumerate().filter(|(_, line)| line.steers);
+        let Some((index, travel)) = moves.next() else {
+            return false;
+        };
+        if moves.next().is_some() || travel.curved {
+            return false;
         }
-        Ok(true)
+        let width = self.wall_width.unwrap_or(self.skin_width);
+        let limit = 2.0 * bead_spacing(self.height(), width) * std::f64::consts::SQRT_2 + width;
+        let from = self.output_at.unwrap_or(self.wrote_at);
+        let to = written(moved[current.lead + index].map_or(travel.at, |point| point.to));
+        let distance = (to.0 - from.0).hypot(to.1 - from.1);
+        distance <= limit && self.ground.covers(from, to, width / 2.0)
     }
 
     fn retract_for(&mut self, index: usize) -> io::Result<()> {
         let buffered = self.buffer[index];
         if buffered.positions
+            && !self.local_hop
             && buffered.delta.is_none()
             && self.withdrawn <= 0.0
             && self

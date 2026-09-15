@@ -853,7 +853,7 @@ impl Scan {
         let delta = line.e.map_or(0.0, |e| self.extruder.observe(e));
         // The same test the rewrite uses to open a loop, so every cell it will
         // ask about is one this pass has already drawn.
-        let extrudes = delta > 0.0 && line.draws_in_plane() && !line.is_travel_prime();
+        let extrudes = delta > 0.0 && line.draws_in_plane();
         // An arc states a centre relative to where it began, or a radius and
         // nothing else, so where it began is what turns either into a curve.
         let arc = line.arc_between(from, to);

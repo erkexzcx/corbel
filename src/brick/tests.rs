@@ -5439,7 +5439,7 @@ fn a_held_loop_reached_within_a_millimetre_is_not_retracted_for() {
 }
 
 #[test]
-fn an_added_prime_can_finish_on_the_approach_without_exceeding_retract_speed() {
+fn an_added_prime_never_extrudes_along_the_approach() {
     let survey = Survey::of("; layer_height = 0.2\nM83\n");
     let config = plain();
     for mode in [Code::RelativeE, Code::AbsoluteE] {
@@ -5450,19 +5450,15 @@ fn an_added_prime_can_finish_on_the_approach_without_exceeding_retract_speed() {
         pass.buffer(Line::parse("N7 G1 X2 Y0 F9000*0"), (0.0, 0.0));
         pass.withdrawn = 0.8;
         pass.retract_feed = Some(1800.0);
-        assert!(pass.recharge_travel(0, Some(0.4), &[None]).unwrap());
-        assert_eq!(pass.withdrawn, 0.0);
+        pass.ride(0, 0.4, true, &[None]).unwrap();
+        assert_eq!(pass.withdrawn, 0.8);
         assert_eq!(pass.nozzle_z, Some(0.4));
         assert_eq!(pass.wanted_feed, Some(9000.0));
         let output = String::from_utf8(pass.out).unwrap();
         let line = Line::parse(output.trim());
-        assert_eq!(
-            line.e,
-            Some(if mode == Code::AbsoluteE { 10.8 } else { 0.8 })
-        );
-        assert_eq!(line.f, Some(4500.0));
+        assert_eq!(line.e, None);
+        assert_eq!(line.f, Some(9000.0));
         assert_eq!(line.x, Some(2.0));
-        assert!(line.is_travel_prime());
         let (body, tail) = output.split_once('*').unwrap();
         let checksum: u8 = tail.split_whitespace().next().unwrap().parse().unwrap();
         assert_eq!(checksum, body.bytes().fold(0, |sum, byte| sum ^ byte));

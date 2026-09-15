@@ -140,6 +140,28 @@ impl Path {
 }
 
 impl Ground {
+    pub(super) fn covers(&self, from: (f64, f64), to: (f64, f64), reach: f64) -> bool {
+        let distance = (to.0 - from.0).hypot(to.1 - from.1);
+        if !distance.is_finite() || distance > CELL * 64.0 || reach <= 0.0 {
+            return false;
+        }
+        let steps = (distance / (Grid::FINEST / 2.0)).ceil().max(1.0) as usize;
+        let margin = distance / (2.0 * steps as f64);
+        let mut gathered = Gathered::default();
+        (0..=steps).all(|step| {
+            let share = step as f64 / steps as f64;
+            let point = (
+                from.0 + (to.0 - from.0) * share,
+                from.1 + (to.1 - from.1) * share,
+            );
+            self.gather(Grid::default().at(point.0, point.1), reach, &mut gathered);
+            gathered
+                .paths
+                .iter()
+                .any(|&index| self.paths[index as usize].distance(point) + margin <= reach)
+        })
+    }
+
     /// The ground across a bead's width: the mean of the nearest path at each
     /// of `count` points spread over ±`reach` of the bead's centreline.
     ///
@@ -407,6 +429,17 @@ impl Ground {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_hop_is_covered_only_if_material_holds_its_whole_path() {
+        let mut ground = Ground::default();
+        ground.add((0.0, -1.0), (0.0, 1.0), None, 0.0);
+        ground.add((0.8, -1.0), (0.8, 1.0), None, 0.0);
+        assert!(!ground.covers((0.0, 0.0), (0.8, 0.0), 0.225));
+        ground.add((0.4, -1.0), (0.4, 1.0), None, 0.0);
+        assert!(ground.covers((0.0, 0.0), (0.8, 0.0), 0.225));
+        assert!(!ground.covers((0.0, 0.0), (3.0, 0.0), 0.225));
+    }
 
     /// A path within reach of a query is found even when not one of its
     /// samples landed in the query's own cell.
