@@ -95,7 +95,7 @@ impl Bead {
     }
 
     fn contains(&self, piece: &Bead) -> Option<f64> {
-        if piece.span > self.span + 0.03 {
+        if piece.span > self.span + 2.0 * 0.03 {
             return None;
         }
         match (self.arc, piece.arc) {
@@ -912,6 +912,17 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_tolerance_applies_to_both_ends_of_an_offset_bead() {
+        let original = beads_in("M83\n;LAYER_CHANGE\nG1 X0 Y0\nG1 X0 Y10 E1\n");
+        let offset = beads_in("M83\n;LAYER_CHANGE\nG1 X0.006 Y-0.025\nG1 X0.006 Y10.006 E1\n");
+        assert!(Originals::new(&original).find(&offset[0]).is_some());
+        let displaced = beads_in("M83\n;LAYER_CHANGE\nG1 X0.031 Y0\nG1 X0.031 Y10 E1\n");
+        assert!(Originals::new(&original).find(&displaced[0]).is_none());
+        let extended = beads_in("M83\n;LAYER_CHANGE\nG1 X0 Y-0.031\nG1 X0 Y10 E1\n");
+        assert!(Originals::new(&original).find(&extended[0]).is_none());
+    }
 
     #[test]
     fn a_skipped_layer_or_missing_z_advance_fails_the_layer_audit() {
