@@ -129,6 +129,7 @@ The gaps are drawn far larger than life — on a 0.2 mm layer they are a few mic
 > **extra flow ≈ `--extra-flow` × (layer height ÷ nozzle diameter)**
 
 So the default of `5` gives **+2.5%** on a 0.2 mm layer through a 0.4 mm nozzle, and about +1% on a 0.08 mm one. Both numbers are read from your file, on every layer, so an adaptive slice is metered against what it actually printed. Nozzle size barely matters on its own; what matters is how thick your layer is next to your nozzle.
+
 ---
 
 ## 🪄 Z anti-aliasing
